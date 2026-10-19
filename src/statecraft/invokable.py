@@ -40,8 +40,8 @@ class Invokable(Protocol):
         """存在だけを伝える1行。"""
         ...
 
-    def execute(self, *, kwargs: dict, interceptor: Interceptor | None = None) -> ToolResult:
+    def execute(
+        self, *, kwargs: dict, interceptor: Interceptor | None = None
+    ) -> ToolResult:
         """実行して結果を返す。例外は投げず、失敗もToolResultとして返す。"""
         ...
-
-

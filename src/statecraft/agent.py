@@ -116,18 +116,22 @@ class RunInput:
     current_inputとして保持する。次の起動時に_begin_run()が差し替える。
     """
 
-    # プロンプトの【依頼内容】へ載せる本文。
+    # 依頼の本文。委譲ではプロンプトの【依頼内容】へ載せる。
+    # 利用者から直接受けた場合は、shared_memory.conversationの方で読ませる。
     message: str
 
     # 呼び出し元から受け取った構造化引数（input_schemaに従う形）。
     # 初期ツールへ渡す引数は、ここから名前が一致するものだけを使う。
     kwargs: dict = field(default_factory=dict)
     # 過去のチャット履歴。[{"role": "user"|"assistant", "content": str}, ...]
-    # respond経由だけが受け取る（委譲では依頼だけが渡り、経緯は渡らない）。
+    # respond経由だけが受け取り、shared_memory.conversationへ記録する
+    # （LLMへはmessagesとして渡さない。窓口も委譲先もconversationで読む）。
     history: list[dict] = field(default_factory=list)
     # 添付ファイル。[{"data": bytes, "mime_type": str}, ...]
     # 画像やPDFをLLMへ渡す場合に使う。
     blobs: list[dict] = field(default_factory=list)
+    # respond()（利用者からの直接の依頼）で起動したか。
+    from_user: bool = False
 
 
 @dataclass
@@ -457,7 +461,9 @@ class Agent:
 
     # 委譲時に受け取れる引数の形（JSON Schema）。deepcopyなのは、浅いコピーでは
     # ネストした"properties"が全インスタンスで共有されるため。
-    input_schema: dict = field(default_factory=lambda: copy.deepcopy(DEFAULT_INPUT_SCHEMA))
+    input_schema: dict = field(
+        default_factory=lambda: copy.deepcopy(DEFAULT_INPUT_SCHEMA)
+    )
 
     # 最終回答に強制する形式。Noneなら自然言語で回答する。
     output_schema: dict | None = None
@@ -621,9 +627,13 @@ class Agent:
         return ResolvedGeneration(
             model=o.model if o.model is not None else self.model,
             llm=o.llm if o.llm is not None else self.llm,
-            temperature=o.temperature if o.temperature is not None else self.temperature,
+            temperature=o.temperature
+            if o.temperature is not None
+            else self.temperature,
             max_tokens=o.max_tokens if o.max_tokens is not None else self.max_tokens,
-            thought_level=o.thought_level if o.thought_level is not None else self.thought_level,
+            thought_level=o.thought_level
+            if o.thought_level is not None
+            else self.thought_level,
         )
 
     def to_declaration(self) -> dict:
@@ -727,9 +737,10 @@ class Agent:
         """
         人間からの入り口。原文・チャット履歴・添付を受け取る。
 
-        ここではshared_memoryへ書き込まない。原文を共有記憶へ持ち込まないことが
-        プロンプトインジェクションへの境界になっており、後続へ渡るのは
-        構造化された依頼だけになる。
+        原文と履歴はshared_memory.conversationへ記録し、窓口自身も委譲先も
+        そこから読む（窓口へ【依頼内容】やmessagesとして別に渡すと二重になる）。
+        委譲先にとっての要求の解釈の基準はrequests（委譲された時点で構造化された
+        依頼）のままで、conversationは解釈を補う材料として読ませる。
         """
         self._begin_run(
             RunInput(
@@ -737,8 +748,10 @@ class Agent:
                 kwargs={"message": message},
                 history=list(history or []),
                 blobs=list(blobs or []),
+                from_user=True,
             )
         )
+        self._record_conversation(message, self.current_input.history)
         # トークンは累計を保持したまま、今回分だけを差分で返す。
         # 累計はNetwork.total_tokens()がセッション全体の集計に使う。
         before_in, before_out = self.total_input_tokens, self.total_output_tokens
@@ -754,6 +767,27 @@ class Agent:
             output_tokens=self.total_output_tokens - before_out,
         )
 
+    def _record_conversation(self, message: str, history: list[dict]) -> None:
+        """
+        利用者の原文と会話履歴をshared_memory.conversationへ記録する。
+
+        追記ではなく置き換える。respondごとに履歴は全体が渡ってくるため、
+        追記すると同じやり取りが重なる。conversationはシステム所有で、
+        LLMの差分では書き換えられない。
+        """
+        speaker = {"user": "利用者", "assistant": "システムの回答"}
+        entries = [
+            MemoryEntry(
+                id=f"history-{i}",
+                text=f"{speaker.get(turn.get('role')) or turn.get('role')}: {turn.get('content')}",
+            )
+            for i, turn in enumerate(history, start=1)
+        ]
+        entries.append(
+            MemoryEntry(id="message", text=f"利用者（今回の原文）: {message}")
+        )
+        self.shared_memory.conversation = entries
+
     def _default_describe_execution(self, kwargs: dict) -> str:
         """
         execution_messageも describe_execution も無い場合の既定文言。
@@ -766,11 +800,14 @@ class Agent:
         return f"{self.name}へ委譲しました。"
 
     @with_timing
-    def execute(self, *, kwargs: dict, interceptor: Interceptor | None = None) -> ToolResult:
+    def execute(
+        self, *, kwargs: dict, interceptor: Interceptor | None = None
+    ) -> ToolResult:
         """
         他のエージェントからの入り口。Tool.execute()と同じ形で呼べる。
 
-        チャット履歴は受け取らない（委譲では依頼だけが渡り、経緯は渡らない）。
+        チャット履歴はmessagesとしては受け取らない。原文と経緯は、窓口の
+        respond()が記録したshared_memory.conversationを読む。
         """
         if self.disabled:
             # Tool.executeと同じく、呼ばれなかった理由を観測側へ伝える。
@@ -814,7 +851,9 @@ class Agent:
                 describe = self.describe_execution or self._default_describe_execution
                 self.interceptor.notify.execute_start(describe(kwargs))
             except Exception as e:  # noqa: BLE001
-                self.interceptor.notify.error(f"{self.name}の実行中メッセージの生成に失敗しました: {e}")
+                self.interceptor.notify.error(
+                    f"{self.name}の実行中メッセージの生成に失敗しました: {e}"
+                )
 
             try:
                 text, _ = self._run_react()
@@ -822,13 +861,18 @@ class Agent:
                 # Invokableの契約として例外を外へ出さない。
                 # ただし握りつぶすと原因が追えなくなるため、観測者へは通知する。
                 self.interceptor.notify.error(f"{self.name}の実行が失敗しました: {e}")
-                self.interceptor.notify.execute_end(f"{self.name}の委譲がエラーで終了しました。")
-                return ToolResult(error=f"{self.name}の実行中にエラーが発生しました: {e}")
+                self.interceptor.notify.execute_end(
+                    f"{self.name}の委譲がエラーで終了しました。"
+                )
+                return ToolResult(
+                    error=f"{self.name}の実行中にエラーが発生しました: {e}"
+                )
 
             # agent_answersはシステム所有。LLMの差分では書けないため直接記録する。
             self.shared_memory.agent_answers.append(
                 MemoryEntry(
-                    id=f"{self.name}-answer-{len(self.shared_memory.agent_answers) + 1}", text=text
+                    id=f"{self.name}-answer-{len(self.shared_memory.agent_answers) + 1}",
+                    text=text,
                 )
             )
             self.interceptor.notify.execute_end(f"{self.name}の委譲が完了しました。")
@@ -869,7 +913,9 @@ class Agent:
             # （素通りさせると未実行のタスクを残したまま回答へ飛ぶ）。
             if not targets and self._unresolved_targets:
                 entries = [
-                    ToolHistoryEntry(name=name, kwargs={}, result=ToolResult(error=reason))
+                    ToolHistoryEntry(
+                        name=name, kwargs={}, result=ToolResult(error=reason)
+                    )
                     for name, reason in self._unresolved_targets
                 ]
                 self.tool_history.extend(entries)
@@ -882,11 +928,15 @@ class Agent:
             # 実行すべきものが無い ＝ 追加実行なしで答えられる状態。
             # toolsを渡さないのではなく、そもそも呼び出しフェーズへ入らない。
             if not targets:
-                return self._final_answer(Phase.ANSWER, notice=self._pending_task_notice()), step
+                return self._final_answer(
+                    Phase.ANSWER, notice=self._pending_task_notice()
+                ), step
 
             # 呼び出しフェーズ。ここでLLMに決めさせるのは「引数」だけで、
             # 何を呼ぶかは既にtargetsで絞られている。
-            response = self._generate(Phase.FUNCTION_CALL, tools=targets, tool_choice=tool_choice)
+            response = self._generate(
+                Phase.FUNCTION_CALL, tools=targets, tool_choice=tool_choice
+            )
 
             # --- 呼び出し要求が返ってこなかった場合の3つの分岐 ---
             if not response.has_calls:
@@ -904,7 +954,9 @@ class Agent:
                 # 呼び出しを強制した（"any"）のに答えが返ってきた場合。この
                 # テキストには回答フェーズの指示も出力形式の強制も効いていないため、
                 # 改めて回答フェーズで答えさせる。
-                return self._final_answer(Phase.ANSWER, notice=self._pending_task_notice()), step
+                return self._final_answer(
+                    Phase.ANSWER, notice=self._pending_task_notice()
+                ), step
 
             # --- 実際に呼ぶ ---
             # 無効化の確認、重複の拒否、実行前判定はこの中で行われる。
@@ -1068,7 +1120,9 @@ class Agent:
             knowledge=self.initial_knowledge,
         )
 
-    def _after_tools(self, entries: list[ToolHistoryEntry], *, notice: str = "") -> None:
+    def _after_tools(
+        self, entries: list[ToolHistoryEntry], *, notice: str = ""
+    ) -> None:
         """
         実行直後。今回の結果を評価してmemoryへ反映する。
 
@@ -1105,7 +1159,9 @@ class Agent:
                 seen.add(name)
                 found = self._resolve_invokable(name)
                 if found is None:
-                    self._unresolved_targets.append((name, "存在しないtool/agentです。"))
+                    self._unresolved_targets.append(
+                        (name, "存在しないtool/agentです。")
+                    )
                 elif self._is_disabled(found):
                     self._unresolved_targets.append((name, "現在無効化されています。"))
                 else:
@@ -1133,8 +1189,9 @@ class Agent:
         spec = PHASE_SPECS[phase]
         cfg = self.resolve_generation(phase)
 
-        # 会話履歴はプロンプト文字列へ埋め込まずmessagesとして渡す（埋め込むと
-        # モデルのマルチターンの扱いを捨てて、ただの長文として読ませることになる）。
+        # 会話履歴はmessagesとして渡さない。shared_memory.conversationに載せ、
+        # 全員が同じ形で読む（窓口だけがマルチターンで受け取ると、委譲先と
+        # 見えている経緯の形が食い違い、窓口には二重に載る）。
         # プロンプトの組み立ては再試行のたびに同じ結果になるので1回だけ行う。
         prompt = self._build_prompt(tool_results=tool_results, extra=extra_prompt)
         system_instruction = self._build_system_instruction(phase)
@@ -1156,7 +1213,9 @@ class Agent:
                 step_no=self._step_no,
             )
             if not gate.proceed:
-                raise GenerationAborted(f"{self.name}の{phase.value}の生成が中止されました。")
+                raise GenerationAborted(
+                    f"{self.name}の{phase.value}の生成が中止されました。"
+                )
             # モデル名が返った場合はそれに差し替える。走行中の状態を見て
             # 軽いモデルへ落とす用途（予算が残り少ない等）のため。
             if gate.model:
@@ -1167,7 +1226,6 @@ class Agent:
                 response = cfg.llm.generate(
                     model=model,
                     prompt=prompt,
-                    messages=self.current_input.history if self.current_input else None,
                     system_instruction=system_instruction,
                     blobs=self._blobs_for(spec) + list(tool_blobs or []),
                     tools=tools,
@@ -1329,7 +1387,9 @@ class Agent:
             rows = _extract_rows(response.text)
             if rows is None:
                 errors = [
-                    DiffError("(全体)", response.text[:200], "JSONの配列として解釈できません")
+                    DiffError(
+                        "(全体)", response.text[:200], "JSONの配列として解釈できません"
+                    )
                 ]
                 ignored = []
                 # 配列として読めなかった場合は適用そのものが起きていない。
@@ -1414,7 +1474,9 @@ class Agent:
                 if isinstance(r, dict) and r.get("field") != DISABLE_FIELD
             ]
             detail = f"（{' / '.join(applied)}）" if applied else "（変更なし）"
-            self.interceptor.notify.memory_updated(f"{self.name}のmemoryを更新しました。{detail}")
+            self.interceptor.notify.memory_updated(
+                f"{self.name}のmemoryを更新しました。{detail}"
+            )
         return errors
 
     def _take_unapplied_notice(self) -> str:
@@ -1597,7 +1659,9 @@ class Agent:
 
         def run_unit(unit: list[tuple[int, _PlannedCall]]) -> dict[int, ToolResult]:
             return {
-                index: item.target.execute(kwargs=item.call.args, interceptor=self.interceptor)
+                index: item.target.execute(
+                    kwargs=item.call.args, interceptor=self.interceptor
+                )
                 for index, item in unit
                 if item.target is not None
             }
@@ -1615,10 +1679,13 @@ class Agent:
                     except Exception as e:  # noqa: BLE001
                         # Invokableは例外を投げない契約だが、スレッドの側で
                         # 何かが起きた場合にここで落とすと1件の失敗が全体を止める。
-                        self.interceptor.notify.error(f"並列実行が例外で終了しました: {e}")
+                        self.interceptor.notify.error(
+                            f"並列実行が例外で終了しました: {e}"
+                        )
                         for index, _ in futures[future]:
                             results.setdefault(
-                                index, ToolResult(error=f"実行中にエラーが発生しました: {e}")
+                                index,
+                                ToolResult(error=f"実行中にエラーが発生しました: {e}"),
                             )
         else:
             for unit in units:
@@ -1639,7 +1706,9 @@ class Agent:
                 # 結果の解釈指示と値の意味は、呼ばれた側が持つ。
                 # 呼んだ側の人格定義へ書き写さない。
                 evaluation=getattr(target, "evaluation", "") if target else "",
-                output_schema=getattr(target, "output_schema", None) if target else None,
+                output_schema=getattr(target, "output_schema", None)
+                if target
+                else None,
             )
 
             # memoryを返したtoolは、その内容をLLMに要約させず直接記録する。
@@ -1766,7 +1835,9 @@ class Agent:
 
         for target in self.initial_tools:
             schema = target.to_declaration().get("parameters") or {}
-            args = {k: v for k, v in kwargs.items() if k in schema.get("properties", {})}
+            args = {
+                k: v for k, v in kwargs.items() if k in schema.get("properties", {})
+            }
             call = FunctionCall(name=target.name, args=args)
 
             missing = [k for k in schema.get("required", []) if _is_blank(args.get(k))]
@@ -1778,7 +1849,9 @@ class Agent:
                     f"必須の引数 {', '.join(missing)} が空のため実行しませんでした。"
                     f"この情報は取得できていません。"
                 )
-                self.interceptor.notify.error(f"{self.name}の初期ステップ '{target.name}': {reason}")
+                self.interceptor.notify.error(
+                    f"{self.name}の初期ステップ '{target.name}': {reason}"
+                )
                 plan.append(_PlannedCall(call=call, decided=ToolResult(error=reason)))
                 continue
 
@@ -1851,8 +1924,8 @@ class Agent:
             self.shared_memory.writing_guide(),
             self.private_memory.writing_guide(),
             section("書き込み先の選び方", ROUTING_GUIDE),
-            # 依頼内容はprompt側で毎ステップ渡るため、memoryへ複写させない。
-            "毎ステップ依頼内容は渡されるため、依頼内容そのものをmemoryへ書く必要はない。",
+            # 依頼は【依頼内容】かconversationで毎ステップ渡るため、memoryへ複写させない。
+            "依頼（依頼内容、またはconversationの原文）は毎ステップ渡されるため、依頼そのものをmemoryへ書き写す必要はない。",
         )
 
     def _render_input_schema(self) -> str:
@@ -1941,7 +2014,7 @@ class Agent:
         ②と③が逆だと、phaseが変わるたびにナレッジ全体が再送になる。
 
           1. 記憶構成が同じエージェントの全phaseで同一
-          2. エージェントごと（ナレッジ / 人格定義 / 各スキーマ / 履歴の扱い）
+          2. エージェントごと（ナレッジ / 人格定義 / 各スキーマ / 直接の依頼の扱い）
           3. phaseごと（memoryの書き方 / tool一覧 / 思考 / ステップの指示）
 
         戻り値は段ごとの配列。区切りを明示する必要があるClaudeがこの境界を
@@ -1971,16 +2044,20 @@ class Agent:
             section("あなたに適用された人格定義", self.system_instruction),
             section("あなたが受け取る依頼の形", self._render_input_schema()),
             section("あなたが返す最終回答の形", self._render_output_schema()),
-            section("会話履歴の扱い", self._history_stance()),
+            section("利用者から直接受けた依頼の扱い", self._direct_request_stance()),
         )
         per_phase = join_sections(
             # ---- ③ phaseで変わる ----
             section(
                 "memoryの書き方",
-                self._render_memory_writing_guide() if spec.include_memory_how_to else "",
+                self._render_memory_writing_guide()
+                if spec.include_memory_how_to
+                else "",
             ),
             section("実行可能なtool / agent", catalog),
-            section("思考の方向づけ", POURING.thinking if spec.include_thinking else ""),
+            section(
+                "思考の方向づけ", POURING.thinking if spec.include_thinking else ""
+            ),
             section("現在のステップでやるべきこと", spec.instruction),
         )
         return [b for b in (universal, per_agent, per_phase) if b]
@@ -2003,7 +2080,8 @@ class Agent:
         # 強制するため、両方に書くと二重提示になる）。ReflexAgentだけは②段に
         # 指示文を常時載せている（FUNCTION_CALLで答えるため強制が効かない）。
         return join_sections(
-            section("依頼内容", run.message),
+            # 利用者から直接受けた依頼は、memoryのconversationに原文として載っている。
+            section("依頼内容", "" if run.from_user else run.message),
             section("現在のmemory", self._render_memory()),
             section("あなたの実行履歴", self.render_tool_history()),
             section("今回の実行結果", tool_results),
@@ -2014,24 +2092,25 @@ class Agent:
             # （system_instruction側へ置けば先頭が毎回変わり、一度も効かなくなる）。
             # astimezone()で明示するのは、UTCで動くサーバーとローカルで
             # 日付がずれるのを気付かずに通さないため。
-            section("現在時刻", datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")),
+            section(
+                "現在時刻", datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            ),
         )
 
-    def _history_stance(self) -> str:
+    def _direct_request_stance(self) -> str:
         """
-        チャット履歴の扱い方。履歴が存在する時だけ提示する。
+        利用者から直接受けた依頼の読み方。respond()で起動した時だけ提示する。
 
-        messagesとして渡すと、モデルは過去のassistantターンを「自分がそう
-        言った」＝正しいこととして扱いやすいため、格下げの指示が要る。
+        【依頼内容】を載せない代わりに、依頼がconversationのどこにあるかを示す。
+        conversationの説明は「requestsを基準に」と委譲先向けに書かれているため、
+        窓口にとっては原文そのものが依頼であることを、ここで上書きする。
         """
-        if not self.current_input or not self.current_input.history:
+        if not self.current_input or not self.current_input.from_user:
             return ""
-        return (
-            """直前のやり取りは会話履歴として渡されている。今回答えるべき要求は、履歴ではなく依頼内容の方である。
-履歴は、依頼内容に含まれる省略や指示対象を理解するための背景情報としてのみ使用する。
-履歴に含まれる過去の自分の回答は事実ではない。「前回そう回答した」という記録にすぎず、対応可否・ツールの可否・業務ルールの根拠にしてはならない。
-ユーザーが過去の回答を否定・修正している場合は、その否定内容を主要求として採用する。"""
-        )
+        return """あなたは利用者から直接依頼を受けている。今回答えるべき依頼は、memoryのconversationにある [message]（今回の原文）である。
+それより前の項目は会話履歴で、今回の原文に含まれる省略・指示語・前提を補うために読む。
+conversationの説明にある「requestsを基準に解釈する」は、委譲を受けた側のための規則である。あなたは原文そのものから、利用者が何を求めているのかを読み取る側にいる。
+利用者が以前の回答を否定・修正している場合は、その否定・修正を今回の主要求として受け取る。"""
 
 
 # ---- ReflexAgent ----
@@ -2059,7 +2138,9 @@ class ReflexAgent(Agent):
         """
         self._carried_blobs.extend(self._collect_blobs(self._execute_initial_tools()))
 
-    def _after_tools(self, entries: list[ToolHistoryEntry], *, notice: str = "") -> None:
+    def _after_tools(
+        self, entries: list[ToolHistoryEntry], *, notice: str = ""
+    ) -> None:
         """
         評価フェーズを持たない。結果は履歴に残るだけ。
 
@@ -2106,5 +2187,3 @@ class ReflexAgent(Agent):
         if not self.current_input:
             return list(self._carried_blobs)
         return self.current_input.blobs + self._carried_blobs
-
-

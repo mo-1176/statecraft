@@ -68,7 +68,9 @@ def parse_tool_return(tool_name: str, returned: Any) -> "ToolResult":
         if isinstance(texts, str):
             texts = [texts]
         if not isinstance(texts, list):
-            return ToolResult(error=f"{tool_name}のmemory['{field_name}']が配列ではありません。")
+            return ToolResult(
+                error=f"{tool_name}のmemory['{field_name}']が配列ではありません。"
+            )
         normalized[str(field_name)] = [str(t) for t in texts]
 
     return ToolResult(value=returned["value"], blobs=list(blobs), memory=normalized)
@@ -203,7 +205,9 @@ class Tool:
                 describe = self.describe_execution or self._default_describe_execution
                 interceptor.notify.execute_start(describe(kwargs))
             except Exception as e:  # noqa: BLE001
-                interceptor.notify.error(f"{tool_name}の実行中メッセージの生成に失敗しました: {e}")
+                interceptor.notify.error(
+                    f"{tool_name}の実行中メッセージの生成に失敗しました: {e}"
+                )
 
         try:
             returned = self.func(**kwargs)
@@ -217,7 +221,9 @@ class Tool:
             if interceptor:
                 interceptor.notify.error(f"{tool_name}の実行が失敗しました: {e}")
             error_message = (
-                str(e) if self.expose_error_details else "ツールの実行中にエラーが発生しました。"
+                str(e)
+                if self.expose_error_details
+                else "ツールの実行中にエラーが発生しました。"
             )
             result = ToolResult(error=error_message)
 
@@ -269,7 +275,10 @@ class Tool:
 
         for name, param in sig.parameters.items():
             # *args / **kwargs はJSON Schemaのプロパティとして表現できないので除外する
-            if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            if param.kind in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
                 continue
 
             properties[name] = self._schema_for(param.annotation)
@@ -330,5 +339,3 @@ class Tool:
             schema["items"] = cls._schema_for(args[0]) if args else {"type": "string"}
 
         return schema
-
-

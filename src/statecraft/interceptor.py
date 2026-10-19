@@ -335,7 +335,9 @@ class Interceptor:
                 try:
                     callback(*args)
                 except Exception:
-                    logger.exception("通知コールバックが例外を送出しました: event=%s", event)
+                    logger.exception(
+                        "通知コールバックが例外を送出しました: event=%s", event
+                    )
 
     def _decide_retry(self, event: str, **kwargs) -> RetryDecision:
         """
@@ -349,7 +351,9 @@ class Interceptor:
             try:
                 verdict = callback(**kwargs)
             except Exception:
-                logger.exception("判定コールバックが例外を送出しました: event=%s", event)
+                logger.exception(
+                    "判定コールバックが例外を送出しました: event=%s", event
+                )
                 # 再試行として扱うと、コールバックの不具合が無限の再試行になる。
                 return RetryDecision(retry=False)
             if verdict is True:
@@ -367,7 +371,9 @@ class Interceptor:
             try:
                 verdict = callback(**kwargs)
             except Exception:
-                logger.exception("判定コールバックが例外を送出しました: event=%s", event)
+                logger.exception(
+                    "判定コールバックが例外を送出しました: event=%s", event
+                )
                 # 「生成してよい」と解釈すると、予算の門が不具合で開く。
                 return GenerateDecision(proceed=False)
             if verdict is True:
@@ -390,7 +396,9 @@ class Interceptor:
                 try:
                     verdict = callback(**kwargs)
                 except Exception:
-                    logger.exception("判定コールバックが例外を送出しました: event=%s", event)
+                    logger.exception(
+                        "判定コールバックが例外を送出しました: event=%s", event
+                    )
                     # 例外の内容は理由にしない（実装の不具合が外へ出る）。
                     return CheckResult(allowed=False)
                 if verdict is True:
@@ -400,5 +408,3 @@ class Interceptor:
                     allowed=False, reason=verdict if isinstance(verdict, str) else ""
                 )
             return CheckResult(allowed=True)
-
-

@@ -47,5 +47,3 @@ def with_timing(func):
         return result
 
     return wrapper
-
-

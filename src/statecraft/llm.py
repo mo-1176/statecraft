@@ -119,7 +119,9 @@ class LLMResponse:
     # LLMが「このツールを呼んでほしい」と要求した内容。
     # 空リストなら、ツールを呼ばずテキストで答えたということ。
     function_calls: list[FunctionCall] = field(default_factory=list)
-    input_tokens: int = 0  # このリクエストで消費した入力トークン数（キャッシュ分を含む合計）
+    input_tokens: int = (
+        0  # このリクエストで消費した入力トークン数（キャッシュ分を含む合計）
+    )
     output_tokens: int = 0  # このリクエストで生成した出力トークン数
 
     # input_tokensのうち、キャッシュから読まれた分。安く課金される。
@@ -136,7 +138,9 @@ class LLMResponse:
     # これが無いと「モデルが何も返さなかった」と区別が付かない。
     stop_reason: str = ""
 
-    execution_time: float = 0.0  # API応答にかかった時間（秒）。with_timingが自動で埋める
+    execution_time: float = (
+        0.0  # API応答にかかった時間（秒）。with_timingが自動で埋める
+    )
 
     @property
     def has_calls(self) -> bool:
@@ -235,7 +239,9 @@ def _normalize_messages(messages: list[dict] | None) -> list[tuple[str, str]]:
     normalized = []
     for i, m in enumerate(messages or []):
         if not isinstance(m, dict):
-            raise TypeError(f"messages[{i}]はrole/contentを持つ辞書である必要があります")
+            raise TypeError(
+                f"messages[{i}]はrole/contentを持つ辞書である必要があります"
+            )
 
         role = m.get("role")
         # "model"（Gemini語彙）で渡されても受け付ける
@@ -376,7 +382,9 @@ class GeminiLLM(BaseLLM):
         if use_vertex:
             if not project_id:
                 raise ValueError("Vertex AI を使用する場合は project_id が必須です。")
-            self.client = genai.Client(vertexai=True, project=project_id, location=location)
+            self.client = genai.Client(
+                vertexai=True, project=project_id, location=location
+            )
         else:
             self.client = genai.Client(api_key=api_key)
 
@@ -493,7 +501,9 @@ class GeminiLLM(BaseLLM):
         tool_config = None
         if formatted_tools and tool_choice:
             tool_config = types.ToolConfig(
-                function_calling_config=types.FunctionCallingConfig(mode=tool_choice.upper())
+                function_calling_config=types.FunctionCallingConfig(
+                    mode=tool_choice.upper()
+                )
             )
 
         # --- ⑤ リクエスト設定をまとめる --------------------------------------
@@ -501,7 +511,9 @@ class GeminiLLM(BaseLLM):
             # SDKの自動関数呼び出し（AFC）を必ず切る。有効なままだと
             # SDK自身がPython関数を呼んでしまい、呼び出し手前の確認
             # （無効化／重複実行／before_execute）と計測が全部迂回される。
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
             temperature=temperature,
             max_output_tokens=max_tokens,
             tools=formatted_tools,
@@ -729,7 +741,8 @@ class OpenAILLM(BaseLLM):
 
         # 過去の履歴 → 今回のターン、の順で組み立てる。
         api_messages.extend(
-            {"role": role, "content": text} for role, text in _normalize_messages(messages)
+            {"role": role, "content": text}
+            for role, text in _normalize_messages(messages)
         )
 
         if prompt or blobs:
@@ -753,7 +766,9 @@ class OpenAILLM(BaseLLM):
         if tools:
             kwargs["tools"] = self._format_tools(tools)
             if tool_choice:
-                kwargs["tool_choice"] = "required" if tool_choice == "any" else tool_choice
+                kwargs["tool_choice"] = (
+                    "required" if tool_choice == "any" else tool_choice
+                )
 
         # OpenAIはreasoning_effortという語彙で受け取る。ThoughtLevelの
         # 段階名をそのまま送る（Geminiのthinking_levelと同じ扱い）。
@@ -906,7 +921,11 @@ class ClaudeLLM(BaseLLM):
                 blocks.append(
                     {
                         "type": "document",
-                        "source": {"type": "text", "media_type": "text/plain", "data": text},
+                        "source": {
+                            "type": "text",
+                            "media_type": "text/plain",
+                            "data": text,
+                        },
                     }
                 )
             elif mime.startswith(("audio/", "video/")):
@@ -956,7 +975,10 @@ class ClaudeLLM(BaseLLM):
         if tail:
             # 区切りの上限を超えた分は、最後の段へまとめる（区切りは打てない）。
             head[-1] = "\n\n".join([head[-1], *tail])
-        return [{"type": "text", "text": b, "cache_control": {"type": "ephemeral"}} for b in head]
+        return [
+            {"type": "text", "text": b, "cache_control": {"type": "ephemeral"}}
+            for b in head
+        ]
 
     @with_timing
     def generate(
@@ -981,7 +1003,8 @@ class ClaudeLLM(BaseLLM):
         # 値がAnyなのは、contentが文字列（履歴）とブロックのリスト
         # （添付を含む今回のターン）の両方を取るため。
         api_messages: list[dict[str, Any]] = [
-            {"role": role, "content": text} for role, text in _normalize_messages(messages)
+            {"role": role, "content": text}
+            for role, text in _normalize_messages(messages)
         ]
 
         if prompt or blobs:
@@ -1026,7 +1049,9 @@ class ClaudeLLM(BaseLLM):
             instruction = _json_only_instruction(response_schema)
             # 最後の段（phase固有）へ足す。phaseが決まればスキーマも決まるので、
             # 別の段にするとその段だけキャッシュが当たらなくなる。
-            blocks = [*blocks[:-1], blocks[-1] + instruction] if blocks else [instruction]
+            blocks = (
+                [*blocks[:-1], blocks[-1] + instruction] if blocks else [instruction]
+            )
         if blocks:
             kwargs["system"] = self._cached_system(blocks)
 
@@ -1069,7 +1094,9 @@ class ClaudeLLM(BaseLLM):
             # 他プロバイダ（内数として報告）と揃えるため、合計をinput_tokensとする。
             cached_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
             cache_write_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
-            input_tokens = (usage.input_tokens or 0) + cached_tokens + cache_write_tokens
+            input_tokens = (
+                (usage.input_tokens or 0) + cached_tokens + cache_write_tokens
+            )
 
         # Claudeは複数のブロック（text / tool_use）を並べて返す。
         # content[0]をtextと決めつけると、tool_useが先頭に来た場合に落ちる。
@@ -1079,7 +1106,9 @@ class ClaudeLLM(BaseLLM):
             if block.type == "text":
                 texts.append(block.text)
             elif block.type == "tool_use":
-                calls.append(FunctionCall(name=block.name, args=dict(block.input or {})))
+                calls.append(
+                    FunctionCall(name=block.name, args=dict(block.input or {}))
+                )
 
         return LLMResponse(
             text="".join(texts),
@@ -1095,5 +1124,3 @@ class ClaudeLLM(BaseLLM):
                 getattr(response, "stop_reason", None), _CLAUDE_STOP_REASONS
             ),
         )
-
-

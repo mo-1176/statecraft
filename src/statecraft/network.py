@@ -125,7 +125,10 @@ class Network:
 
                 # agentを置く場合、配線を受けていない実体だと自分だけの空の
                 # 共有記憶で動く。sub_agentsと同じ理由で同じチェックをする。
-                if isinstance(target, Agent) and self.agents.get(target.name) is not target:
+                if (
+                    isinstance(target, Agent)
+                    and self.agents.get(target.name) is not target
+                ):
                     raise ValueError(
                         f"{agent.name}のinitial_tools内の'{target.name}'がagentsに"
                         f"含まれていません。Networkの配線を受けないため、"
@@ -155,7 +158,9 @@ class Network:
             resolved = []
             for name in agent.sub_agent_names:
                 if name not in self.agents:
-                    raise ValueError(f"{agent.name}が存在しないagentを参照しています: {name}")
+                    raise ValueError(
+                        f"{agent.name}が存在しないagentを参照しています: {name}"
+                    )
                 if name == agent.name:
                     raise ValueError(f"{agent.name}が自分自身を参照しています")
                 resolved.append(self.agents[name])
@@ -249,7 +254,7 @@ class Network:
         噛み合わないため。引き継ぎを入れるのはこのメソッドの後。
 
             network.reset()
-            network.shared_memory.back_grounds = carried
+            network.shared_memory.ontology = carried
         """
         # 空にするのではなく差し替える（項目が増えた時の消し忘れを防ぐ）。
         # reset()の前に取った参照は古い実体を指したままになる。
@@ -284,7 +289,6 @@ class Network:
     def token_usage(self) -> dict[str, tuple[int, int]]:
         """Agentごとのトークン消費の内訳。どのAgentが重いかを見るためのもの。"""
         return {
-            name: (a.total_input_tokens, a.total_output_tokens) for name, a in self.agents.items()
+            name: (a.total_input_tokens, a.total_output_tokens)
+            for name, a in self.agents.items()
         }
-
-
