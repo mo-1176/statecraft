@@ -502,7 +502,7 @@ class Agent:
     # （thought_levelと同じ扱い）。既定がNoneなのは、受け付けないモデルが
     # あるため（OpenAIの推論モデル等は値に関わらず400）。
     temperature: float | None = None
-    max_tokens: int = 8192
+    max_tokens: int = 65535
     # どれだけ考えさせるか。Noneならパラメータ自体を送らず、モデルの動的思考に
     # 任せる。明示的にOFFにしたい場合だけThoughtLevel.NONEを指定する。
     thought_level: ThoughtLevel | None = None
