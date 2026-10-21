@@ -774,17 +774,37 @@ class Agent:
         追記ではなく置き換える。respondごとに履歴は全体が渡ってくるため、
         追記すると同じやり取りが重なる。conversationはシステム所有で、
         LLMの差分では書き換えられない。
+
+        idは古い順の連番（turn-1, turn-2, ...）で、最後が今回の発言。
+        今回の発言だけ番号が無いと、時系列がidから読めない。
+
+        末尾のuser-onlyは、利用者の発言だけを抜き出した一覧。依頼の中身は
+        ここを軸に読ませる（_direct_request_stance）。会話をそのまま読ませると、
+        「言い直された解釈に異議が無ければ同意した」と読む会話の規範が働き、
+        過去の回答の解釈が、利用者の訂正をすり抜けて依頼の中身へ入り込む。
+        話者のラベルを明確にするだけでは、この読み方は変わらない。
         """
-        speaker = {"user": "利用者", "assistant": "システムの回答"}
+        speaker = {"user": "利用者", "assistant": "あなた（過去の回答）"}
         entries = [
             MemoryEntry(
-                id=f"history-{i}",
+                id=f"turn-{i}",
                 text=f"{speaker.get(turn.get('role')) or turn.get('role')}: {turn.get('content')}",
             )
             for i, turn in enumerate(history, start=1)
         ]
         entries.append(
-            MemoryEntry(id="message", text=f"利用者（今回の原文）: {message}")
+            MemoryEntry(
+                id=f"turn-{len(history) + 1}", text=f"利用者（今回の発言）: {message}"
+            )
+        )
+        said = [turn.get("content") for turn in history if turn.get("role") == "user"]
+        said.append(message)
+        entries.append(
+            MemoryEntry(
+                id="user-only",
+                text="利用者の発言だけ（古い順、最後が今回）: "
+                + " → ".join(f"「{s}」" for s in said),
+            )
         )
         self.shared_memory.conversation = entries
 
@@ -2104,13 +2124,22 @@ class Agent:
         【依頼内容】を載せない代わりに、依頼がconversationのどこにあるかを示す。
         conversationの説明は「requestsを基準に」と委譲先向けに書かれているため、
         窓口にとっては原文そのものが依頼であることを、ここで上書きする。
+
+        依頼の中身は「今回の発言」ではなく「利用者の発言の積み重ね」とする。
+        今回の発言が訂正や受け入れだけのとき、それ単体には依頼が無く、
+        「省略を履歴で補え」とだけ言うと、補う材料に過去の回答が使われる。
+        過去の回答は、利用者が受け入れたかどうかで扱いを分ける。一律に
+        「利用者が使った語だけ」と縛ると、「じゃあそれで」のような受け入れを落とす。
         """
         if not self.current_input or not self.current_input.from_user:
             return ""
-        return """あなたは利用者から直接依頼を受けている。今回答えるべき依頼は、memoryのconversationにある [message]（今回の原文）である。
-それより前の項目は会話履歴で、今回の原文に含まれる省略・指示語・前提を補うために読む。
-conversationの説明にある「requestsを基準に解釈する」は、委譲を受けた側のための規則である。あなたは原文そのものから、利用者が何を求めているのかを読み取る側にいる。
-利用者が以前の回答を否定・修正している場合は、その否定・修正を今回の主要求として受け取る。"""
+        return """あなたは利用者から直接依頼を受けている。
+依頼の中身は、利用者の発言の積み重ねで決まる。conversation の user-only（利用者の発言だけを古い順に並べたもの。最後が今回の発言）を軸に読む。
+「あなた（過去の回答）」は、利用者が何に答え、何を受け入れ、何を言い直しているのかを知るために読む。
+- 利用者が過去の回答を受け入れている（その語を使う、「それで」「そう」と同意する）なら、受け入れた内容は依頼の一部になる。
+- 利用者が言い直したり、別の言葉で答えたりしているなら、その部分についての過去の解釈は捨てる。
+- どちらとも言えないなら、過去の回答の解釈を、利用者の意図として確定させない。
+conversationの説明にある「requestsを基準に解釈する」は、委譲を受けた側のための規則である。あなたは原文そのものから、利用者が何を求めているのかを読み取る側にいる。"""
 
 
 # ---- ReflexAgent ----
