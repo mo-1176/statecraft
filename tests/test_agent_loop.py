@@ -444,6 +444,54 @@ def test_respondの原文は共有記憶へ入らない():
     assert agent.shared_memory.requests is None
 
 
+# ---- 会話履歴の記録 ----
+CORRECTION_HISTORY = [
+    {"role": "user", "content": "コンプを揃えたい"},
+    {"role": "assistant", "content": "コンプリートを目指されていますか？"},
+]
+
+
+def test_会話履歴は古い順の連番で記録され最後が今回の発言になる():
+    """今回の発言だけ番号が無いと、時系列がidから読めない。"""
+    llm = FakeLLM([diff_response([]), text_response("ok")])
+    agent = build_agent(llm)
+
+    agent.respond(message="DTMのコンプレッサーのことです", history=CORRECTION_HISTORY)
+
+    entries = agent.shared_memory.conversation
+    assert [e.id for e in entries] == ["turn-1", "turn-2", "turn-3", "user-only"]
+    assert entries[0].text == "利用者: コンプを揃えたい"
+    assert entries[1].text == "あなた（過去の回答）: コンプリートを目指されていますか？"
+    assert entries[2].text == "利用者（今回の発言）: DTMのコンプレッサーのことです"
+
+
+def test_利用者の発言だけの一覧に過去の回答は入らない():
+    """依頼の中身を読む軸。過去の回答の解釈が、訂正をすり抜けて入り込むのを防ぐ。"""
+    llm = FakeLLM([diff_response([]), text_response("ok")])
+    agent = build_agent(llm)
+
+    agent.respond(message="DTMのコンプレッサーのことです", history=CORRECTION_HISTORY)
+
+    user_only = agent.shared_memory.conversation[-1].text
+    assert "「コンプを揃えたい」 → 「DTMのコンプレッサーのことです」" in user_only
+    assert "コンプリート" not in user_only
+
+
+def test_直接の依頼の読み方はrespondのときだけ提示される():
+    """委譲先はrequestsを基準に読むため、利用者の発言を軸にする指示は窓口だけに出す。"""
+    direct = FakeLLM([diff_response([]), text_response("ok")])
+    build_agent(direct).respond(message="x")
+    delegated = FakeLLM([diff_response([]), text_response("ok")])
+    build_agent(delegated).execute(kwargs={"message": "x"})
+
+    def system_text(llm) -> str:
+        return "\n".join(llm.calls[0]["system_instruction"])
+
+    stance = "依頼の中身は、利用者の発言の積み重ねで決まる"
+    assert stance in system_text(direct)
+    assert stance not in system_text(delegated)
+
+
 # ---- 起動ごとの初期化 ----
 def test_前回のタスクは次の起動へ持ち越さない():
     """statusがnextのまま残ると、前回の依頼のためのtool実行が起きる。"""
