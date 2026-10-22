@@ -1327,18 +1327,38 @@ class Agent:
         """
         return (self.shared_memory, self.private_memory)
 
-    def _stale_task_errors(self, executed: list[ToolHistoryEntry]) -> list[DiffError]:
+    def _executed_task_ids(self, executed: list[ToolHistoryEntry]) -> set[str]:
         """
-        実行済みの対象がstatusに反映されているかを検証する。
+        今回の実行に対応するタスクのid。記憶を更新する前に控える。
 
-        nextのまま残ると次のステップで同じ対象が選ばれ、重複拒否で弾かれる
-        ぶんmax_stepsを使い切るまで無駄が続く。記憶の書き方の誤りとして
-        DiffErrorで差し戻す。失敗した実行は対象にしない（再試行が正しい）。
+        更新の後に「成功した対象を指すnextのタスク」を探すと、結果を見て新しく
+        立てたタスク（同じtoolを別の引数でもう一度、など）まで放置と見なして
+        差し戻してしまう。toolが1つしか無いエージェントは、結果を見て掘り直す
+        ことができなくなる。失敗した実行は対象にしない（再試行が正しい）。
         """
         succeeded = {e.name for e in executed if e.result.success}
         if not succeeded:
-            return []
+            return set()
 
+        pending = (TaskStatus.NEXT, TaskStatus.NEXT_PARALLEL)
+        return {
+            task.id
+            for task in self.private_memory.tasks
+            if task.status in pending and succeeded & set(task.target_names)
+        }
+
+    def _stale_task_errors(self, executed_ids: set[str]) -> list[DiffError]:
+        """
+        実行済みのタスクがstatusに反映されているかを検証する。
+
+        nextのまま残ると次のステップで同じ対象が選ばれ、重複拒否で弾かれる
+        ぶんmax_stepsを使い切るまで無駄が続く。記憶の書き方の誤りとして
+        DiffErrorで差し戻す。
+
+        見るのは実行前から控えていたidだけ。このステップで新しく作った
+        タスクは、同じ対象を指していても通す（全く同じ呼び出しの繰り返しは
+        重複拒否が止める）。
+        """
         pending = (TaskStatus.NEXT, TaskStatus.NEXT_PARALLEL)
         return [
             DiffError(
@@ -1347,10 +1367,11 @@ class Agent:
                 f"このタスクの対象（{'、'.join(task.target_names)}）は今回実行済みだが、"
                 f"statusが{task.status.value}のまま残っている。"
                 "done（完了）/ unnecessary（不要になった）/ conditional（前段の結果次第）"
-                "のいずれかへ必ず更新すること。",
+                "のいずれかへ必ず更新すること。"
+                "同じ対象で続けて別の実行が必要なら、新しいidのタスクとして作ること。",
             )
             for task in self.private_memory.tasks
-            if task.status in pending and succeeded & set(task.target_names)
+            if task.id in executed_ids and task.status in pending
         ]
 
     def _update_memory(
@@ -1396,6 +1417,9 @@ class Agent:
         # ループ内で必ず代入されるが（max(1, ...)により最低1回は回る）、
         # 型チェッカーはそこまで推論しないため明示的に初期化する。
         rows: list | None = None
+        # 差分の適用は試行ごとに繰り返されるので、実行したタスクは試行に入る前に
+        # 控える（1回目の適用の後に控えると、書き換えた後のtasksを見てしまう）。
+        executed_ids = self._executed_task_ids(executed) if executed else set()
         # 0以下だとループが一度も回らず、memoryを作らないまま「更新しました」と
         # 通知してしまう。最低1回は必ず生成する。
         for attempt in range(1, max(1, self.max_memory_retries) + 1):
@@ -1429,8 +1453,8 @@ class Agent:
                 applied_seq = diff.apply_seq
                 # 書き込みが通ったうえで、実行済みのタスクが放置されていないかを見る。
                 # apply_diffは1行ずつしか見ないので「書かれなかったこと」は拾えない。
-                if executed:
-                    errors.extend(self._stale_task_errors(executed))
+                if executed_ids:
+                    errors.extend(self._stale_task_errors(executed_ids))
 
             ignored_all.extend(ignored)
 

@@ -282,6 +282,58 @@ def test_不正な差分は差し戻して再生成させる():
     assert "前回の更新で失敗した項目" in llm.calls[1]["prompt"]
 
 
+def test_実行したタスクをnextのまま残すと差し戻す(search_tool):
+    """放置すると次のステップで同じ対象が選ばれ、重複拒否で空回りする。"""
+    llm = FakeLLM(
+        [
+            diff_response([task_row("t-1", "規程を調べる", "next", ["search_rules"])]),
+            call_response("search_rules", topic="貸出"),
+            # 実行したt-1をnextのまま残す
+            diff_response([{"field": "facts", "id": "f-1", "text": "一般は5冊まで"}]),
+            diff_response([task_row("t-1", "規程を調べる", "done", ["search_rules"])]),
+            text_response("5冊までです。"),
+        ]
+    )
+    agent = build_agent(llm, tools=[search_tool])
+
+    agent.respond(message="貸出は何冊まで？")
+
+    # 記憶の更新がやり直され、その指示に放置の理由が載っていること
+    assert len(llm.calls) == 5
+    assert "今回実行済みだが" in llm.calls[3]["prompt"]
+
+
+def test_結果を見て同じtoolで掘り直すタスクは差し戻さない(search_tool):
+    """
+    1回目の結果を見て、同じtoolを別の引数で呼ぶタスクを新しく立てる台本。
+    toolが1つしか無いエージェントでも、結果から生まれた次の問いへ進めること。
+    """
+    llm = FakeLLM(
+        [
+            diff_response([task_row("t-1", "規程を調べる", "next", ["search_rules"])]),
+            call_response("search_rules", topic="貸出"),
+            diff_response(
+                [
+                    {"field": "facts", "id": "f-1", "text": "延長は別の規程による"},
+                    task_row("t-1", "規程を調べる", "done", ["search_rules"]),
+                    task_row("t-2", "延長の規程を調べる", "next", ["search_rules"]),
+                ]
+            ),
+            call_response("search_rules", topic="延長"),
+            diff_response([task_row("t-2", "延長の規程を調べる", "done", ["search_rules"])]),
+            text_response("延長は1回までです。"),
+        ]
+    )
+    agent = build_agent(llm, tools=[search_tool])
+
+    response = agent.respond(message="貸出の延長はできる？")
+
+    assert response.text == "延長は1回までです。"
+    assert search_tool.calls == ["貸出", "延長"]
+    # 記憶の更新が差し戻されていない（台本どおり6回で終わる）
+    assert len(llm.calls) == 6
+
+
 def test_リトライを使い切っても止まらない():
     """通った分だけを残して進む（欠けた分はerrorイベントで通知される）。"""
     errors = []
