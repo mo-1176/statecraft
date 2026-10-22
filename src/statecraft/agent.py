@@ -1364,11 +1364,12 @@ class Agent:
             DiffError(
                 "tasks",
                 {"field": "tasks", "id": task.id, "status": task.status.value},
-                f"このタスクの対象（{'、'.join(task.target_names)}）は今回実行済みだが、"
+                f"このタスクの対象（{'、'.join(task.target_names)}）は今回呼び出されたが、"
                 f"statusが{task.status.value}のまま残っている。"
-                "done（完了）/ unnecessary（不要になった）/ conditional（前段の結果次第）"
-                "のいずれかへ必ず更新すること。"
-                "同じ対象で続けて別の実行が必要なら、新しいidのタスクとして作ること。",
+                "今回の呼び出しの引数と結果を見て、このタスクの目的が満たされたかを確かめ、"
+                "statusを更新すること。満たされたならdone。"
+                "今回の呼び出しに含まれていなかった内容や、結果が目的に届かなかった内容は、"
+                "依頼の中身を変えた新しいidのタスクとして作り、このタスクはunnecessaryにする。",
             )
             for task in self.private_memory.tasks
             if task.id in executed_ids and task.status in pending

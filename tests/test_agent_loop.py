@@ -300,7 +300,7 @@ def test_実行したタスクをnextのまま残すと差し戻す(search_tool)
 
     # 記憶の更新がやり直され、その指示に放置の理由が載っていること
     assert len(llm.calls) == 5
-    assert "今回実行済みだが" in llm.calls[3]["prompt"]
+    assert "今回呼び出されたが" in llm.calls[3]["prompt"]
 
 
 def test_結果を見て同じtoolで掘り直すタスクは差し戻さない(search_tool):
