@@ -742,16 +742,17 @@ class Agent:
         委譲先にとっての要求の解釈の基準はrequests（委譲された時点で構造化された
         依頼）のままで、conversationは解釈を補う材料として読ませる。
         """
+        turns = list(history or [])
         self._begin_run(
             RunInput(
                 message=message,
                 kwargs={"message": message},
-                history=list(history or []),
+                history=turns,
                 blobs=list(blobs or []),
                 from_user=True,
             )
         )
-        self._record_conversation(message, self.current_input.history)
+        self._record_conversation(message, turns)
         # トークンは累計を保持したまま、今回分だけを差分で返す。
         # 累計はNetwork.total_tokens()がセッション全体の集計に使う。
         before_in, before_out = self.total_input_tokens, self.total_output_tokens
@@ -785,11 +786,13 @@ class Agent:
         話者のラベルを明確にするだけでは、この読み方は変わらない。
         """
         speaker = {"user": "利用者", "assistant": "あなた（過去の回答）"}
+
+        def label(turn: dict) -> str:
+            role = str(turn.get("role"))
+            return speaker.get(role, role)
+
         entries = [
-            MemoryEntry(
-                id=f"turn-{i}",
-                text=f"{speaker.get(turn.get('role')) or turn.get('role')}: {turn.get('content')}",
-            )
+            MemoryEntry(id=f"turn-{i}", text=f"{label(turn)}: {turn.get('content')}")
             for i, turn in enumerate(history, start=1)
         ]
         entries.append(
