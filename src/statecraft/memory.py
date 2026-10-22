@@ -42,6 +42,27 @@ class MemoryEntry:
 
     id: str  # この項目の識別子。LLMが付ける（例: "fact-1"）
     text: str  # 内容そのもの
+    # factsの根拠の種類（FACT_BASESのキー）と出典。facts以外では空のまま。
+    # 本文に混ぜずに持つのは、更新のたびに本文へ付け足されて重なるのを防ぐため。
+    # 読む側には、render()が本文の後ろに出す。
+    basis: str = ""
+    source: str = ""
+
+
+# factsの根拠の種類。文章で「根拠を書く」と求めても、出典の無い価格や
+# 記事の記載が、確認した事実として回答まで運ばれた。値として必須にし、
+# 読む側が言い切りの強さを変えられるようにする。
+# 「明記されていた」を一次と二次に分けるのは、当事者の資料と、第三者の
+# 記事やまとめでは、同じ「書いてあった」でも確かさが違うため。
+FACT_BASES = {
+    "primary": "一次情報",
+    "secondary": "二次情報",
+    "observed": "観測",
+    "derived": "導出",
+    "general": "一般知識",
+}
+# 根拠の種類と出典を必須にするプロパティ。
+PROVENANCE_FIELDS = frozenset({"facts"})
 
 
 class TaskStatus(StrEnum):
@@ -144,8 +165,8 @@ ROUTING_GUIDE = """
 - 根拠はあるが、まだ確定していない読み取り              → hypotheses
 - 自分が実際に行った調査・実行と、その結果              → actions
 - 何を採用し、何を採用しなかったかの判断                → decisions
-- 手元のtool / agentで埋められる、未解決の論点          → open_questions
-- 依頼者に聞かないと埋まらない、未解決の論点            → requester_questions
+- 手元のtool / agentで埋められる、未解決の論点          → questions_to_research
+- 依頼者に聞かないと埋まらない、未解決の論点            → questions_to_ask
 - 依頼の読みと、ここまでを踏まえた現時点の理解          → state_briefing
 - これから追加で実行する作業                            → tasks
 - 外に出す必要が全く無い作業上の知識と、tool/agentの使い方の取り決め → task_notes
@@ -157,7 +178,7 @@ ROUTING_GUIDE = """
 - facts と decisions    : 判断の材料か、判断そのものか
 - state_briefing と decisions  : 要求に対して何が言えるかの提示か、何を採用したかの決定か
 - state_briefing と hypotheses : 依頼者が何を前提に何を尋ねているかの読みか、依頼者が何かを取り違えていそうだという読みか
-- open_questions と requester_questions : 手元のtool / agentで埋まるか、依頼者に聞かないと埋まらないか
+- questions_to_research と questions_to_ask : 手元のtool / agentで埋まるか、依頼者に聞かないと埋まらないか
 - vars と task_notes    : 相手にも渡すべき値か、自分が作業で使うだけの値か
 
 factsは対象ごとの断片なので、それだけでは話が飛んで見える。
@@ -364,20 +385,22 @@ state_briefingは、結論だけの短い要約や、factsの羅列だけで済�
     "facts": {
         "description": """今回の件について確認できた情報。今の問いに直接答えるものに限らず、数値・条件・例外・手順・理由・関連する対象を含めて持つ。
 判断に使いやすいよう、対象ごとの断片として持つ。文章として繋がっている必要はない。断片どうしを繋ぐ文脈はstate_briefingが、対象領域の概念構造はontologyが担う。""",
-        "how_to": """ここへ書けるのは、確認できたものだけである。
+        "how_to": """ここへ書けるのは、根拠を示せるものだけである。
 依頼者が述べたことは、それだけでは確認されていない（依頼者の前提が誤っていることもあり、factsへ写すと以降は誰も疑わなくなる）。確認していないならhypothesesへ書く。
 
 回答文ではなくメモとして、である調・体言止めで書く。主語を書き、何についての情報かが単体で分かるようにする。
 同じ対象の情報は1件へ統合する。統合は削ることではなく、数値・条件・例外・但し書き・理由をすべて残す。対象が違うものは別の項目にする。
   例:「対象機能の指定上限：標準で10件。超過分はエラーにならず無視される。上位プランでは50件。上限の変更は管理者のみが申請でき、反映は翌営業日。」
 
-【根拠の種類を書く】
-何を根拠にそう言えるのかを、textの中に含める。根拠の種類によって、以降の扱いが変わる。
-  - 明記されていた（例:「規程書に、標準上限は10件と明記」）
-  - 確認した事実から導いた（明記は無い。どの事実からどう導いたかを書く）
-  - データを実際に観測した（例:「昨日のログでは実際の値は0件」）
-  - 一般知識（個別の確認ではない）→ 今回の対象に当てはまると確かめるまでは、factsではなくhypotheses
-根拠を示せないなら、それはfactsではなくhypothesesである。
+【根拠の種類と出典を、basisとsourceに書く】
+1件ごとに、basis（根拠の種類）とsource（出典）を必ず指定する。読む側は、これを見て言い切りの強さを変える。
+  - primary   … 当事者・公式の資料に明記されていた（例: メーカーの製品ページ、規程書の原本）
+  - secondary … 第三者の記事・まとめに書かれていた。当事者の資料で確かめるまでは、伝え聞いた情報である
+  - observed  … データや実行結果を直接観測した（例:「昨日のログでは実際の値は0件」）
+  - derived   … 確かめた事実から導いた。どの事実からどう導いたかをtextに書く
+  - general   … 一般知識。個別に確かめたものではない
+sourceには、URL・資料名・どのtool / agentの結果かを書く。1件のtextに出典の違う情報を混ぜない（出典ごとに分ける）。
+一般知識はfactsに書いてよいが、それを今回の対象に当てはめた読み（「今回もそうだろう」）は、確かめるまでhypothesesである。
 
 【期限のある情報は、今の状態まで書く】
 開始日・終了日・期限・有効期間のある情報は、日付と一緒に、現在時刻に対してどの状態か（有効・終了済み・開始前）を書く。日付だけを写すと、読む側は今も有効なものとして扱う。
@@ -459,7 +482,8 @@ state_briefingは、結論だけの短い要約や、factsの羅列だけで済�
     "hypotheses": {
         "description": """根拠はあるが、まだ確定していない読み取り。
 対象についての読み取りだけでなく、依頼者の取り違えについての読み取りもここに含む。""",
-        "how_to": """推測だと分かる形で書き、何を根拠にそう考えたかを併記する。確定させないまま、それを前提とした作業を始めない。
+        "how_to": """推測だと分かる形で書き、何を根拠にそう考えたかを併記する。手元のtool / agentで確かめられるものは、確かめる前に、それを前提とした作業を始めない。
+確かめる手段の無いもの（依頼者の好みなど）について、答えが無いまま進めるために置いた仮定もここへ書く。仮定であることと、外れていた場合に結論がどう変わるかを書く。仮定の上で進めることと、仮定を確かめたことは違う。
 
 一般論として成り立つことを今回の対象へ当てはめたものは、確認するまで仮説である。知識として書かれているからといって、今回の対象がその条件に該当している保証はない。該当を確かめずにfactsへ書くと、以降のすべての判断が、確認されていない前提の上で進む。
 
@@ -468,27 +492,29 @@ state_briefingは、結論だけの短い要約や、factsの羅列だけで済�
 何をどう取り違えていそうか、何を見てそう思うのか、取り違えていた場合に要求がどう変わるのかを書く。
 factsへ書くと、確定していない取り違えを断定して指摘することになる。これは依頼者を正すためではなく、こちらが誤った要求を解かないために書く。""",
     },
-    "open_questions": {
-        "description": """まだ答えが出ていない論点のうち、手元のtool / agentで解決できるもの。""",
+    "questions_to_research": {
+        "description": """調べる問い。まだ答えが出ていない論点のうち、手元のtool / agentで解決できるもの。""",
         "how_to": """何について、なぜ未解決なのか、何が分かれば解決するのかまで書く。
-ここに書くのは、手元のtool / agentで埋まるものだけにする。依頼者に聞かなければ分からないことはrequester_questionsへ書く（ここに書くと、見つからないものを探し続けることになる）。
+ここに書くのは、手元のtool / agentで埋まるものだけにする。依頼者に聞かなければ分からないことはquestions_to_askへ書く（ここに書くと、見つからないものを探し続けることになる）。
 委譲先が判断すべきことも、ここには書かない。相手の技能や情報で解決することは、tasksとして委譲する。
 
-【解決したら書き換える】
+【解決と、仮定で進めることを分ける】
 答えが出た論点は、同じidで、解決したことが分かる形に書き換える。答えそのものはfactsへ書く。
   例:「（解決済み）在庫状態は貸出中と確認できた。fact-1を参照」
+調べても答えが出なかった論点は、解決済みにしない。何を試して見つからなかったのかを書き足し、未解決のまま残す。答えが無いまま進めるために置いた仮定は、hypothesesへ書く。
 記憶から項目を消す手段は無いため、書き換えないと未解決の論点として読まれ続け、答えの出ていることを再び調べ始める。""",
     },
-    "requester_questions": {
-        "description": """まだ答えが出ていない論点のうち、依頼者に聞かなければ解決できないもの。
+    "questions_to_ask": {
+        "description": """尋ねる問い。まだ答えが出ていない論点のうち、依頼者に聞かなければ解決できないもの。
 依頼者自身の状況・目的・経験・好み・手元の環境のように、手元のどのtool / agentで調べても出てこないものがここに入る。
 最終回答で、依頼者への問いになる。委譲を受けた側にとっての依頼者は委譲元であり、委譲元はここを読んで、自分で答えるか、さらに自分の依頼者へ尋ねる。""",
         "how_to": """何を知りたいのか、なぜ手元では埋まらないのか、それが分かると結論がどう変わるのかを書く。結論を変えないものは書かない。
 ここにある論点は、tasksにしない。調べても出てこないものを調べに行くことになる。分からないままでも、分かっている範囲の結論は出せる。
 尋ねることを理由に、調べる手を止めない。依頼者の答えがどうであっても必要になる情報（選ぶときの軸、軸ごとの代表的な選択肢など）は、手元のtool / agentで先に集め、分かる範囲の結論を用意してから尋ねる。
 
-【解決したら書き換える】
-依頼者が答えた（会話に答えが現れた）論点は、同じidで、解決したことが分かる形に書き換える。答えの中身は、state_briefingの依頼の読みへ反映する。""",
+【解決と、仮定で進めることを分ける】
+依頼者が答えた（会話に答えが現れた）論点は、同じidで、解決したことが分かる形に書き換える。答えの中身は、state_briefingの依頼の読みへ反映する。
+依頼者の答えが無いまま進める時は、解決済みにしない。置いた仮定をhypothesesへ書き、この問いは未解決のまま残す（最終回答で尋ねる問いになる）。""",
     },
     "agent_answers": {
         "description": """各エージェントが出した回答。単独のエージェントの出力であり、検証されていない結論を含みうる。そのまま最終的な結論として採用せず、判断材料として読む。""",
@@ -621,6 +647,9 @@ class BaseMemory:
         if isinstance(e, TaskEntry):
             targets = ", ".join(e.target_names) if e.target_names else "(対象なし)"
             return f"  - [{e.id}] ({e.status.value}) {e.text} → {targets}"
+        if e.basis:
+            label = FACT_BASES.get(e.basis, e.basis)
+            return f"  - [{e.id}] {e.text}［根拠: {label} / 出典: {e.source}］"
         return f"  - [{e.id}] {e.text}"
 
     def render(self) -> str:
@@ -726,14 +755,15 @@ class SharedMemory(BaseMemory):
     hypotheses: list[MemoryEntry] = field(
         default_factory=list
     )  # 根拠はあるが未確定の推測
-    open_questions: list[MemoryEntry] = field(
-        default_factory=list
-    )  # まだ解決していない論点（手元のtool / agentで埋まるもの）
-    # 依頼者に聞かないと埋まらない論点。open_questionsと分けているのは、
-    # 埋め方が違う（調べに行くか、尋ねるか）のに同じ置き場だと、モデルが
-    # 問いの形をしたものを全部open_questionsへ入れ、調べても出てこないものを
-    # 委譲して探し続けたため。書き分けを説明しても置き場が1つでは守られなかった。
-    requester_questions: list[MemoryEntry] = field(default_factory=list)
+    # まだ解決していない論点を、埋め方で2つに分けて持つ。
+    #   questions_to_research … 手元のtool / agentで調べて埋めるもの
+    #   questions_to_ask      … 依頼者に尋ねないと埋まらないもの
+    # 置き場が1つだと、モデルが問いの形をしたものを全部そこへ入れ、調べても
+    # 出てこないものを委譲して探し続けた。置き場を分けても、片方の名前が
+    # open_questions（どんな問いでも入りそうな名前）だと、依頼者への問いが
+    # そちらへ入り続けたため、名前を「調べる / 尋ねる」の動詞で対比させている。
+    questions_to_research: list[MemoryEntry] = field(default_factory=list)
+    questions_to_ask: list[MemoryEntry] = field(default_factory=list)
     agent_answers: list[MemoryEntry] = field(
         default_factory=list
     )  # 各エージェントの回答（追記専用）
@@ -844,9 +874,12 @@ class DiffError:
 # 1つの結果を複数の書き先へ展開し、問いに直接答えない条件・例外も残す形を見せる。
 DIFF_EXAMPLE = """[
   {"field": "vars", "id": "仕様書のURL", "text": "対象機能の仕様書のURL: https://example.com/spec/123"},
-  {"field": "facts", "id": "fact-1", "text": "対象機能の指定上限（仕様書に明記）：標準プランで10件、上位プランで50件。上限は、一括処理の負荷を契約の処理量に見合わせるために設けられている。上限を超えた分はエラーにならず、11件目以降が無視される。"},
-  {"field": "facts", "id": "fact-2", "text": "対象機能の上限変更（仕様書に明記）：管理者のみが申請でき、反映は申請の翌営業日。一時的な引き上げは受け付けない。"},
-  {"field": "facts", "id": "fact-3", "text": "部署単位での上限の設定（仕様書の上限の節を確認）：記載なし。可能とも不可とも書かれていない。上限はプラン単位でのみ説明されている。"},
+  {"field": "facts", "id": "fact-1", "text": "対象機能の指定上限：標準プランで10件、上位プランで50件。上限は、一括処理の負荷を契約の処理量に見合わせるために設けられている。上限を超えた分はエラーにならず、11件目以降が無視される。",
+   "basis": "primary", "source": "対象機能の仕様書 https://example.com/spec/123"},
+  {"field": "facts", "id": "fact-2", "text": "対象機能の上限変更：管理者のみが申請でき、反映は申請の翌営業日。一時的な引き上げは受け付けない。",
+   "basis": "primary", "source": "対象機能の仕様書 https://example.com/spec/123"},
+  {"field": "facts", "id": "fact-3", "text": "部署単位での上限の設定：記載なし（仕様書の上限の節を確認）。可能とも不可とも書かれていない。上限はプラン単位でのみ説明されている。",
+   "basis": "primary", "source": "対象機能の仕様書 https://example.com/spec/123"},
   {"field": "ontology", "id": "対象機能の指定上限", "text": "対象機能の指定上限は、一括処理の負荷を契約の処理量に見合わせるために、プランごとに定められている。超えた指定は無視される。エラーにならないため、超過は失敗としては現れず、指定した件数と反映された件数の食い違いとして現れる。上限を超えて使う手段は、上位プランへの変更と、管理者による上限変更の申請の2つ。"},
   {"field": "hypotheses", "id": "hyp-1", "text": "依頼者は、12件を指定すれば全件が反映されると考えている可能性がある。超過分はエラーにならず無視される仕様のため、指定できていないことに気付きにくい（fact-1）。取り違えていた場合、求められているのは指定の方法ではなく、10件を超えて反映させる手段になる。"},
   {"field": "actions", "id": "action-1", "text": "指定上限を確認するため仕様を照会した。上限値に加え、超過時の挙動と上限変更の手続きも得られた。"},
@@ -912,6 +945,18 @@ def build_diff_schema(*memories, allow_disable: bool = False) -> dict:
         "text": {"type": "string", "description": "記録する内容"},
     }
 
+    # factsを持つmemoryが含まれる時だけ、根拠の種類と出典のフィールドを足す。
+    if PROVENANCE_FIELDS & set(fields):
+        properties["basis"] = {
+            "type": "string",
+            "enum": list(FACT_BASES),
+            "description": """factsの場合は必ず指定する、根拠の種類。primary=当事者・公式の資料に明記（メーカー、販売元、規程の原本など）、secondary=第三者の記事・まとめに記載、observed=データや実行結果を直接観測した、derived=確かめた事実から導いた、general=一般知識。指定しないとその行は差し戻される""",
+        }
+        properties["source"] = {
+            "type": "string",
+            "description": """factsの場合は必ず指定する、出典。URL、資料名、どのtool / agentの結果か。generalなら省略できる""",
+        }
+
     # tasksを持つmemoryが含まれる時だけ、タスク用のフィールドを足す。
     if any(t is TaskEntry for t in fields.values()):
         properties["status"] = {
@@ -948,8 +993,38 @@ def build_diff_schema(*memories, allow_disable: bool = False) -> dict:
     }
 
 
-def _build_entry(entry_type, raw: dict):
-    """1件分の生データからエントリを作る。不正なら例外を投げる。"""
+def _provenance(raw: dict, default_source: str) -> tuple[str, str]:
+    """
+    factsの行から、根拠の種類と出典を取り出す。不正なら例外を投げる。
+
+    default_source: tool由来の書き込み（ToolResult.memory）ではtool名が入る。
+        toolは根拠の種類を知らないので、指定が無ければ「観測」とし、
+        出典はtool名にする（toolが返した値を、そのまま記録したものだから）。
+    """
+    basis = raw.get("basis")
+    if not basis and default_source:
+        return "observed", str(raw.get("source") or default_source)
+    if basis not in FACT_BASES:
+        valid = " / ".join(FACT_BASES)
+        raise ValueError(f"factsにはbasis（根拠の種類）を指定してください（指定可能: {valid}）")
+    source = str(raw.get("source") or "").strip()
+    if not source:
+        if basis != "general":
+            raise ValueError(
+                "factsにはsource（出典: URL、資料名、どのtool / agentの結果か）を指定してください"
+            )
+        source = FACT_BASES["general"]
+    return basis, source
+
+
+def _build_entry(
+    entry_type, raw: dict, *, provenance: bool = False, default_source: str = ""
+):
+    """
+    1件分の生データからエントリを作る。不正なら例外を投げる。
+
+    provenance: 根拠の種類と出典を必須にするプロパティ（facts）への書き込みならTrue。
+    """
     if not isinstance(raw, dict) or "id" not in raw or "text" not in raw:
         raise ValueError("id と text を持つオブジェクトである必要があります")
 
@@ -982,6 +1057,9 @@ def _build_entry(entry_type, raw: dict):
             target_names=[str(t) for t in raw_targets],
         )
 
+    if provenance:
+        basis, source = _provenance(raw, default_source)
+        return MemoryEntry(id=entry_id, text=str(raw["text"]), basis=basis, source=source)
     return MemoryEntry(id=entry_id, text=str(raw["text"]))
 
 
@@ -1151,7 +1229,13 @@ def _apply_diff(
         resolved.append(row)
 
         try:
-            _upsert(bucket, _build_entry(entry_type, row))
+            entry = _build_entry(
+                entry_type,
+                row,
+                provenance=field_name in PROVENANCE_FIELDS,
+                default_source=id_prefix or "",
+            )
+            _upsert(bucket, entry)
         except ValueError as e:
             # 行の中身が不正だった場合（idが空、statusが不正など）。
             # 例外は外へ出さず、この行だけを失敗として集める。

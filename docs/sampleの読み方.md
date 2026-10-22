@@ -53,7 +53,7 @@ python sample.py "貸出は何冊まで？"
 
 APIキーは `.env` に置きます（`.env.example` をコピーして書き換える）。探す順は 環境変数 → `.env` → 起動時の入力欄（伏せ字）です。入力欄で入れた場合もチェックを入れたまま進めれば `.env` へ保存され、次回からは聞かれません。
 
-2回目以降は、前回の記憶のうち `back_grounds` と `vars` が引き継がれます（`sample_carry_over.json`）。
+2回目以降は、前回の記憶のうち `ontology` と `vars` が引き継がれます（`sample_carry_over.json`）。
 
 ```bash
 python sample.py "深夜特急を予約したい。会員番号はM-001"
@@ -531,17 +531,17 @@ PLATFORM = "ai_studio"
 **引き継ぎの仕組みはフレームワーク側にありません。** 何をセッションとみなすかはアプリケーションごとに違うためです。
 
 ```python
-CARRY_OVER_FIELDS = ("back_grounds", "vars")
+CARRY_OVER_FIELDS = ("ontology", "vars")
 ```
 
 | | 引き継ぐ | なぜ |
 |---|---|---|
-| `back_grounds` | **する** | 対象のモデル。質問が変わっても成り立つ |
+| `ontology` | **する** | 対象のモデル。質問が変わっても成り立つ |
 | `vars` | **する** | 値そのものが変わらない |
 | `facts` | しない | 別の件では無関係な事実が混ざる |
 | `actions` | しない | 「もう調べた」と誤認する |
 | `decisions` | しない | 前のターンの解釈に縛られる |
-| `hypotheses` / `open_questions` | しない | 前のターンの未解決論点を追い続ける |
+| `hypotheses` / `questions_to_research` | しない | 前のターンの未解決論点を追い続ける |
 
 **絞るのは保存する側です。** 保存しなければ引き継がれようがありません。
 
@@ -556,7 +556,7 @@ setattr(net.shared_memory, name, [MemoryEntry(id=r["id"], text=r["text"]) for r 
 引き継ぎが効いているかは、実行の冒頭に出ます。
 
 ```
-前回から引き継いだ記憶: back_grounds 2件 / vars 1件
+前回から引き継いだ記憶: ontology 2件 / vars 1件
 ```
 
 ---

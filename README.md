@@ -124,7 +124,7 @@ python sample.py
 python sample.py "貸出は何冊まで？"
 ```
 
-2回目以降は前回の記憶のうち一部（`back_grounds` と `vars`）が引き継がれ、`sample_carry_over.json` に保存されます。続けて実行すると引き継ぎの効果が見えます。
+2回目以降は前回の記憶のうち一部（`ontology` と `vars`）が引き継がれ、`sample_carry_over.json` に保存されます。続けて実行すると引き継ぎの効果が見えます。
 
 ```bash
 python sample.py "深夜特急を予約したい。会員番号はM-001"
@@ -599,15 +599,15 @@ LLMは記憶を直接書き換えず、**差分の配列**を返します。
 
 | | 内容 |
 |---|---|
-| `facts` | 確定した情報。対象ごとの断片 |
-| `back_grounds` | 対象そのもののモデル（定義・構成・制約・状態・関係） |
+| `facts` | 根拠を示せる情報。対象ごとの断片。1件ごとに根拠の種類（一次情報・二次情報・観測・導出・一般知識）と出典を持つ |
+| `ontology` | 対象領域の概念構造（定義・構成・制約・関係） |
 | `state_briefing` | 断片どうしの繋がりと、現時点の理解。時系列で積み上がる |
 | `vars` | 一字一句失われると困る値（ID・URL・SQL・キー） |
 | `actions` | 何を確認するために何を行い、結果どうなったか |
 | `decisions` | 何を採用し、何を採用しなかったか |
 | `hypotheses` | 根拠はあるが未確定の読み取り |
-| `open_questions` | 手元のtool / agentで解決できる未解決の論点 |
-| `requester_questions` | 依頼者に聞かないと解決できない未解決の論点。最終回答で依頼者への問いになる |
+| `questions_to_research` | 手元のtool / agentで解決できる未解決の論点 |
+| `questions_to_ask` | 依頼者に聞かないと解決できない未解決の論点。最終回答で依頼者への問いになる |
 | `requests` | **システムが書く。** 今回の要求 |
 | `agent_answers` | **システムが書く。** 各Agentの回答 |
 
@@ -662,22 +662,22 @@ specialist_b = Agent(name="b", sub_agent_names=["excel"], ...)
 # 保存
 saved = {
     f: [{"id": e.id, "text": e.text} for e in getattr(net.shared_memory, f)]
-    for f in ("back_grounds", "vars")
+    for f in ("ontology", "vars")
 }
 
 # 復元（Network構築後に代入する）
-net.shared_memory.back_grounds = [MemoryEntry(**r) for r in saved["back_grounds"]]
+net.shared_memory.ontology = [MemoryEntry(**r) for r in saved["ontology"]]
 ```
 
 | | 引き継ぐ | なぜ |
 |---|---|---|
-| `back_grounds` | **する** | 対象のモデル。質問が変わっても成り立つ |
+| `ontology` | **する** | 対象のモデル。質問が変わっても成り立つ |
 | `vars` | **する** | 値そのものが変わらない |
 | `facts` | しない | 別の件では無関係な事実が混ざる |
 | `actions` | しない | 「もう調べた」と誤認する |
 | `decisions` | しない | 前のターンの解釈に縛られる |
-| `hypotheses` / `open_questions` | しない | 前のターンの未解決論点を追い続ける |
-| `requester_questions` | しない | 尋ねた問いは過去の回答として会話に残り、答えも会話から読める |
+| `hypotheses` / `questions_to_research` | しない | 前のターンの未解決論点を追い続ける |
+| `questions_to_ask` | しない | 尋ねた問いは過去の回答として会話に残り、答えも会話から読める |
 
 **絞るのは保存する側で行ってください。** 保存しなければ、引き継がれようがありません。
 
@@ -796,7 +796,7 @@ net["front"].respond(message=...)
 
 ```python
 net.reset()
-net.shared_memory.back_grounds = carried   # 前のターンから引き継ぐもの
+net.shared_memory.ontology = carried   # 前のターンから引き継ぐもの
 ```
 
 `reset()` は共有記憶を**差し替える**ため、呼ぶ前に取っておいた参照は古い実体を指したままになります。呼んだ後に `net.shared_memory` から取り直してください。
@@ -1345,7 +1345,7 @@ pytest -v                                 # 1件ずつ名前を出す
 
 **動作を確認済み**
 
-Geminiでの1往復、委譲、初期ツール、入力/出力スキーマ、実行前の拒否（機械的な条件とエージェント判定の両方）、記憶への直接書き込み、添付の受け渡し、同時実行、ツールの無効化、停滞の検出、phaseごとのモデル切替、記憶の差分イベント、生成の計測、生成前の判定（予算による中止とモデル切替）、生成失敗時の再試行判定（待って再試行／枠切れ時のモデル切替）、会話履歴の読み分け（利用者の訂正と受け入れ）、依頼者に聞く論点の分離（requester_questions）、実行したタスクの到達判定（outcome）の記録、期限のある情報の現在時刻との照合
+Geminiでの1往復、委譲、初期ツール、入力/出力スキーマ、実行前の拒否（機械的な条件とエージェント判定の両方）、記憶への直接書き込み、添付の受け渡し、同時実行、ツールの無効化、停滞の検出、phaseごとのモデル切替、記憶の差分イベント、生成の計測、生成前の判定（予算による中止とモデル切替）、生成失敗時の再試行判定（待って再試行／枠切れ時のモデル切替）、会話履歴の読み分け（利用者の訂正と受け入れ）、依頼者に聞く論点の分離（questions_to_ask）、実行したタスクの到達判定（outcome）の記録、期限のある情報の現在時刻との照合
 
 **未検証**
 
