@@ -1391,11 +1391,12 @@ def dump_memory(net: Network) -> None:
         "state_briefing",
         "vars",
         "facts",
-        "back_grounds",
+        "ontology",
         "actions",
         "decisions",
         "hypotheses",
         "open_questions",
+        "requester_questions",
         "agent_answers",
     ):
         entries = getattr(shared, name)

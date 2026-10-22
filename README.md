@@ -606,7 +606,8 @@ LLMは記憶を直接書き換えず、**差分の配列**を返します。
 | `actions` | 何を確認するために何を行い、結果どうなったか |
 | `decisions` | 何を採用し、何を採用しなかったか |
 | `hypotheses` | 根拠はあるが未確定の読み取り |
-| `open_questions` | 自分で調べれば解決できる未解決の論点 |
+| `open_questions` | 手元のtool / agentで解決できる未解決の論点 |
+| `requester_questions` | 依頼者に聞かないと解決できない未解決の論点。最終回答で依頼者への問いになる |
 | `requests` | **システムが書く。** 今回の要求 |
 | `agent_answers` | **システムが書く。** 各Agentの回答 |
 
@@ -676,6 +677,7 @@ net.shared_memory.back_grounds = [MemoryEntry(**r) for r in saved["back_grounds"
 | `actions` | しない | 「もう調べた」と誤認する |
 | `decisions` | しない | 前のターンの解釈に縛られる |
 | `hypotheses` / `open_questions` | しない | 前のターンの未解決論点を追い続ける |
+| `requester_questions` | しない | 尋ねた問いは過去の回答として会話に残り、答えも会話から読める |
 
 **絞るのは保存する側で行ってください。** 保存しなければ、引き継がれようがありません。
 
