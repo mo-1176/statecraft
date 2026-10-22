@@ -407,3 +407,26 @@ def test_単一値のプロパティは書き込み対象に含まれない():
     assert "facts" in fields
     assert fields["facts"] is MemoryEntry
     assert "requests" not in fields
+
+
+def test_依頼者への問いは調べる問いと別の置き場に入る(memories):
+    """
+    埋め方が違う（調べるか、尋ねるか）ものを同じ置き場にすると、
+    調べても出てこない問いを探しに行く。置き場が分かれていることを守る。
+    """
+    shared, private = memories
+    result = apply_diff(
+        [
+            {"field": "open_questions", "id": "oq-1", "text": "セールの終了日はいつか"},
+            {"field": "requester_questions", "id": "rq-1", "text": "予算はいくらか"},
+        ],
+        shared,
+        private,
+    )
+
+    assert result.errors == []
+    assert [e.id for e in shared.open_questions] == ["oq-1"]
+    assert [e.id for e in shared.requester_questions] == ["rq-1"]
+    # 書き方の説明も、読む側の説明も、この欄の分が載る
+    assert "■ requester_questions" in shared.writing_guide()
+    assert "■ requester_questions" in shared.reading_guide()

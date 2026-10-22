@@ -742,16 +742,17 @@ class Agent:
         委譲先にとっての要求の解釈の基準はrequests（委譲された時点で構造化された
         依頼）のままで、conversationは解釈を補う材料として読ませる。
         """
+        turns = list(history or [])
         self._begin_run(
             RunInput(
                 message=message,
                 kwargs={"message": message},
-                history=list(history or []),
+                history=turns,
                 blobs=list(blobs or []),
                 from_user=True,
             )
         )
-        self._record_conversation(message, self.current_input.history)
+        self._record_conversation(message, turns)
         # トークンは累計を保持したまま、今回分だけを差分で返す。
         # 累計はNetwork.total_tokens()がセッション全体の集計に使う。
         before_in, before_out = self.total_input_tokens, self.total_output_tokens
@@ -785,11 +786,13 @@ class Agent:
         話者のラベルを明確にするだけでは、この読み方は変わらない。
         """
         speaker = {"user": "利用者", "assistant": "あなた（過去の回答）"}
+
+        def label(turn: dict) -> str:
+            role = str(turn.get("role"))
+            return speaker.get(role, role)
+
         entries = [
-            MemoryEntry(
-                id=f"turn-{i}",
-                text=f"{speaker.get(turn.get('role')) or turn.get('role')}: {turn.get('content')}",
-            )
+            MemoryEntry(id=f"turn-{i}", text=f"{label(turn)}: {turn.get('content')}")
             for i, turn in enumerate(history, start=1)
         ]
         entries.append(
@@ -1324,31 +1327,113 @@ class Agent:
         """
         return (self.shared_memory, self.private_memory)
 
-    def _stale_task_errors(self, executed: list[ToolHistoryEntry]) -> list[DiffError]:
+    def _executed_task_ids(self, executed: list[ToolHistoryEntry]) -> set[str]:
         """
-        実行済みの対象がstatusに反映されているかを検証する。
+        今回の実行に対応するタスクのid。記憶を更新する前に控える。
 
-        nextのまま残ると次のステップで同じ対象が選ばれ、重複拒否で弾かれる
-        ぶんmax_stepsを使い切るまで無駄が続く。記憶の書き方の誤りとして
-        DiffErrorで差し戻す。失敗した実行は対象にしない（再試行が正しい）。
+        更新の後に「成功した対象を指すnextのタスク」を探すと、結果を見て新しく
+        立てたタスク（同じtoolを別の引数でもう一度、など）まで放置と見なして
+        差し戻してしまう。toolが1つしか無いエージェントは、結果を見て掘り直す
+        ことができなくなる。失敗した実行は対象にしない（再試行が正しい）。
         """
         succeeded = {e.name for e in executed if e.result.success}
         if not succeeded:
-            return []
+            return set()
 
+        pending = (TaskStatus.NEXT, TaskStatus.NEXT_PARALLEL)
+        return {
+            task.id
+            for task in self.private_memory.tasks
+            if task.status in pending and succeeded & set(task.target_names)
+        }
+
+    def _stale_task_errors(self, executed_ids: set[str]) -> list[DiffError]:
+        """
+        実行済みのタスクがstatusに反映されているかを検証する。
+
+        nextのまま残ると次のステップで同じ対象が選ばれ、重複拒否で弾かれる
+        ぶんmax_stepsを使い切るまで無駄が続く。記憶の書き方の誤りとして
+        DiffErrorで差し戻す。
+
+        見るのは実行前から控えていたidだけ。このステップで新しく作った
+        タスクは、同じ対象を指していても通す（全く同じ呼び出しの繰り返しは
+        重複拒否が止める）。
+        """
         pending = (TaskStatus.NEXT, TaskStatus.NEXT_PARALLEL)
         return [
             DiffError(
                 "tasks",
                 {"field": "tasks", "id": task.id, "status": task.status.value},
-                f"このタスクの対象（{'、'.join(task.target_names)}）は今回実行済みだが、"
+                f"このタスクの対象（{'、'.join(task.target_names)}）は今回呼び出されたが、"
                 f"statusが{task.status.value}のまま残っている。"
-                "done（完了）/ unnecessary（不要になった）/ conditional（前段の結果次第）"
-                "のいずれかへ必ず更新すること。",
+                "今回の呼び出しの引数と結果を見て、このタスクの目的が満たされたかを確かめ、"
+                "statusを更新すること。満たされたならdone。"
+                "今回の呼び出しに含まれていなかった内容や、結果が目的に届かなかった内容は、"
+                "依頼の中身を変えた新しいidのタスクとして作り、このタスクはunnecessaryにする。",
             )
             for task in self.private_memory.tasks
-            if task.status in pending and succeeded & set(task.target_names)
+            if task.id in executed_ids and task.status in pending
         ]
+
+    def _outcome_errors(
+        self, executed_ids: set[str], rows: list, task_ids_before: set[str]
+    ) -> list[DiffError]:
+        """
+        実行したタスクを片付ける行に、結果が目的に届いたか（outcome）を書かせる。
+
+        「目的に届いた時だけdone」と文章で求めても、「調査完了」とだけ書いて
+        doneにされ、問いに答えていない結果のまま回答へ進んだ。届いたかを値で
+        書かせ、届かなかったなら次の手（依頼を変えた新しいタスク、または
+        手段が無い理由のdecisions）を同じ更新に含めさせる。
+
+        rowsは、この更新の試行をまたいで積んだ行。差し戻しで直した行と、
+        1回目に通った行（新しいタスクやdecisions）の両方を見るため。
+        nextのまま残ったタスクは_stale_task_errorsが扱うので、ここでは見ない。
+        """
+        latest: dict[str, dict] = {}
+        for row in rows:
+            if row.get("field") == "tasks":
+                row_id = str(row.get("id", "")).strip()
+                if row_id in executed_ids:
+                    latest[row_id] = row
+
+        pending = (TaskStatus.NEXT, TaskStatus.NEXT_PARALLEL, TaskStatus.CONDITIONAL)
+        has_follow_up = any(
+            row.get("field") == "decisions"
+            or (
+                row.get("field") == "tasks"
+                and str(row.get("id", "")).strip() not in task_ids_before
+                and row.get("status") in {s.value for s in pending}
+            )
+            for row in rows
+        )
+
+        errors = []
+        for task in self.private_memory.tasks:
+            if task.id not in executed_ids or task.status in pending:
+                continue
+            outcome = latest.get(task.id, {}).get("outcome")
+            entry = {"field": "tasks", "id": task.id, "status": task.status.value}
+            if outcome not in ("reached", "not_reached"):
+                message = (
+                    "今回実行したタスクを更新する行には、outcomeに、結果がこのタスクの"
+                    "目的に届いたか（reached / not_reached）を必ず指定すること。"
+                )
+            elif outcome == "not_reached" and task.status is TaskStatus.DONE:
+                message = (
+                    "目的に届かなかったタスクはdoneにしない。unnecessaryにし、"
+                    "届かなかった内容は、依頼の中身を変えた新しいidのタスクとして立てるか、"
+                    "試したことと手段が無い理由をdecisionsへ書くこと。"
+                )
+            elif outcome == "not_reached" and not has_follow_up:
+                message = (
+                    "目的に届かなかった時は、依頼の中身（問い方・引数・範囲）か相手を変えた"
+                    "新しいidのタスクを立てるか、試したことと手段が無い理由をdecisionsへ書くこと。"
+                )
+            else:
+                continue
+            errors.append(DiffError("tasks", entry, message))
+        return errors
 
     def _update_memory(
         self,
@@ -1393,6 +1478,13 @@ class Agent:
         # ループ内で必ず代入されるが（max(1, ...)により最低1回は回る）、
         # 型チェッカーはそこまで推論しないため明示的に初期化する。
         rows: list | None = None
+        # 差分の適用は試行ごとに繰り返されるので、実行したタスクは試行に入る前に
+        # 控える（1回目の適用の後に控えると、書き換えた後のtasksを見てしまう）。
+        executed_ids = self._executed_task_ids(executed) if executed else set()
+        # 届かなかった時の「新しいタスク」を見分けるため、更新前にあったidを控える。
+        task_ids_before = {t.id for t in self.private_memory.tasks}
+        # outcomeの検証は試行をまたいで行う（1回目に通った行も次の手として数える）。
+        seen_rows: list[dict] = []
         # 0以下だとループが一度も回らず、memoryを作らないまま「更新しました」と
         # 通知してしまう。最低1回は必ず生成する。
         for attempt in range(1, max(1, self.max_memory_retries) + 1):
@@ -1426,8 +1518,12 @@ class Agent:
                 applied_seq = diff.apply_seq
                 # 書き込みが通ったうえで、実行済みのタスクが放置されていないかを見る。
                 # apply_diffは1行ずつしか見ないので「書かれなかったこと」は拾えない。
-                if executed:
-                    errors.extend(self._stale_task_errors(executed))
+                if executed_ids:
+                    seen_rows.extend(r for r in rows if isinstance(r, dict))
+                    errors.extend(self._stale_task_errors(executed_ids))
+                    errors.extend(
+                        self._outcome_errors(executed_ids, seen_rows, task_ids_before)
+                    )
 
             ignored_all.extend(ignored)
 
