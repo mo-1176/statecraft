@@ -75,7 +75,7 @@ def test_初期記憶からtool実行を経て回答するまで(search_tool):
             call_response("search_rules", topic="貸出"),
             diff_response(
                 [
-                    {"field": "facts", "id": "f-1", "text": "一般は5冊まで"},
+                    {"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "一般は5冊まで"},
                     task_row("t-1", "規程を調べる", "done", ["search_rules"], outcome="reached"),
                 ]
             ),
@@ -289,7 +289,7 @@ def test_実行したタスクをnextのまま残すと差し戻す(search_tool)
             diff_response([task_row("t-1", "規程を調べる", "next", ["search_rules"])]),
             call_response("search_rules", topic="貸出"),
             # 実行したt-1をnextのまま残す
-            diff_response([{"field": "facts", "id": "f-1", "text": "一般は5冊まで"}]),
+            diff_response([{"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "一般は5冊まで"}]),
             diff_response([task_row("t-1", "規程を調べる", "done", ["search_rules"], outcome="reached")]),
             text_response("5冊までです。"),
         ]
@@ -314,7 +314,7 @@ def test_結果を見て同じtoolで掘り直すタスクは差し戻さない(
             call_response("search_rules", topic="貸出"),
             diff_response(
                 [
-                    {"field": "facts", "id": "f-1", "text": "延長は別の規程による"},
+                    {"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "延長は別の規程による"},
                     task_row("t-1", "規程を調べる", "done", ["search_rules"], outcome="reached"),
                     task_row("t-2", "延長の規程を調べる", "next", ["search_rules"]),
                 ]

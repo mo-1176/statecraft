@@ -1395,8 +1395,8 @@ def dump_memory(net: Network) -> None:
         "actions",
         "decisions",
         "hypotheses",
-        "open_questions",
-        "requester_questions",
+        "questions_to_research",
+        "questions_to_ask",
         "agent_answers",
     ):
         entries = getattr(shared, name)
@@ -1436,7 +1436,7 @@ CARRY_OVER_FILE = "sample_carry_over.json"
 # 引き継ぐプロパティ。基準は「今回の質問に依存しないか」。
 # facts / actions / decisions を入れない理由は docs にある。
 # 絞るのは保存する側で行う（保存しなければ引き継がれようがない）。
-CARRY_OVER_FIELDS = ("back_grounds", "vars")
+CARRY_OVER_FIELDS = ("ontology", "vars")
 
 
 def load_carry_over(net: Network) -> list[str]:
@@ -1464,7 +1464,7 @@ def save_carry_over(net: Network) -> None:
     data = {}
     for name in CARRY_OVER_FIELDS:
         entries = getattr(net.shared_memory, name)
-        # back_grounds は蓄積するほど価値が上がるが、初期トークンも押し上げる。
+        # ontology は蓄積するほど価値が上がるが、初期トークンも押し上げる。
         # 多くなってきたらここで別途LLMへ投げて統合・圧縮する。
         #   if len(entries) > 30:
         #       entries = summarize_backgrounds(entries)
