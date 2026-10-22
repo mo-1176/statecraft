@@ -408,6 +408,126 @@ def test_届かなかったら依頼を変えて出し直せる(search_tool):
     assert len(llm.calls) == 6
 
 
+def test_ありかだけ分かったタスクをdoneにすると差し戻す(search_tool):
+    """「〜に載っている」と分かっただけで、答えそのものを得ないまま回答へ進ませない。"""
+    llm = FakeLLM(
+        [
+            diff_response([task_row("t-1", "貸出上限を調べる", "next", ["search_rules"])]),
+            call_response("search_rules", topic="貸出"),
+            diff_response(
+                [task_row("t-1", "貸出上限を調べる", "done", ["search_rules"], outcome="located")]
+            ),
+            diff_response(
+                [
+                    task_row("t-1", "貸出上限を調べる", "unnecessary", ["search_rules"], outcome="located"),
+                    task_row("t-2", "利用規程から貸出上限を確かめる", "next", ["search_rules"]),
+                ]
+            ),
+            call_response("search_rules", topic="利用規程"),
+            diff_response(
+                [task_row("t-2", "貸出上限 → 5冊まで", "done", ["search_rules"], outcome="reached")]
+            ),
+            text_response("5冊までです。"),
+        ]
+    )
+    agent = build_agent(llm, tools=[search_tool])
+
+    agent.respond(message="貸出は何冊まで？")
+
+    assert len(llm.calls) == 7
+    assert "ありかが分かっただけのタスクはdoneにしない" in llm.calls[3]["prompt"]
+
+
+def test_ありかが分かった時はdecisionsで止められない(search_tool):
+    """「深追いは不要」とdecisionsへ書いて、答えの無い結果のまま回答へ進ませない。"""
+    llm = FakeLLM(
+        [
+            diff_response([task_row("t-1", "貸出上限を調べる", "next", ["search_rules"])]),
+            call_response("search_rules", topic="貸出"),
+            diff_response(
+                [
+                    task_row("t-1", "貸出上限を調べる", "unnecessary", ["search_rules"], outcome="located"),
+                    {"field": "decisions", "id": "d-1", "text": "これ以上の深追いは不要と判断"},
+                ]
+            ),
+            diff_response(
+                [task_row("t-2", "利用規程から貸出上限を確かめる", "next", ["search_rules"])]
+            ),
+            call_response("search_rules", topic="利用規程"),
+            diff_response(
+                [task_row("t-2", "貸出上限 → 5冊まで", "done", ["search_rules"], outcome="reached")]
+            ),
+            text_response("5冊までです。"),
+        ]
+    )
+    agent = build_agent(llm, tools=[search_tool])
+
+    response = agent.respond(message="貸出は何冊まで？")
+
+    assert "取りに行く手段があることを示している" in llm.calls[3]["prompt"]
+    assert response.text == "5冊までです。"
+    assert search_tool.calls == ["貸出", "利用規程"]
+
+
+def test_ありかだけ分かって次の手が無いと差し戻す(search_tool):
+    llm = FakeLLM(
+        [
+            diff_response([task_row("t-1", "貸出上限を調べる", "next", ["search_rules"])]),
+            call_response("search_rules", topic="貸出"),
+            diff_response(
+                [task_row("t-1", "貸出上限を調べる", "unnecessary", ["search_rules"], outcome="located")]
+            ),
+            diff_response(
+                [
+                    task_row("t-1", "貸出上限を調べる", "unnecessary", ["search_rules"], outcome="located"),
+                    task_row("t-2", "利用規程から貸出上限を確かめる", "next", ["search_rules"]),
+                ]
+            ),
+            call_response("search_rules", topic="利用規程"),
+            diff_response(
+                [task_row("t-2", "貸出上限 → 5冊まで", "done", ["search_rules"], outcome="reached")]
+            ),
+            text_response("5冊までです。"),
+        ]
+    )
+    agent = build_agent(llm, tools=[search_tool])
+
+    response = agent.respond(message="貸出は何冊まで？")
+
+    assert "どのtool / agentで取りに行けるかを考え" in llm.calls[3]["prompt"]
+    assert response.text == "5冊までです。"
+    assert search_tool.calls == ["貸出", "利用規程"]
+    assert len(llm.calls) == 7
+
+
+def test_ありかが分かったら取りに行くタスクを立てれば進める(search_tool):
+    """locatedと、ありかから答えを取りに行く新しいタスクを同じ更新で出せば、差し戻さずに実行する。"""
+    llm = FakeLLM(
+        [
+            diff_response([task_row("t-1", "貸出上限を調べる", "next", ["search_rules"])]),
+            call_response("search_rules", topic="貸出"),
+            diff_response(
+                [
+                    task_row("t-1", "貸出上限を調べる", "unnecessary", ["search_rules"], outcome="located"),
+                    task_row("t-2", "利用規程から貸出上限を確かめる", "next", ["search_rules"]),
+                ]
+            ),
+            call_response("search_rules", topic="利用規程"),
+            diff_response(
+                [task_row("t-2", "貸出上限 → 5冊まで", "done", ["search_rules"], outcome="reached")]
+            ),
+            text_response("5冊までです。"),
+        ]
+    )
+    agent = build_agent(llm, tools=[search_tool])
+
+    response = agent.respond(message="貸出は何冊まで？")
+
+    assert response.text == "5冊までです。"
+    assert search_tool.calls == ["貸出", "利用規程"]
+    assert len(llm.calls) == 6
+
+
 def test_リトライを使い切っても止まらない():
     """通った分だけを残して進む（欠けた分はerrorイベントで通知される）。"""
     errors = []
