@@ -76,7 +76,7 @@ def test_初期記憶からtool実行を経て回答するまで(search_tool):
             diff_response(
                 [
                     {"field": "facts", "id": "f-1", "text": "一般は5冊まで"},
-                    task_row("t-1", "規程を調べる", "done", ["search_rules"]),
+                    task_row("t-1", "規程を調べる", "done", ["search_rules"], outcome="reached"),
                 ]
             ),
             text_response("一般の方は5冊までです。"),
@@ -192,7 +192,7 @@ def test_同じ呼び出しは二度実行しない(search_tool):
         [
             diff_response([task_row("t-1", "調べる", "next", ["search_rules"])]),
             calls_response(("search_rules", {"topic": "貸出"}), ("search_rules", {"topic": "貸出"})),
-            diff_response([task_row("t-1", "調べる", "done", ["search_rules"])]),
+            diff_response([task_row("t-1", "調べる", "done", ["search_rules"], outcome="reached")]),
             text_response("完了"),
         ]
     )
@@ -208,7 +208,7 @@ def test_引数が違えば重複ではない(search_tool):
         [
             diff_response([task_row("t-1", "調べる", "next", ["search_rules"])]),
             calls_response(("search_rules", {"topic": "貸出"}), ("search_rules", {"topic": "返却"})),
-            diff_response([task_row("t-1", "調べる", "done", ["search_rules"])]),
+            diff_response([task_row("t-1", "調べる", "done", ["search_rules"], outcome="reached")]),
             text_response("完了"),
         ]
     )
@@ -290,7 +290,7 @@ def test_実行したタスクをnextのまま残すと差し戻す(search_tool)
             call_response("search_rules", topic="貸出"),
             # 実行したt-1をnextのまま残す
             diff_response([{"field": "facts", "id": "f-1", "text": "一般は5冊まで"}]),
-            diff_response([task_row("t-1", "規程を調べる", "done", ["search_rules"])]),
+            diff_response([task_row("t-1", "規程を調べる", "done", ["search_rules"], outcome="reached")]),
             text_response("5冊までです。"),
         ]
     )
@@ -315,12 +315,12 @@ def test_結果を見て同じtoolで掘り直すタスクは差し戻さない(
             diff_response(
                 [
                     {"field": "facts", "id": "f-1", "text": "延長は別の規程による"},
-                    task_row("t-1", "規程を調べる", "done", ["search_rules"]),
+                    task_row("t-1", "規程を調べる", "done", ["search_rules"], outcome="reached"),
                     task_row("t-2", "延長の規程を調べる", "next", ["search_rules"]),
                 ]
             ),
             call_response("search_rules", topic="延長"),
-            diff_response([task_row("t-2", "延長の規程を調べる", "done", ["search_rules"])]),
+            diff_response([task_row("t-2", "延長の規程を調べる", "done", ["search_rules"], outcome="reached")]),
             text_response("延長は1回までです。"),
         ]
     )
@@ -331,6 +331,80 @@ def test_結果を見て同じtoolで掘り直すタスクは差し戻さない(
     assert response.text == "延長は1回までです。"
     assert search_tool.calls == ["貸出", "延長"]
     # 記憶の更新が差し戻されていない（台本どおり6回で終わる）
+    assert len(llm.calls) == 6
+
+
+def test_実行したタスクを片付ける時はoutcomeが無いと差し戻す(search_tool):
+    """「調査完了」とだけ書いてdoneにすると、届いたかを判断しないまま回答へ進む。"""
+    llm = FakeLLM(
+        [
+            diff_response([task_row("t-1", "規程を調べる", "next", ["search_rules"])]),
+            call_response("search_rules", topic="貸出"),
+            diff_response([task_row("t-1", "調査完了", "done", ["search_rules"])]),
+            diff_response(
+                [task_row("t-1", "規程を調べる → 5冊まで", "done", ["search_rules"], outcome="reached")]
+            ),
+            text_response("5冊までです。"),
+        ]
+    )
+    agent = build_agent(llm, tools=[search_tool])
+
+    agent.respond(message="貸出は何冊まで？")
+
+    assert len(llm.calls) == 5
+    assert "outcome" in llm.calls[3]["prompt"]
+
+
+def test_届かなかったタスクをdoneにすると差し戻す(search_tool):
+    llm = FakeLLM(
+        [
+            diff_response([task_row("t-1", "規程を調べる", "next", ["search_rules"])]),
+            call_response("search_rules", topic="貸出"),
+            diff_response(
+                [task_row("t-1", "規程を調べる", "done", ["search_rules"], outcome="not_reached")]
+            ),
+            diff_response(
+                [
+                    task_row("t-1", "規程を調べる", "unnecessary", ["search_rules"], outcome="not_reached"),
+                    {"field": "decisions", "id": "d-1", "text": "規程の検索は他に手段が無い"},
+                ]
+            ),
+            text_response("分かりませんでした。"),
+        ]
+    )
+    agent = build_agent(llm, tools=[search_tool])
+
+    agent.respond(message="貸出は何冊まで？")
+
+    assert len(llm.calls) == 5
+    assert "doneにしない" in llm.calls[3]["prompt"]
+
+
+def test_届かなかったら依頼を変えて出し直せる(search_tool):
+    """not_reachedと、検索語を変えた新しいタスクを同じ更新で出せば、差し戻さずに実行する。"""
+    llm = FakeLLM(
+        [
+            diff_response([task_row("t-1", "貸出上限を調べる", "next", ["search_rules"])]),
+            call_response("search_rules", topic="貸出"),
+            diff_response(
+                [
+                    task_row("t-1", "貸出上限を調べる", "unnecessary", ["search_rules"], outcome="not_reached"),
+                    task_row("t-2", "貸出上限を、利用規程として調べ直す", "next", ["search_rules"]),
+                ]
+            ),
+            call_response("search_rules", topic="利用規程"),
+            diff_response(
+                [task_row("t-2", "貸出上限 → 5冊まで", "done", ["search_rules"], outcome="reached")]
+            ),
+            text_response("5冊までです。"),
+        ]
+    )
+    agent = build_agent(llm, tools=[search_tool])
+
+    response = agent.respond(message="貸出は何冊まで？")
+
+    assert response.text == "5冊までです。"
+    assert search_tool.calls == ["貸出", "利用規程"]
     assert len(llm.calls) == 6
 
 
@@ -385,7 +459,7 @@ def test_toolのmemoryは要約を通さず記憶へ入る():
         [
             diff_response([task_row("t-1", "予約する", "next", ["issue_reservation"])]),
             call_response("issue_reservation", title="深夜特急"),
-            diff_response([task_row("t-1", "予約する", "done", ["issue_reservation"])]),
+            diff_response([task_row("t-1", "予約する", "done", ["issue_reservation"], outcome="reached")]),
             text_response("予約できました。"),
         ]
     )
@@ -767,7 +841,7 @@ def test_実行イベントに呼び出し元と呼び出し先が入る(search_
         [
             diff_response([task_row("t-1", "調べる", "next", ["search_rules"])]),
             call_response("search_rules", topic="貸出"),
-            diff_response([task_row("t-1", "調べる", "done", ["search_rules"])]),
+            diff_response([task_row("t-1", "調べる", "done", ["search_rules"], outcome="reached")]),
             text_response("完了"),
         ]
     )
