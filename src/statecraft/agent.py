@@ -38,6 +38,7 @@ from .memory import (
     DIFF_EXAMPLE,
     DISABLE_FIELD,
     ROUTING_GUIDE,
+    TASK_OUTCOMES,
     DiffError,
     MemoryEntry,
     PrivateMemory,
@@ -1383,8 +1384,9 @@ class Agent:
 
         「目的に届いた時だけdone」と文章で求めても、「調査完了」とだけ書いて
         doneにされ、問いに答えていない結果のまま回答へ進んだ。届いたかを値で
-        書かせ、届かなかったなら次の手（依頼を変えた新しいタスク、または
-        手段が無い理由のdecisions）を同じ更新に含めさせる。
+        書かせ、届かなかった（not_reached）か、ありかだけ分かった（located）なら、
+        次の手（依頼を変えた新しいタスク、または手段が無い理由のdecisions）を
+        同じ更新に含めさせる。
 
         rowsは、この更新の試行をまたいで積んだ行。差し戻しで直した行と、
         1回目に通った行（新しいタスクやdecisions）の両方を見るため。
@@ -1398,15 +1400,17 @@ class Agent:
                     latest[row_id] = row
 
         pending = (TaskStatus.NEXT, TaskStatus.NEXT_PARALLEL, TaskStatus.CONDITIONAL)
-        has_follow_up = any(
-            row.get("field") == "decisions"
-            or (
-                row.get("field") == "tasks"
-                and str(row.get("id", "")).strip() not in task_ids_before
-                and row.get("status") in {s.value for s in pending}
-            )
+        has_new_task = any(
+            row.get("field") == "tasks"
+            and str(row.get("id", "")).strip() not in task_ids_before
+            and row.get("status") in {s.value for s in pending}
             for row in rows
         )
+        # 届かなかった時は、手段が尽きた理由（decisions）でも次の手として認める。
+        # ありかが分かった時は認めない。ありかが分かっていることが、取りに行く
+        # 手段があることを示しているため。decisionsで「深追いは不要」と書いて
+        # 止め、答えの無い抜粋のまま回答へ進む失敗が実際に起きた。
+        has_follow_up = has_new_task or any(row.get("field") == "decisions" for row in rows)
 
         errors = []
         for task in self.private_memory.tasks:
@@ -1414,21 +1418,34 @@ class Agent:
                 continue
             outcome = latest.get(task.id, {}).get("outcome")
             entry = {"field": "tasks", "id": task.id, "status": task.status.value}
-            if outcome not in ("reached", "not_reached"):
+            if outcome not in TASK_OUTCOMES:
                 message = (
                     "今回実行したタスクを更新する行には、outcomeに、結果がこのタスクの"
-                    "目的に届いたか（reached / not_reached）を必ず指定すること。"
+                    "目的に届いたか（reached / located / not_reached）を必ず指定すること。"
+                )
+            elif outcome == "located" and task.status is TaskStatus.DONE:
+                message = (
+                    "答えのありかが分かっただけのタスクはdoneにしない。unnecessaryにし、"
+                    "分かったありかから答えそのものを取りに行く新しいidのタスクを立てること。"
+                )
+            elif outcome == "located" and not has_new_task:
+                message = (
+                    "答えのありかが分かった時は、そこから答えそのものを、どのtool / agentで"
+                    "取りに行けるかを考え、新しいidのタスクを立てること。ありかが分かっていることが、"
+                    "取りに行く手段があることを示している。"
                 )
             elif outcome == "not_reached" and task.status is TaskStatus.DONE:
                 message = (
                     "目的に届かなかったタスクはdoneにしない。unnecessaryにし、"
-                    "届かなかった内容は、依頼の中身を変えた新しいidのタスクとして立てるか、"
-                    "試したことと手段が無い理由をdecisionsへ書くこと。"
+                    "答えるのに足りない情報を、それを取れるtool / agent（無ければ代わりの手段）で"
+                    "取りに行く新しいidのタスクとして立てること。"
+                    "どの手段も無い時だけ、足りない情報と試した手段をdecisionsへ書く。"
                 )
             elif outcome == "not_reached" and not has_follow_up:
                 message = (
-                    "目的に届かなかった時は、依頼の中身（問い方・引数・範囲）か相手を変えた"
-                    "新しいidのタスクを立てるか、試したことと手段が無い理由をdecisionsへ書くこと。"
+                    "目的に届かなかった時は、答えるのに何が足りないのか、それをどのtool / agentで"
+                    "取れるか（無ければ代わりの手段）を考え、新しいidのタスクを立てること。"
+                    "どの手段も無い時だけ、足りない情報と試した手段をdecisionsへ書く。"
                 )
             else:
                 continue
