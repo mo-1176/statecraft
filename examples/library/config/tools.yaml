@@ -1,0 +1,70 @@
+# ツールの定義。どのエージェントに持たせるかは agents.yaml に書く。
+# type はツールの実装（library/network.py の TOOL_FACTORIES）を指す。
+# 長い evaluation は prompts/tools/<名前>/evaluation.md に置いている。
+
+- name: search_rules
+  type: search_rules
+  summary: 図書館の利用規程を検索する
+  # 「必ず最初に実行すること」とは書かない。
+  # 最初の1回は initial_tools としてシステムが実行済みで、
+  # ここに残るのは「別の主題で調べ直したくなった時」の使い方だけ。
+  usage: 別の主題の規程も必要になった場合に実行する。
+  # 実行中に利用者の画面へ出す文言。{名前} には実行時の引数が入る。
+  # 渡さなければ「search_rulesをtopic='貸出'で実行しています...」という開発者向けの既定文になる。
+  execution_message: 「{topic}」について利用規程を確認しています...
+  parameters:
+    type: object
+    properties:
+      topic: {type: string, description: 何について調べるか}
+    required: [topic]
+
+# agents.yaml の tools へは登録しない（initial_tools だけ）ので、LLMからはカタログにも
+# 候補にも出ない。実行するのはシステムだけで、呼び直すこともできない。
+- name: fetch_member_status
+  type: fetch_member_status
+  summary: 会員番号から会員区分を引く
+  # evaluationが流れるのは結果が返ってきた時だけ。実行されなかった場合は届かないので、
+  # ここに「取得できなかった時の扱い」は書かない。
+  evaluation: |-
+    会員区分は貸出可能冊数と貸出期間の条件に直結する。区分が分かったら、その区分での結論を記録する。
+  execution_message: 会員情報を確認しています...
+  parameters:
+    type: object
+    properties:
+      member_id: {type: string, description: 利用者の会員番号}
+    required: [member_id]
+
+- name: check_stock
+  type: check_stock
+  summary: 書名から所在と貸出状況を調べる
+  execution_message: 『{title}』の所蔵状況を照会しています...
+  parameters:
+    type: object
+    properties:
+      title: {type: string, description: 調べたい書名（正確な書名）}
+    required: [title]
+
+- name: issue_reservation
+  type: issue_reservation
+  summary: 予約を登録し受付番号を発行する
+  usage: 貸出中の資料に対してのみ実行する。会員番号が不明な場合は実行しない。
+  # member_id も差し込めるが、画面に出す必要がないので出さない。
+  # 引数を全部受け取れることと、全部出すことは別。
+  execution_message: 『{title}』の予約を登録しています...
+  parameters:
+    type: object
+    properties:
+      title: {type: string, description: 予約する書名}
+      member_id: {type: string, description: 利用者の会員番号}
+    required: [title, member_id]
+
+# execution_message を渡さない例。既定の汎用文が使われる。全部に文言を用意する必要はない。
+- name: send_overdue_notice
+  type: send_overdue_notice
+  summary: 延滞者へ督促メールを送信する
+  usage: 延滞の事実が確認できている場合にのみ実行する。
+  parameters:
+    type: object
+    properties:
+      member_id: {type: string, description: 督促対象の会員番号}
+    required: [member_id]

@@ -85,14 +85,17 @@ class ToolConfig(ConfigEntry):
     nameはLLMに見せる名前、typeは実装の種類（NetworkBuilder.TOOL_FACTORIESのキー）。
     分けてあるので、同じ実装からsettingsだけ違うツールを何本でも作れる。
 
-    文章とスキーマのdescriptionにある {名前} は、settingsの同じ名前の値で埋める。
-    数字をsettingsの1か所にだけ書けば、説明文と実装の上限が食い違わない。
-    波かっこをそのまま書くときは {{ }} にする。
+    summary / usage / evaluationとスキーマのdescriptionにある {名前} は、settingsの
+    同じ名前の値で埋める。数字をsettingsの1か所にだけ書けば、説明文と実装の上限が
+    食い違わない。波かっこをそのまま書くときは {{ }} にする。
+    execution_messageは埋めない。その {名前} は、実行時にツールの引数で埋まる。
     """
 
     FILE = "tools.yaml"
     KIND = "tools"
     TEXT_FIELDS = ("usage", "evaluation", "execution_message")
+    # settingsで埋める文章
+    FILLED_FIELDS: ClassVar[tuple[str, ...]] = ("summary", "usage", "evaluation")
 
     type: str
     summary: str = ""
@@ -108,7 +111,7 @@ class ToolConfig(ConfigEntry):
 
     def fill_placeholders(self) -> None:
         try:
-            for field in ("summary", *self.TEXT_FIELDS):
+            for field in self.FILLED_FIELDS:
                 text = getattr(self, field)
                 if text is not None:
                     setattr(self, field, self._fill(text))
