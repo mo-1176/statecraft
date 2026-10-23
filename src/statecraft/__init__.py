@@ -22,13 +22,21 @@ from .agent import (
     ReflexAgent,
     RunInput,
 )
+from .builder import NetworkBuilder
+from .config import (
+    AgentConfig,
+    GenerationOverride,
+    KnowledgeConfig,
+    NetworkConfig,
+    ToolConfig,
+)
 from .interceptor import CheckResult, Interceptor, RetryDecision
 from .invokable import Invokable
 from .llm import BaseLLM, ClaudeLLM, GeminiLLM, OpenAILLM, ThoughtLevel
 from .memory import MemoryEntry, PrivateMemory, SharedMemory, TaskEntry, TaskStatus
 from .network import Network
 from .prompts import Phase
-from .tools import Tool, ToolResult
+from .tools import SchemaTool, Tool, ToolResult
 
 try:
     # 配布物のメタデータを唯一の出典にする（pyprojectとの二重管理を避ける）。
@@ -39,6 +47,7 @@ except PackageNotFoundError:
 
 __all__ = [
     "Agent",
+    "AgentConfig",
     "AgentResponse",
     "BaseLLM",
     "CheckResult",
@@ -48,22 +57,28 @@ __all__ = [
     "GenerationAborted",
     "GenerationConfig",
     "GenerationEvent",
+    "GenerationOverride",
     "Interceptor",
     "Invokable",
+    "KnowledgeConfig",
     "MemoryDiffEvent",
     "MemoryEntry",
     "Network",
+    "NetworkBuilder",
+    "NetworkConfig",
     "OpenAILLM",
     "Phase",
     "PrivateMemory",
     "ReflexAgent",
     "RetryDecision",
     "RunInput",
+    "SchemaTool",
     "SharedMemory",
     "TaskEntry",
     "TaskStatus",
     "ThoughtLevel",
     "Tool",
+    "ToolConfig",
     "ToolResult",
     "__version__",
 ]

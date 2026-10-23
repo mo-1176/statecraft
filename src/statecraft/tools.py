@@ -339,3 +339,31 @@ class Tool:
             schema["items"] = cls._schema_for(args[0]) if args else {"type": "string"}
 
         return schema
+
+
+# ---- SchemaTool ----
+@dataclass
+class SchemaTool(Tool):
+    """
+    引数のJSON Schemaを、型ヒントから作らずに手で渡すTool。
+
+    型ヒントからの自動生成では表せない形がある（TypedDictの配列、Literalの
+    enumなど。_schema_forはこれらを"string"として扱う）。そういう引数を
+    受け取りたい場合と、設定ファイル（tools.yaml）からツールを作る場合に使う。
+    スキーマと関数の引数を食い違わせないのは、渡す側の責任になる。
+    """
+
+    # 引数のJSON Schema。{"type": "object", "properties": {...}, "required": [...]}
+    parameters: dict = field(default_factory=dict)
+
+    # LLMへ提示する名前。空なら関数名を使う。設定ファイルでは、同じ関数から
+    # settingsだけ変えて別のツールを作れるので、名前を関数名から切り離す
+    # （切り離さないと、同じ関数から作ったツールが全部同じ名前になる）。
+    tool_name: str = ""
+
+    @property
+    def name(self) -> str:
+        return self.tool_name or super().name
+
+    def get_json_schema(self) -> dict:
+        return self.parameters

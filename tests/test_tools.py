@@ -8,7 +8,7 @@ Tool の検証。
 
 import pytest
 
-from statecraft import Interceptor, Tool, ToolResult
+from statecraft import Interceptor, SchemaTool, Tool, ToolResult
 from statecraft.tools import parse_tool_return
 
 
@@ -305,3 +305,32 @@ def test_declarationはsummaryとusageを結合する():
     assert "概要" in d["description"]
     assert "使い方" in d["description"]
     assert d["parameters"]["type"] == "object"
+
+
+# ---- SchemaTool ----
+def test_SchemaToolは渡したスキーマをそのまま使う():
+    def f(searches: list) -> dict:
+        return {"value": ""}
+
+    schema = {
+        "type": "object",
+        "properties": {"searches": {"type": "array", "items": {"type": "object"}}},
+        "required": ["searches"],
+    }
+    tool = SchemaTool(func=f, summary="概要", parameters=schema)
+
+    assert tool.to_declaration()["parameters"] == schema
+
+
+def test_SchemaToolはtool_nameを関数名より優先する():
+    """同じ関数から作ったツールを、別の名前で並べられるように。"""
+
+    def f() -> dict:
+        return {"value": ""}
+
+    news = SchemaTool(func=f, summary="s", tool_name="news_search")
+    plain = SchemaTool(func=f, summary="s")
+
+    assert news.name == "news_search"
+    assert news.to_declaration()["name"] == "news_search"
+    assert plain.name == "f"
