@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "statecraft"
-version = "0.1.4"
+version = "0.2.0"
 description = "記憶を構造として扱うマルチエージェントフレームワーク"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,7 +37,13 @@ classifiers = [
     "Natural Language :: Japanese",
     "Typing :: Typed",
 ]
-dependencies = []
+# 設定ファイル（config.py）の読み込みに使う。
+#   pydantic 2.0 … TypeAdapter / model_validator / ConfigDict（1.x には無い）
+#   pyyaml   6.0 … safe_load しか使わない。下限は今の系列に合わせただけ
+dependencies = [
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+]
 
 # 下限は「このフレームワークが実際に呼んでいるAPIが入ったバージョン」。
 #   google-genai 1.51.0 … types.ThinkingConfig(thinking_level=...)

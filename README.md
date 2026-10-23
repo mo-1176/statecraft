@@ -21,6 +21,7 @@ LLMの能力を引き出し、軽量モデルでも自律的に多くのタス�
 - [Network](#network) — 1リクエスト分の配線
   - [Agentを使い回す](#agentを使い回す--reset)
   - [よくある構成](#よくある構成)
+- [設定ファイルから組み立てる](#設定ファイルから組み立てる) — YAML と Markdown でネットワークを定義する
 - [Interceptor](#interceptor) — 観測と、実行前の判定
 - [テスト](#テスト)
 - [実装状況](#実装状況)
@@ -840,7 +841,156 @@ Orchestrator（統括）    記憶を持ち、知識の取得と全体の判断�
 
 ---
 
+## 設定ファイルから組み立てる
 
+エージェントとツールの定義（プロンプト、説明文、モデル、スキーマ、つながり）を、コードの外の YAML と Markdown に書けます。プロンプトの調整にコードの書き換えが要らなくなり、どのエージェントが何とつながっているかも、設定を読めば分かります。
+
+### フォルダ構成
+
+```
+<root>/
+  config/
+    agents.yaml        # エージェント（必須）
+    tools.yaml         # ツール
+    knowledges.yaml    # ナレッジの名前とファイル
+  prompts/
+    agents/<エージェント名>/<項目>.md
+    tools/<ツール名>/<項目>.md
+  knowledge/
+    <名前>.md
+```
+
+tools.yaml と knowledges.yaml は、使わなければ置かなくて構いません。
+
+### agents.yaml
+
+```yaml
+- name: front
+  summary: ユーザーとの対話を担当します。
+  provider: gemini
+  model: gemini-3.1-flash-lite
+  sub_agents: [scout]
+
+- name: scout
+  summary: 情報収集を担当します。
+  provider: gemini
+  model: gemini-3.1-flash-lite
+  max_steps: 10
+  tools: [web_search]
+  knowledge: [basics]
+  phase_overrides:
+    initial_memory:
+      thought_level: low
+  input_schema:
+    type: object
+    properties:
+      purpose: {type: string, description: 依頼者がその先で達成したいこと}
+    required: [purpose]
+```
+
+項目は Agent の同名の引数にあたり、書かなかった項目は Agent の既定値になります。Agent の引数と違うのは次の項目です。
+
+| 項目 | 中身 |
+|---|---|
+| `type` | `agent`（既定）か `reflex`。設定の形は同じで、クラスだけが変わります |
+| `provider` | LLM の提供元の名前。実体は `LLM_FACTORIES` で作ります（[組み立てる](#組み立てる)） |
+| `thought_level` | `none` / `minimal` / `low` / `medium` / `high` |
+| `tools` / `initial_tools` | tools.yaml のツール名 |
+| `sub_agents` | 委譲できるエージェント名（Agent の `sub_agent_names`） |
+| `knowledge` / `initial_knowledge` | knowledges.yaml のナレッジ名。書いた順につなげて渡します |
+
+つながりは、使う側のエージェントにだけ書きます。tools.yaml や knowledges.yaml には、どのエージェントが使うかを書きません。同じ関係を2か所に書くと、片方だけ直したときに食い違うためです。
+
+### tools.yaml
+
+```yaml
+- name: web_search
+  type: web_search
+  summary: Webを検索し、問いごとに結果を返します。
+  settings:
+    max_searches: 4
+  parameters:
+    type: object
+    properties:
+      searches:
+        type: array
+        description: 検索の一覧。最大{max_searches}件
+    required: [searches]
+```
+
+| 項目 | 中身 |
+|---|---|
+| `name` | LLM に見せるツール名 |
+| `type` | 実装の種類。`TOOL_FACTORIES` のキー |
+| `settings` | 実装に渡す値。文章の差し込み口にも使います |
+| `parameters` | 引数の JSON Schema。型ヒントからは作らず、書いたものをそのまま使います |
+| `summary` / `usage` / `evaluation` / `execution_message` | Tool の同名の項目 |
+
+`name` と `type` が分かれているので、同じ実装から `settings` だけ違うツールを何本でも作れます。
+
+文章とスキーマの `description` にある `{名前}` は、`settings` の同じ名前の値で埋まります。数字を `settings` の1か所に書けば、説明文と実装の上限が食い違いません。波かっこをそのまま書くときは `{{ }}` にしてください。
+
+### 長い文章は Markdown に置く
+
+`system_instruction`、`usage`、`evaluation`、`execution_message` は、YAML に直接書く代わりに `prompts/<agents か tools>/<名前>/<項目>.md` に置けます。置き場所が決まっているので、YAML からファイルを指す必要はありません。同じ項目が YAML と md の両方にあるとエラーになります。
+
+### knowledges.yaml
+
+複数のエージェントで使い回す文書は、名前を付けて登録します。
+
+```yaml
+- name: basics
+  file: knowledge/basics.md     # root からのパス
+```
+
+### 組み立てる
+
+ツールの関数は、`NetworkBuilder` の子クラスで `type` と対応させます。
+
+```python
+from statecraft import NetworkBuilder
+
+
+def make_search(*, max_searches: int):
+    """settings を受け取り、ツールの関数を返す。"""
+
+    def web_search(searches: list) -> dict:
+        ...
+
+    return web_search
+
+
+class MyBuilder(NetworkBuilder):
+    TOOL_FACTORIES = {"web_search": make_search}
+
+
+net = MyBuilder.from_dir("path/to/root", interceptor).build()
+response = net["front"].respond(message="...")
+```
+
+YAML に関数の場所（モジュール名）を書く形にしていないのは、設定を書き換えられる人が、登録されていない関数を組み立て時に呼べないようにするためです。
+
+`provider` の `gemini` / `openai` / `claude` は最初から登録されています。API キーは YAML に書かず、環境変数（`GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`）に置いてください。各 SDK がそこから読みます。それ以外の provider を使う場合は、既定の対応表に足します。
+
+```python
+class MyBuilder(NetworkBuilder):
+    TOOL_FACTORIES = {"web_search": make_search}
+    LLM_FACTORIES = {**NetworkBuilder.LLM_FACTORIES, "azure_openai": make_azure_llm}
+```
+
+LLM は provider ごとに1つ作り、同じ provider のエージェントで共有します。
+
+### 読み込み時の検証
+
+YAML は書き間違えても読めてしまうので、次のものは読み込みか組み立ての時点でエラーにします。名前の食い違いは、1つずつではなくまとめて出ます。
+
+- 知らない項目名（綴り違い）
+- 同じ名前のエージェント・ツール・ナレッジが2つ以上ある
+- `tools` / `sub_agents` / `knowledge` などに書いた名前が、指す先のファイルに無い
+- 同じ文章が YAML と md の両方にある
+- `{名前}` に入れる値が `settings` に無い
+- ナレッジの `file` が無い
+- `type` / `provider` が対応表に無い、`settings` が実装の引数と合わない
 
 ---
 
@@ -1334,6 +1484,8 @@ pytest -v                                 # 1件ずつ名前を出す
 | `test_tools.py` | 戻り値の契約と、型ヒントからのスキーマ生成。利用者の関数が壊れても例外を外へ出さないこと |
 | `test_interceptor.py` | 判定の既定値の向き。書き忘れ・例外が「許可」に倒れないこと |
 | `test_network.py` | 配線の検証。実行時に静かに壊れる設定ミスを構築時に落とすこと |
+| `test_config.py` | 設定ファイルの読み込み。書き間違いが静かに読めてしまわないこと |
+| `test_builder.py` | 設定からの組み立て。設定の値が Agent / Tool へ渡り、書かなかった項目は既定値になること |
 | `test_utils.py` | 文言の差し込みと実行時間の計測 |
 
 テストを足す場合、偽のLLMは `tests/conftest.py` にあります。応答の順番が決まっているなら `FakeLLM`、
@@ -1345,7 +1497,7 @@ pytest -v                                 # 1件ずつ名前を出す
 
 **動作を確認済み**
 
-Geminiでの1往復、委譲、初期ツール、入力/出力スキーマ、実行前の拒否（機械的な条件とエージェント判定の両方）、記憶への直接書き込み、添付の受け渡し、同時実行、ツールの無効化、停滞の検出、phaseごとのモデル切替、記憶の差分イベント、生成の計測、生成前の判定（予算による中止とモデル切替）、生成失敗時の再試行判定（待って再試行／枠切れ時のモデル切替）、会話履歴の読み分け（利用者の訂正と受け入れ）、問いの置き場の分離（調べる questions_to_research / 尋ねる questions_to_ask）、factsの根拠の種類と出典、実行したタスクの到達判定（outcome）の記録、ありかだけ分かったタスク（located）の取りに行くタスクへの引き継ぎ、期限のある情報の現在時刻との照合
+Geminiでの1往復、委譲、初期ツール、入力/出力スキーマ、実行前の拒否（機械的な条件とエージェント判定の両方）、記憶への直接書き込み、添付の受け渡し、同時実行、ツールの無効化、停滞の検出、phaseごとのモデル切替、記憶の差分イベント、生成の計測、生成前の判定（予算による中止とモデル切替）、生成失敗時の再試行判定（待って再試行／枠切れ時のモデル切替）、会話履歴の読み分け（利用者の訂正と受け入れ）、問いの置き場の分離（調べる questions_to_research / 尋ねる questions_to_ask）、factsの根拠の種類と出典、実行したタスクの到達判定（outcome）の記録、ありかだけ分かったタスク（located）の取りに行くタスクへの引き継ぎ、期限のある情報の現在時刻との照合、設定ファイル（YAML / Markdown）からの組み立て
 
 **未検証**
 
