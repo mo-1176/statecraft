@@ -154,6 +154,15 @@ def test_スキーマのdescription以外の波かっこは残る(root):
     assert search.parameters["properties"]["q"]["pattern"] == "^[a-z]{2,}$"
 
 
+def test_execution_messageの差し込み口は実行時まで残す():
+    """execution_messageの {名前} は、実行時にツールの引数で埋まる。"""
+    t = tool("x", execution_message="『{title}』を照会しています...")
+
+    t.fill_placeholders()
+
+    assert t.execution_message == "『{title}』を照会しています..."
+
+
 def test_差し込み口に入れる値が無いとエラーになる():
     broken = tool("x", usage="最大{max_reeds}件")
 

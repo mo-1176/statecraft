@@ -1,0 +1,166 @@
+# 図書館の問い合わせ対応。front（受付）が librarian（司書）へ委譲する。
+#
+#   利用者 ──→ front（受付・ReflexAgent）──委譲──→ librarian（調査・Agent）
+#                                                         │
+#                                                       tool 4つ
+#                               実行の手前で compliance（審査役）が可否を返す
+#
+# 審査役（compliance）は、ここではなく guard/config/agents.yaml にある。
+# 共有記憶とinterceptorを、このネットワークと分けるため（同じNetworkに入れると両方が配られる）。
+#
+# 長い文章は prompts/agents/<名前>/<項目>.md に置いている。
+#
+# 改行を含めたくない長い説明は、"..." で囲み、行末の \ で折り返している
+# （\ で折り返すと、改行も空白も入らずにつながる）。改行を含めたいものは |- で書く。
+
+# ---- 窓口：記憶を持たない ReflexAgent ----
+# 記憶へ書く経路が構造として無い。引き換えにtasksも無いので、
+# 同じ相手を何度も呼べてしまう（max_stepsで抑えている）。
+- name: front
+  type: reflex
+  summary: 利用者との窓口
+  provider: gemini
+  # ReflexAgentはANSWERフェーズを通らないため、phase_overridesでの上書きは
+  # Network構築時に弾かれる。既定のモデルを上げる。
+  model: gemini-3.7-flash
+  thought_level: low
+  max_steps: 3
+  sub_agents: [librarian]
+  # librarian と同じナレッジを渡す。同一の文字列であることがキャッシュの共有条件
+  knowledge: [terms]
+  # ReflexAgentでは強制されず、指示文として system_instruction へ載るだけ
+  # （各項目のdescriptionがそのまま説明になる）。
+  output_schema:
+    type: object
+    properties:
+      message:
+        type: string
+        description: "利用者へそのまま表示する本文。\
+          この項目だけが利用者の目に触れる。内部の構成や実行の経過には触れない"
+      awaiting_reply:
+        type: boolean
+        description: "利用者からの返答を待っている状態か。\
+          足りない情報を尋ねた場合や、どれについてかを確認した場合は true。\
+          答え終わって、こちらから尋ねることが無い場合は false"
+    required: [message, awaiting_reply]
+
+# ---- 司書：記憶を持つ Agent ----
+# 調べた内容を記憶へ積み上げながら判断を進める。
+# toolの結果は記憶へ要約された後、以降のプロンプトからは外れる。
+- name: librarian
+  summary: 図書館の規程と蔵書を調べ、判断材料を揃える
+  # summary は常時提示される軽い情報、usage は委譲先として選ばれた時に渡す詳細。
+  # 引数の意味は input_schema の description が説明するので、ここには書かない。
+  usage: "対象が複数あっても、読むべき規程が複数あっても、依頼は1つで渡す。\
+    何をどの順で何回調べるかは、こちらで判断する。"
+  # evaluation（委譲が返ってきた瞬間にだけ添えられる指示）は
+  # prompts/agents/librarian/evaluation.md
+  execution_message: 司書が調べています...
+  provider: gemini
+  model: gemini-3.5-flash-lite
+  thought_level: low
+  max_steps: 6
+  phase_overrides:
+    # 記憶を作るphaseに上のモデルを使う。
+    # ここが軽いと、読み取った内容が項目へ振り分けられないまま落ちる。
+    # ANSWERはstatusを返すだけで文章を作らないため、既定のままでよい。
+    initial_memory: {model: gemini-3.7-flash}
+    memory_update: {model: gemini-3.7-flash}
+  tools: [search_rules, check_stock, issue_reservation, send_overdue_notice]
+  # 決まっている手順はLLMに選ばせない。並列で走る。
+  # 引数は input_schema の同名プロパティから渡される（名前が一致しないとNetwork構築時に落ちる）。
+  # 会員番号が渡らない相談では、fetch_member_status は実行されず
+  # 「取得できなかった」が記録される（必須引数が空のため）。
+  #
+  # search_rules は tools にも入れる。別の主題で調べ直したくなるため。
+  # fetch_member_status は入れない。区分は依頼の会員番号だけで決まり、
+  # 呼び直しても同じ結果しか返らないので、選択肢として見せる価値が無い。
+  initial_tools: [search_rules, fetch_member_status]
+  knowledge: [terms]
+
+  # 委譲時に受け取れる引数の形。frontはこの形でしか依頼を渡せない。
+  # 「利用者の発言をそのまま流さず、何を調べたいのかを確定してから渡すこと」は
+  # front の指示文には書かない。依頼するのではなく、渡せる形の方を先に決める。
+  input_schema:
+    type: object
+    properties:
+      # 初期tool search_rules(topic) の引数名と一致させる。
+      # 選択肢からは選ばせない。読むべき規程は、蔵書の状態を調べた後にしか分からないことがある。
+      topic:
+        type: string
+        description: "何についての相談かを指す短い名詞句。\
+          利用者の言葉から、対象となる資料・制度・手続きを取る。\
+          決まった選択肢から選ぶのではなく、相談の対象をそのまま名詞句にする。\
+          要求の内容は入れない（それはrequestへ書く）。\
+          「確認」「可否」「方法」のような動作や論点も含めない"
+      request:
+        type: string
+        description: "今回の要求と、その要求が成立した経緯。\
+          会話履歴を見なくても理解できる自然文で書く。冒頭は「今回の要求:」で始める。\
+          利用者が何を知りたい・確認したい・してほしいと述べているかを明記する。\
+          対象名・条件・会員番号・書名・日付などは省略しない（原文の情報量を保つ）。\
+          挨拶・相づち・感情表現・重複・無関係な雑談だけを除く。\
+          原因の仮説、分類、作業の方針、調べる手順、解決策、結論を足してはならない。\
+          原文に無い状態・原因・目的・可否を、事実として書いてはならない。\
+          分からないことは補わず「未確定」と明示する"
+      title:
+        type: string
+        description: "対象の書名。利用者が明示した書名をそのまま入れる。\
+          特定の本の話でなければ空文字。\
+          話題や文脈から書名を推測して入れてはならない"
+      # 一字一句そのまま渡らないと困る値は、requestの自由文に混ぜず独立した項目にする。
+      # 自由文だと言い換えの過程で落ちたり書き換わったりし、しかも渡されたかどうかが分からない。
+      #
+      # requiredに入れていない。会員番号が出てこない相談は普通にあり、必須にすると値を作られる。
+      # 空のまま渡ると fetch_member_status(member_id) は実行されない。
+      member_id:
+        type: string
+        description: "利用者の会員番号。利用者が明示した値をそのまま入れる。\
+          明示されていない場合は空文字にする。\
+          形式が分かっていても、それに合わせて値を作ってはならない。\
+          名前や文脈から会員番号を推測してはならない"
+      # 質問文だけを渡すと、受け取った側が「何を調べれば答えたことになるか」を
+      # 自分で決めることになり、判断がステップごとにぶれる。
+      # 何が揃えば答えられるのかを先に確定させると、戻ってきた時に照合できる。
+      back_ground:
+        type: string
+        description: |-
+          この依頼を、会話の経緯を知らない相手が理解して処理できるようにする背景。次の4つを書く。
+          1. 依頼に至った背景。なぜこの依頼が発生したのか、何を問題・不足としているのか。会話に無い目的や原因は推測しない
+          2. 依頼を理解するために必要な前提知識。この依頼に出てくる用語や概念について、それを知らない担当者が依頼を理解するには何を理解している必要があるかを、「〜とは何か」「〜と〜の関係」の粒度で示す。答えそのものを書いてはならない（定義や仕様を自分で作らない）
+          3. 依頼成立に必要な情報。要求を満たすために、どの種類の情報・条件・判断材料が必要になるか。具体的なtool名や調べ方は書かない
+          4. 完了条件。何をもってこの要求が満たされたと判断できるか
+    # back_groundを必須にしている。背景が空の依頼は、受け取った側が
+    # 「何を調べれば答えたことになるか」を自分で決めるしかなく、同じ依頼でも毎回違う調べ方になる。
+    required: [topic, request, back_ground]
+
+  # 最終回答の形。受け取るのが機械（front側の分岐）なので、スキーマで強制する。
+  # 返すのは状態だけで、文章は含めない。回答文を持たせると、依頼元が記憶ではなく
+  # その文章を読んで済ませる。調べる側は「何が分かったか」を記憶に残し、
+  # 「終わったかどうか」を状態で返す。
+  output_schema:
+    type: object
+    properties:
+      # 「完遂できたか」を自然文ではなく列挙で返す。文章で「できませんでした」と返すと、
+      # 受け取った側は「言い方を変えて頼み直せば結果が変わるかもしれない」と考える余地が残る。
+      status:
+        type: string
+        enum: [COMPLETE, PARTIAL, REJECTED, ERROR]
+        description: "今回の処理結果。\
+          COMPLETE は必要な情報が揃い、記憶を根拠に回答してよい状態。\
+          実行していないタスクが残っている状態は COMPLETE ではない。\
+          PARTIAL は一部の判断材料は得られたが、そのままでは要求を完遂できない状態。\
+          REJECTED は前提が成立しない・規程上できないなど、依頼をそのまま満たすべきでない状態。\
+          ERROR は処理中に想定外の失敗が起きた状態"
+      # 「なぜ完遂できなかったのか」を返す。不足しているものが入力なのか、依頼の解釈なのかで、
+      # やるべきことが変わる（前者は値を聞く、後者は何の話かを聞く）。
+      blocking_reason:
+        type: string
+        enum: [NONE, AMBIGUOUS_REQUEST, MISSING_REQUIRED_INPUT, NOT_PERMITTED, INTERNAL_ERROR]
+        description: "COMPLETE 以外になった主な原因。\
+          NONE は阻害要因なし。\
+          AMBIGUOUS_REQUEST は、調べても何についての問いか確定できない状態。\
+          MISSING_REQUIRED_INPUT は、主題は分かるが、回答や実行に必要な条件・対象・識別情報が不足している状態。\
+          NOT_PERMITTED は、規程上できないと確認できた状態。\
+          INTERNAL_ERROR は、内部の失敗により正常に処理できなかった状態"
+    required: [status, blocking_reason]

@@ -1,0 +1,28 @@
+# 審査役。実行の手前で、interceptor の before_execute から呼ばれる（library/observers.py の Guard）。
+#
+# 図書館のネットワーク（../config/agents.yaml）とは別の設定にしている。
+# 同じNetworkに入れると、共有記憶とinterceptorが配られてしまう。他のエージェントとは4点で非対称:
+#   - Networkへ入れない（委譲候補にしない）
+#   - 共有記憶を渡さない（librarianの記憶を読ませない）
+#   - interceptorを渡さない（審査中に審査が走らない）
+#   - 用語辞書を渡さない（止める理由になる語彙を増やさない）
+#
+# system_instruction は prompts/agents/compliance/system_instruction.md。
+# 同じ指示文を「委譲の審査」と「操作の審査」の両方で使うため、どちらで何を見るのかを明記してある。
+
+- name: compliance
+  type: reflex
+  summary: 実行内容が規程に反しないかを審査する
+  provider: gemini
+  model: gemini-3.5-flash-lite
+  thought_level: low
+  max_steps: 1
+  # 審査結果は、文面ではなく構造で受け取る。
+  # 「許可します」「問題ないと思われます」といった文面を解釈して可否を判定すると、
+  # そこが新しい失敗の入り口になる。
+  output_schema:
+    type: object
+    properties:
+      allow: {type: boolean, description: この実行を許可してよいか}
+      reason: {type: string, description: その判断の理由。規程のどこに照らしたか}
+    required: [allow, reason]

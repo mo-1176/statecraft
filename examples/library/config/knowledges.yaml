@@ -1,0 +1,6 @@
+# 複数のエージェントで使い回す文書。どのエージェントに載せるかは agents.yaml に書く。
+
+# 用語辞書。書くのは語の意味だけ。規程の値（何日・何冊）を書くと、
+# search_rules を読まずに答えられてしまう。
+- name: terms
+  file: knowledge/terms.md

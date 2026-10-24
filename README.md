@@ -85,7 +85,7 @@ pip install -e ".[gemini,claude]"   # 複数でもよい
 
 ## サンプルを動かす
 
-図書館の問い合わせ対応を題材に、3体のエージェントと4つのツールが動きます。読み方は [docs/sampleの読み方.md](docs/sampleの読み方.md) にあります。
+図書館の問い合わせ対応を題材に、3体のエージェントと5つのツールが動きます。エージェントとツールの定義は設定のディレクトリ（`examples/library/` の YAML と Markdown）にあり、そのまま写せば自分のアプリの雛形になります。読み方は [docs/sampleの読み方.md](docs/sampleの読み方.md) にあります。
 
 ### 1. APIキーを置く
 
@@ -105,37 +105,51 @@ GEMINI_API_KEY=ここに貼る
 
 キーは [Google AI Studio](https://aistudio.google.com/apikey) で取得できます。
 
-キーの探し方は次の順です（`sample.py` の `resolve_api_key()`）。
+キーの探し方は次の順です（`examples/library/api_key.py`）。
 
 | 順 | 場所 | 用途 |
 |---|---|---|
 | 1 | 環境変数 `GEMINI_API_KEY` | 一時的に別のキーで動かす |
 | 2 | `.env` | 既定。2回目以降は何も聞かれない。`examples/.env` → リポジトリ直下の `.env` の順に探します |
-| 3 | 起動時の入力欄（伏せ字） | まだ `.env` を作っていない場合。チェックを入れたまま進めると `examples/.env` へ保存され、次回から聞かれません |
+| 3 | 起動時の入力欄（伏せ字） | まだ `.env` を作っていない場合。チェックを入れたまま進めると `examples/.env` へ保存され、次回から聞かれません（`api.py` では出しません） |
 
 シェルに `GEMINI_API_KEY="..."` と打つ方法は勧めません。多くのシェルがコマンド行を履歴ファイルへ平文で残すためです。
 
 ### 2. 実行する
 
-サンプルは `examples/` の中から実行します。
+サンプルは `examples/` の中から実行します。入口は3つです。
+
+| 入口 | 使い方 |
+|---|---|
+| `cli.py` | 1つの質問に答えて終わる。記憶の中身とコストの内訳まで出す |
+| `chat.py` | 対話モード。会話履歴と記憶を次のターンへ引き継ぐ。`exit` で終わる |
+| `api.py` | Web API（`POST /chat`）。会話を `session_id` で見分ける |
 
 ```bash
 cd examples
-python sample.py
-python sample.py "貸出は何冊まで？"
+python cli.py
+python cli.py "貸出は何冊まで？"
+python chat.py
 ```
 
-2回目以降は前回の記憶のうち一部（`ontology` と `vars`）が引き継がれ、`sample_carry_over.json` に保存されます。続けて実行すると引き継ぎの効果が見えます。
+`cli.py` と `chat.py` は、前回の記憶のうち一部（`ontology` と `vars`）を引き継ぎ、`sample_carry_over.json` に保存します。続けて実行すると引き継ぎの効果が見えます。
 
 ```bash
-python sample.py "深夜特急を予約したい。会員番号はM-001"
-python sample.py "さっきの予約の受付番号は？"
+python cli.py "深夜特急を予約したい。会員番号はM-001"
+python cli.py "さっきの予約の受付番号は？"
 ```
 
 毎回まっさらな状態で試すには `--fresh` を付けます。
 
 ```bash
-python sample.py "貸出は何冊まで？" --fresh
+python cli.py "貸出は何冊まで？" --fresh
+```
+
+Web API は FastAPI と uvicorn を足してから起動します。`http://127.0.0.1:8000/docs` から試せます。
+
+```bash
+pip install fastapi uvicorn
+python api.py
 ```
 
 **API利用料がかかります。** 1往復あたりの目安は数円未満ですが、実行ごとに画面へ内訳（phaseごとのトークンと概算額）が出るので、そこで確認してください。
@@ -182,11 +196,15 @@ print(response.text)
 print(net.total_tokens())  # (入力, 出力)
 ```
 
-自己完結したサンプルが `sample.py` です。図書館の問い合わせに答える構成で、受付役と司書役の2体が動きます。
+同じことを設定ファイル（YAML と Markdown）で書くこともできます（→ [設定ファイルから組み立てる](#設定ファイルから組み立てる)）。
+
+動くサンプルは `examples/` にあります。図書館の問い合わせに答える構成で、受付役と司書役の2体が動きます。定義は設定のディレクトリ（`examples/library/`）に書いてあります。
 
 ```bash
-python sample.py "貸出は何冊まで？"
-python sample.py "貸出は何冊まで？" --fresh    # 前回の記憶を引き継がない
+cd examples
+python cli.py "貸出は何冊まで？"
+python cli.py "貸出は何冊まで？" --fresh    # 前回の記憶を引き継がない
+python chat.py                              # 対話モード
 ```
 
 何がどう動いているかは [sampleの読み方.md](docs/sampleの読み方.md) にあります。試せる質問も載せてあります。
@@ -849,6 +867,8 @@ Orchestrator（統括）    記憶を持ち、知識の取得と全体の判断�
 
 エージェントとツールの定義（プロンプト、説明文、モデル、スキーマ、つながり）を、コードの外の YAML と Markdown に書けます。プロンプトの調整にコードの書き換えが要らなくなり、どのエージェントが何とつながっているかも、設定を読めば分かります。
 
+動く雛形が `examples/library/` にあります。写して中身を入れ替える手順は [sampleの読み方.md](docs/sampleの読み方.md#自分のアプリに写す) にあります。
+
 ### フォルダ構成
 
 ```
@@ -932,7 +952,7 @@ tools.yaml と knowledges.yaml は、使わなければ置かなくて構いま�
 
 `name` と `type` が分かれているので、同じ実装から `settings` だけ違うツールを何本でも作れます。
 
-文章とスキーマの `description` にある `{名前}` は、`settings` の同じ名前の値で埋まります。数字を `settings` の1か所に書けば、説明文と実装の上限が食い違いません。波かっこをそのまま書くときは `{{ }}` にしてください。
+`summary` / `usage` / `evaluation` とスキーマの `description` にある `{名前}` は、`settings` の同じ名前の値で埋まります。数字を `settings` の1か所に書けば、説明文と実装の上限が食い違いません。波かっこをそのまま書くときは `{{ }}` にしてください。`execution_message` の `{名前}` は埋めずに残し、実行時にツールの引数で埋まります（[進捗メッセージ](#進捗メッセージ)）。
 
 ### 長い文章は Markdown に置く
 
@@ -1002,7 +1022,7 @@ YAML は書き間違えても読めてしまうので、次のものは読み込
 
 イベントの通知と、実行前の判定を担います。
 
-**実運用で必要になる仕組みです。** `Interceptor` を渡さなくても動くので（何も登録しなければ何も起きません）、PoCの段階では `sample.py` の登録をそのまま使うだけで足ります。記憶の差分・引数・進捗・トークンの表示が一式揃っています。
+**実運用で必要になる仕組みです。** `Interceptor` を渡さなくても動くので（何も登録しなければ何も起きません）、PoCの段階では、サンプルの `examples/library/observers.py` の登録をそのまま使うだけで足ります。記憶の差分・引数・進捗・トークンの表示が一式揃っています。
 
 深く読むのは、次のどれかをやる段になってからで間に合います。
 
@@ -1513,7 +1533,7 @@ OpenAI / Claude のプロバイダ実装、記憶の引き継ぎ、結果を見�
 
 | | 内容 |
 |---|---|
-| [sampleの読み方.md](docs/sampleの読み方.md) | `sample.py` の全体像と、試せる質問集 |
+| [sampleの読み方.md](docs/sampleの読み方.md) | サンプル（`examples/`）の全体像、試せる質問集、自分のアプリに写す手順 |
 
 
 
