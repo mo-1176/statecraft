@@ -1444,8 +1444,8 @@ class Agent:
                 message = (
                     f"このタスクは、この更新の前の試行で{lowest[task.id]}と判定している。"
                     "差し戻しの間に新しい結果は届いていないので、判定を上げることはできない。"
-                    f"outcomeは{lowest[task.id]}のままにすること。答えにまだ要るなら、"
-                    "取りに行く新しいidのタスクを立て、取り直さない時は、"
+                    f"outcomeは{lowest[task.id]}のままにすること。答えにまだ要り、まだ取り直していないなら、"
+                    "取りに行く新しいidのタスクを立てる。取り直しても届かなかった時と、取り直さない時は、"
                     "足りない情報と試した手段をdecisionsへ書く。"
                 )
             elif outcome == "located" and task.status is TaskStatus.DONE:
@@ -1462,15 +1462,16 @@ class Agent:
             elif outcome == "not_reached" and task.status is TaskStatus.DONE:
                 message = (
                     "目的に届かなかったタスクはdoneにしない。unnecessaryにすること。"
-                    "答えにまだ要るなら、足りない情報を、それを取れるtool / agent（無ければ代わりの手段）で"
-                    "取りに行く新しいidのタスクとして立て、取り直さない時は、"
-                    "足りない情報と試した手段、取り直さない理由をdecisionsへ書く。"
+                    "答えにまだ要り、まだ取り直していないなら、足りない情報を、それを取れるtool / agent"
+                    "（無ければ代わりの手段）で取りに行く新しいidのタスクとして立てる。"
+                    "取り直しても届かなかった時と、取り直さない時は、足りない情報と試した手段をdecisionsへ書く。"
                 )
             elif outcome == "not_reached" and not has_follow_up:
                 message = (
                     "目的に届かなかった時は、答えるのに何が足りないのか、それをどのtool / agentで"
-                    "取れるか（無ければ代わりの手段）を考え、答えにまだ要るなら新しいidのタスクを立てること。"
-                    "取り直さない時は、足りない情報と試した手段、取り直さない理由をdecisionsへ書く。"
+                    "取れるか（無ければ代わりの手段）を考え、答えにまだ要り、まだ取り直していないなら"
+                    "新しいidのタスクを立てること。取り直しても届かなかった時と、取り直さない時は、"
+                    "足りない情報と試した手段をdecisionsへ書く。"
                 )
             else:
                 continue
