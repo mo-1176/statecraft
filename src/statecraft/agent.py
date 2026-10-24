@@ -59,6 +59,10 @@ from .prompts import (
 from .tools import Tool, ToolResult
 from .utils import format_message, with_timing
 
+# outcomeの良さの順。差し戻しの間に判定を上げさせないために比べる（_outcome_errors）。
+_OUTCOME_RANK = {"not_reached": 0, "located": 1, "reached": 2}
+assert set(_OUTCOME_RANK) == set(TASK_OUTCOMES)
+
 
 def _extract_rows(text: str) -> list | None:
     """
@@ -1391,13 +1395,26 @@ class Agent:
         rowsは、この更新の試行をまたいで積んだ行。差し戻しで直した行と、
         1回目に通った行（新しいタスクやdecisions）の両方を見るため。
         nextのまま残ったタスクは_stale_task_errorsが扱うので、ここでは見ない。
+
+        前の試行で付けたoutcomeより良い判定へは、書き換えさせない。差し戻しの
+        間に新しい結果は届いていないので、判定が上がる材料が無い。not_reachedと
+        正しく判定したのに、次の手を立てる代わりにreachedへ書き換えて差し戻しを
+        抜け、答えの無いまま回答へ進む失敗が実際に起きた。
         """
         latest: dict[str, dict] = {}
+        # この更新の試行の中で、タスクごとに付けた最も低いoutcome
+        lowest: dict[str, str] = {}
         for row in rows:
             if row.get("field") == "tasks":
                 row_id = str(row.get("id", "")).strip()
                 if row_id in executed_ids:
                     latest[row_id] = row
+                    outcome = row.get("outcome")
+                    if outcome in _OUTCOME_RANK and (
+                        row_id not in lowest
+                        or _OUTCOME_RANK[outcome] < _OUTCOME_RANK[lowest[row_id]]
+                    ):
+                        lowest[row_id] = outcome
 
         pending = (TaskStatus.NEXT, TaskStatus.NEXT_PARALLEL, TaskStatus.CONDITIONAL)
         has_new_task = any(
@@ -1423,6 +1440,13 @@ class Agent:
                     "今回実行したタスクを更新する行には、outcomeに、結果がこのタスクの"
                     "目的に届いたか（reached / located / not_reached）を必ず指定すること。"
                 )
+            elif _OUTCOME_RANK[outcome] > _OUTCOME_RANK[lowest[task.id]]:
+                message = (
+                    f"このタスクは、この更新の前の試行で{lowest[task.id]}と判定している。"
+                    "差し戻しの間に新しい結果は届いていないので、判定を上げることはできない。"
+                    f"outcomeは{lowest[task.id]}のまま、答えを取りに行く新しいidのタスクを立てること。"
+                    "どの手段も無い時だけ、足りない情報と試した手段をdecisionsへ書く。"
+                )
             elif outcome == "located" and task.status is TaskStatus.DONE:
                 message = (
                     "答えのありかが分かっただけのタスクはdoneにしない。unnecessaryにし、"
@@ -1447,6 +1471,63 @@ class Agent:
                     "取れるか（無ければ代わりの手段）を考え、新しいidのタスクを立てること。"
                     "どの手段も無い時だけ、足りない情報と試した手段をdecisionsへ書く。"
                 )
+            else:
+                continue
+            errors.append(DiffError("tasks", entry, message))
+        return errors
+
+    def _conditional_errors(self, rows: list, waiting_before: set[str]) -> list[DiffError]:
+        """
+        結果待ち（conditional）のタスクを、立てた時に決めた条件と照らして扱わせる。
+
+        立てる時は、何が分かったら実行するか（run_when）と、何が分かったら不要か
+        （skip_when）を書かせる。結果を見た後で「十分だった」と計画を取り消すのを、
+        結果を見る前に決めた条件と照らして判断させるため。検索で探し、見つけた
+        ページを読むと計画しておきながら、抜粋を見て読む方を取り消す失敗が実際に起きた。
+        条件を先に書かせるのは、本当に不要になる場合（在架と分かったので予約しない、
+        静的な資料で値が分かったので観測しない）を、道具の種類で決め打ちせずに残すため。
+
+        実行しないまま片付ける時は、どちらの条件に当たったか（resolved_by）を書かせ、
+        行き先と食い違えば差し戻す。次に実行するタスクが無いのに結果待ちを残した
+        時も差し戻す（残したままだと、決めないまま実行されずに回答へ進む）。
+
+        状態は差分を適用した後のmemoryで見る。resolved_byはmemoryに残さない値なので、
+        試行をまたいで積んだ行から読む。
+        """
+        resolved: dict[str, str] = {}
+        for row in rows:
+            if isinstance(row, dict) and row.get("field") == "tasks" and row.get("resolved_by"):
+                resolved[str(row.get("id", "")).strip()] = str(row["resolved_by"])
+
+        runnable = (TaskStatus.NEXT, TaskStatus.NEXT_PARALLEL)
+        has_next = any(t.status in runnable for t in self.private_memory.tasks)
+        errors = []
+        for task in self.private_memory.tasks:
+            entry = {"field": "tasks", "id": task.id, "status": task.status.value}
+            conditions = f"実行する条件: {task.run_when} / 不要になる条件: {task.skip_when}"
+            choice = resolved.get(task.id)
+            if task.status is TaskStatus.CONDITIONAL and not (task.run_when and task.skip_when):
+                message = (
+                    "結果待ち（conditional）のタスクには、立てる時に、何が分かったら実行するか"
+                    "（run_when）と、何が分かったら不要になるか（skip_when）を書くこと。"
+                )
+            elif task.status is TaskStatus.CONDITIONAL and not has_next and task.id in waiting_before:
+                message = (
+                    "次に実行するタスクが無いのに、このタスクが結果待ちのまま残っている。"
+                    f"このままでは実行されないまま回答へ進むので、立てた時の条件（{conditions}）と"
+                    "照らし、実行する条件に当たったならnextへ上げ、不要になる条件に当たったなら"
+                    "unnecessaryにして、どちらに当たったかをresolved_byに書くこと。"
+                )
+            elif task.id not in waiting_before:
+                continue
+            elif task.status in (TaskStatus.UNNECESSARY, TaskStatus.DONE) and choice != "skip_when":
+                message = (
+                    "結果待ちだったこのタスクを、実行しないまま片付けている。片付けてよいのは、"
+                    f"立てた時の不要になる条件に当たった時である（{conditions}）。"
+                    "当たったならresolved_byにskip_whenと書き、実行する条件に当たったならnextへ上げること。"
+                )
+            elif task.status in runnable and choice == "skip_when":
+                message = "不要になる条件（skip_when）に当たったなら、nextではなくunnecessaryにすること。"
             else:
                 continue
             errors.append(DiffError("tasks", entry, message))
@@ -1500,6 +1581,10 @@ class Agent:
         executed_ids = self._executed_task_ids(executed) if executed else set()
         # 届かなかった時の「新しいタスク」を見分けるため、更新前にあったidを控える。
         task_ids_before = {t.id for t in self.private_memory.tasks}
+        # 今回の実行の結果を待っていたタスクを見分けるため、更新前の結果待ちを控える。
+        waiting_before = {
+            t.id for t in self.private_memory.tasks if t.status is TaskStatus.CONDITIONAL
+        }
         # outcomeの検証は試行をまたいで行う（1回目に通った行も次の手として数える）。
         seen_rows: list[dict] = []
         # 0以下だとループが一度も回らず、memoryを作らないまま「更新しました」と
@@ -1535,12 +1620,13 @@ class Agent:
                 applied_seq = diff.apply_seq
                 # 書き込みが通ったうえで、実行済みのタスクが放置されていないかを見る。
                 # apply_diffは1行ずつしか見ないので「書かれなかったこと」は拾えない。
+                seen_rows.extend(r for r in rows if isinstance(r, dict))
                 if executed_ids:
-                    seen_rows.extend(r for r in rows if isinstance(r, dict))
                     errors.extend(self._stale_task_errors(executed_ids))
                     errors.extend(
                         self._outcome_errors(executed_ids, seen_rows, task_ids_before)
                     )
+                errors.extend(self._conditional_errors(seen_rows, waiting_before))
 
             ignored_all.extend(ignored)
 
