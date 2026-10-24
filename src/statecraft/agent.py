@@ -1423,7 +1423,7 @@ class Agent:
             and row.get("status") in {s.value for s in pending}
             for row in rows
         )
-        # 届かなかった時は、手段が尽きた理由（decisions）でも次の手として認める。
+        # 届かなかった時は、取り直さない理由（decisions）でも次の手として認める。
         # ありかが分かった時は認めない。ありかが分かっていることが、取りに行く
         # 手段があることを示しているため。decisionsで「深追いは不要」と書いて
         # 止め、答えの無い抜粋のまま回答へ進む失敗が実際に起きた。
@@ -1444,8 +1444,9 @@ class Agent:
                 message = (
                     f"このタスクは、この更新の前の試行で{lowest[task.id]}と判定している。"
                     "差し戻しの間に新しい結果は届いていないので、判定を上げることはできない。"
-                    f"outcomeは{lowest[task.id]}のまま、答えを取りに行く新しいidのタスクを立てること。"
-                    "どの手段も無い時だけ、足りない情報と試した手段をdecisionsへ書く。"
+                    f"outcomeは{lowest[task.id]}のままにすること。答えにまだ要るなら、"
+                    "取りに行く新しいidのタスクを立て、取り直さない時は、"
+                    "足りない情報と試した手段をdecisionsへ書く。"
                 )
             elif outcome == "located" and task.status is TaskStatus.DONE:
                 message = (
@@ -1460,16 +1461,16 @@ class Agent:
                 )
             elif outcome == "not_reached" and task.status is TaskStatus.DONE:
                 message = (
-                    "目的に届かなかったタスクはdoneにしない。unnecessaryにし、"
-                    "答えるのに足りない情報を、それを取れるtool / agent（無ければ代わりの手段）で"
-                    "取りに行く新しいidのタスクとして立てること。"
-                    "どの手段も無い時だけ、足りない情報と試した手段をdecisionsへ書く。"
+                    "目的に届かなかったタスクはdoneにしない。unnecessaryにすること。"
+                    "答えにまだ要るなら、足りない情報を、それを取れるtool / agent（無ければ代わりの手段）で"
+                    "取りに行く新しいidのタスクとして立て、取り直さない時は、"
+                    "足りない情報と試した手段、取り直さない理由をdecisionsへ書く。"
                 )
             elif outcome == "not_reached" and not has_follow_up:
                 message = (
                     "目的に届かなかった時は、答えるのに何が足りないのか、それをどのtool / agentで"
-                    "取れるか（無ければ代わりの手段）を考え、新しいidのタスクを立てること。"
-                    "どの手段も無い時だけ、足りない情報と試した手段をdecisionsへ書く。"
+                    "取れるか（無ければ代わりの手段）を考え、答えにまだ要るなら新しいidのタスクを立てること。"
+                    "取り直さない時は、足りない情報と試した手段、取り直さない理由をdecisionsへ書く。"
                 )
             else:
                 continue
