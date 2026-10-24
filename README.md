@@ -918,7 +918,7 @@ tools.yaml と knowledges.yaml は、使わなければ置かなくて構いま�
 |---|---|
 | `type` | `agent`（既定）か `reflex`。設定の形は同じで、クラスだけが変わります |
 | `provider` | LLM の提供元の名前。実体は `LLM_FACTORIES` で作ります（[組み立てる](#組み立てる)） |
-| `thought_level` | `none` / `minimal` / `low` / `medium` / `high` |
+| `thought_level` | `none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`。どの段階を受け付けるかはモデルごとに違い、受け付けない段階は API がエラーを返します |
 | `tools` / `initial_tools` | tools.yaml のツール名 |
 | `sub_agents` | 委譲できるエージェント名（Agent の `sub_agent_names`） |
 | `knowledge` / `initial_knowledge` | knowledges.yaml のナレッジ名。書いた順につなげて渡します |

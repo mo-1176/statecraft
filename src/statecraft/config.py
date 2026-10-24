@@ -23,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, PrivateAttr, TypeAdapter, model_vali
 from .prompts import Phase
 
 # ThoughtLevelのメンバー名の小文字。組み立てる側でThoughtLevelへ変える。
-ThoughtLevelName = Literal["none", "minimal", "low", "medium", "high"]
+ThoughtLevelName = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 
 class ConfigEntry(BaseModel):
