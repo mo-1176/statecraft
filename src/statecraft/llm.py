@@ -628,11 +628,71 @@ class OpenAILLM(BaseLLM):
     Chat Completionsは使わない。GPT-6系はChat Completionsでは、思考を伴う
     ツール呼び出しを受け付けない（reasoning_effortをnoneにした時だけ通る）。
     function_callのphaseで思考の段階を選べなくなるため、Responsesに揃える。
+
+    system_instructionは、instructionsではなくinputの先頭のdeveloperメッセージで
+    渡す。キャッシュの区切りを打てるのがそこだけのため（_developer_messageを参照）。
     """
 
+    # 1リクエストで書けるキャッシュは4か所まで（自動の区切りを止めた場合）。
+    _MAX_CACHE_BREAKPOINTS = 4
+
     def __init__(self, *, api_key: str | None = None):
-        OpenAI = _require("openai", "openai").OpenAI
-        self.client = OpenAI(api_key=api_key)
+        openai = _require("openai", "openai")
+        self.client = openai.OpenAI(api_key=api_key)
+        self._bad_request = openai.BadRequestError
+        # キャッシュの区切りを断ったモデル。GPT-5.6より前のモデルは区切りを
+        # 受け付けず400になる。対応表は持たず、断られたモデルだけを覚えて、
+        # 以降は区切り無しで送る。
+        self._without_cache_breakpoints: set[str] = set()
+
+    def _developer_message(self, blocks: list[str], breakpoints: bool) -> dict:
+        """
+        system_instructionの段を、inputの先頭に置くdeveloperメッセージにする。
+
+        GPT-5.6以降のキャッシュは、区切りまでが丸ごと一致した時にだけ当たる。
+        区切りを指定しないと、OpenAIが最後のuserメッセージの末尾に1つ打つ。
+        memoryと実行結果は毎回変わるので、その区切りは次の呼び出しで当たらず、
+        書き込み（通常の1.25倍）だけが毎回かかる。段ごとに区切る理由は
+        ClaudeLLM._cached_systemと同じ（再利用できる範囲が段ごとに違う）。
+        instructionsには区切りを打てないため、developerメッセージで渡す。
+
+        効かない条件もClaudeと同じで、モデル・tool定義・思考の段階のどれかが
+        違うリクエスト同士では、区切りが一致していても当たらない。
+        """
+        head = list(blocks[: self._MAX_CACHE_BREAKPOINTS])
+        tail = blocks[self._MAX_CACHE_BREAKPOINTS :]
+        if tail:
+            # 区切りの上限を超えた分は、最後の段へまとめる（区切りは打てない）。
+            head[-1] = "\n\n".join([head[-1], *tail])
+        mark = {"prompt_cache_breakpoint": {"mode": "explicit"}} if breakpoints else {}
+        return {
+            "role": "developer",
+            "content": [{"type": "input_text", "text": b, **mark} for b in head],
+        }
+
+    def _create(self, kwargs: dict, blocks: list[str], conversation: list[dict]):
+        """
+        キャッシュの区切りを付けて送る。モデルが区切りを断ったら、そのモデルを
+        覚えて、区切り無しで送り直す。
+        """
+        model = kwargs["model"]
+
+        def request(breakpoints: bool) -> dict:
+            developer = [self._developer_message(blocks, breakpoints)] if blocks else []
+            req = {**kwargs, "input": developer + conversation}
+            if breakpoints:
+                # 自動の区切りを止める。止めないと、末尾の区切りの書き込みが毎回かかる。
+                req["prompt_cache_options"] = {"mode": "explicit"}
+            return req
+
+        breakpoints = bool(blocks) and model not in self._without_cache_breakpoints
+        try:
+            return self.client.responses.create(**request(breakpoints))
+        except self._bad_request as e:
+            if not breakpoints or "prompt_cache" not in str(e.param or ""):
+                raise
+        self._without_cache_breakpoints.add(model)
+        return self.client.responses.create(**request(False))
 
     def _format_tools(self, tools: list[Any]) -> list[dict]:
         formatted = []
@@ -740,12 +800,16 @@ class OpenAILLM(BaseLLM):
         # ルートがオブジェクトで、全項目が必須のスキーマしか受け付けない。
         # memory差分はルートが配列である前提（キーの捏造を防ぐための設計）なので、
         # スキーマは指示文として渡し、パース側で吸収する。
-        instructions = _as_text(system_instruction)
+        blocks = _as_blocks(system_instruction)
         if response_schema:
-            instructions += _json_only_instruction(response_schema)
+            instruction = _json_only_instruction(response_schema)
+            # 最後の段（phase固有）へ足す。理由はClaudeLLMと同じ。
+            blocks = (
+                [*blocks[:-1], blocks[-1] + instruction] if blocks else [instruction]
+            )
 
         # 過去の履歴 → 今回のターン、の順で組み立てる。
-        input_items = [
+        conversation = [
             {"role": role, "content": text}
             for role, text in _normalize_messages(messages)
         ]
@@ -754,19 +818,16 @@ class OpenAILLM(BaseLLM):
             content = self._format_blobs(blobs or [])
             if prompt:
                 content.append({"type": "input_text", "text": prompt})
-            input_items.append({"role": "user", "content": content})
+            conversation.append({"role": "user", "content": content})
 
         kwargs = {
             "model": model,
-            "input": input_items,
             # 思考に使ったトークンも、この上限の中に数えられる。
             "max_output_tokens": max_tokens,
             # Responsesは既定で応答をOpenAI側に保存し、後の呼び出しから参照できる
             # ようにする。文脈はAgentが毎回組み立てて渡すので、保存は使わない。
             "store": False,
         }
-        if instructions:
-            kwargs["instructions"] = instructions
         # 指定された時だけ送る。推論モデル（o系 / gpt-5系以降）は受け付けないため、
         # そちらを使う場合は利用側がtemperatureを指定しない。
         if temperature is not None:
@@ -783,7 +844,7 @@ class OpenAILLM(BaseLLM):
         if thought_level is not None:
             kwargs["reasoning"] = {"effort": thought_level.name.lower()}
 
-        response = self.client.responses.create(**kwargs)
+        response = self._create(kwargs, blocks, conversation)
 
         input_tokens = 0
         output_tokens = 0
@@ -982,8 +1043,9 @@ class ClaudeLLM(BaseLLM):
         """
         system_instructionを段ごとのブロックにし、各段の末尾へキャッシュの区切りを打つ。
 
-        Gemini / OpenAIは一致するプレフィックスを自動でキャッシュするが、
-        Claudeは cache_control で明示的に区切らないとキャッシュされない。
+        Geminiは一致するプレフィックスを自動でキャッシュするが、
+        Claudeは cache_control で明示的に区切らないとキャッシュされない
+        （GPT-5.6以降のOpenAIも、区切りの位置でしか当たらない）。
 
         段の境界ごとに区切るのは、再利用できる範囲が違うため。
         1段目は全エージェント・全phase、2段目はそのエージェントの全phase、
