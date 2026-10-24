@@ -94,6 +94,8 @@ class ThoughtLevel(IntEnum):
     LOW = 2
     MEDIUM = 3
     HIGH = 4
+    XHIGH = 5
+    MAX = 6
 
 
 @dataclass
@@ -127,7 +129,7 @@ class LLMResponse:
     # input_tokensのうち、キャッシュから読まれた分。安く課金される。
     # プロンプトキャッシュが実際に効いているかは、この値でしか確認できない。
     cached_tokens: int = 0
-    # キャッシュへ「書き込んだ」分。Claudeのみ報告される。
+    # キャッシュへ「書き込んだ」分。ClaudeとOpenAIが報告する。
     # 書き込みは通常より高く課金されるため、毎回これが立つ（＝毎回ミスしている）
     # 状態は、キャッシュを付けたことが逆に高くついているサイン。
     cache_write_tokens: int = 0
@@ -198,12 +200,10 @@ _CLAUDE_STOP_REASONS = {
     "refusal": "refusal",
 }
 
-# OpenAI: choices[0].finish_reason
+# OpenAI（Responses API）: 打ち切られた時だけ incomplete_details.reason に理由が入る。
+# 通常終了・呼び出し要求・拒否は、status と output の中身から判定する（OpenAILLM.generate）。
 _OPENAI_STOP_REASONS = {
-    "stop": "end",
-    "tool_calls": "tool_use",
-    "function_call": "tool_use",
-    "length": "max_tokens",
+    "max_output_tokens": "max_tokens",
     "content_filter": "refusal",
 }
 
@@ -622,6 +622,14 @@ _OPENAI_AUDIO_FORMAT_ALIASES = {
 
 
 class OpenAILLM(BaseLLM):
+    """
+    OpenAIのResponses APIで生成する。
+
+    Chat Completionsは使わない。GPT-6系はChat Completionsでは、思考を伴う
+    ツール呼び出しを受け付けない（reasoning_effortをnoneにした時だけ通る）。
+    function_callのphaseで思考の段階を選べなくなるため、Responsesに揃える。
+    """
+
     def __init__(self, *, api_key: str | None = None):
         OpenAI = _require("openai", "openai").OpenAI
         self.client = OpenAI(api_key=api_key)
@@ -636,11 +644,12 @@ class OpenAILLM(BaseLLM):
                 formatted.append(
                     {
                         "type": "function",
-                        "function": {
-                            "name": d["name"],
-                            "description": d["description"],
-                            "parameters": d["parameters"],
-                        },
+                        "name": d["name"],
+                        "description": d["description"],
+                        "parameters": d["parameters"],
+                        # strictは引数のスキーマに「全項目必須・additionalProperties: false」
+                        # を求める。任意の引数を持つtoolがそのままでは渡せないため使わない。
+                        "strict": False,
                     }
                 )
             else:
@@ -649,19 +658,19 @@ class OpenAILLM(BaseLLM):
 
     def _format_blobs(self, blobs: list[dict]) -> list[dict]:
         """
-        添付を、OpenAIのcontentパートへ変換する。
+        添付を、Responses APIのcontentパートへ変換する。
 
-        種類ごとにパートが違う（openai.types.chat の
-        ChatCompletionContentPartParam に並んでいる形に合わせる）。
+        種類ごとにパートが違う（openai.types.responses の
+        ResponseInputContentParam に並んでいる形に合わせる）。
 
-            画像    {"type": "image_url",    "image_url":   {"url": "data:..."}}
-            音声    {"type": "input_audio",  "input_audio": {"data": ..., "format": ...}}
-            その他  {"type": "file",         "file":        {"filename": ..., "file_data": ...}}
+            画像    {"type": "input_image", "image_url": "data:...", "detail": "auto"}
+            音声    {"type": "input_audio", "input_audio": {"data": ..., "format": ...}}
+            その他  {"type": "input_file",  "filename": ..., "file_data": "data:..."}
 
         filenameが必要なのは、file_dataで中身を直接送る場合に要求されるため。
         blobは名前を持たないので連番で作る。
 
-        動画はChat Completionsに該当するパートが無いため例外にする
+        動画はResponses APIに該当するパートが無いため例外にする
         （fileパートへ入れても「渡したつもりで見られていない」状態になる）。
         """
         parts = []
@@ -671,8 +680,9 @@ class OpenAILLM(BaseLLM):
             if mime.startswith("image/"):
                 parts.append(
                     {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime};base64,{b64_data}"},
+                        "type": "input_image",
+                        "image_url": f"data:{mime};base64,{b64_data}",
+                        "detail": "auto",
                     }
                 )
             elif mime.startswith("audio/"):
@@ -693,18 +703,16 @@ class OpenAILLM(BaseLLM):
             elif mime.startswith("video/"):
                 raise ValueError(
                     f"blobs[{i}]のmime_type {mime!r} はOpenAIへ渡せません。"
-                    "Chat Completionsに動画のcontentパートが無いためです。"
+                    "Responses APIに動画のcontentパートが無いためです。"
                     "動画を渡す必要がある生成は、phase_overridesでllmをGeminiへ"
                     "差し替えてください（Geminiは動画をそのまま受け取れます）。"
                 )
             else:
                 parts.append(
                     {
-                        "type": "file",
-                        "file": {
-                            "filename": f"attachment_{i + 1}{_extension_for(mime)}",
-                            "file_data": f"data:{mime};base64,{b64_data}",
-                        },
+                        "type": "input_file",
+                        "filename": f"attachment_{i + 1}{_extension_for(mime)}",
+                        "file_data": f"data:{mime};base64,{b64_data}",
                     }
                 )
         return parts
@@ -728,38 +736,38 @@ class OpenAILLM(BaseLLM):
         max_tokens: int,
         thought_level: ThoughtLevel | None = None,
     ) -> LLMResponse:
-        # response_formatのjson_objectモードはルートをオブジェクトに強制するため使わない。
+        # Responsesにも構造を強制する手段（text.formatのjson_schema）はあるが、
+        # ルートがオブジェクトで、全項目が必須のスキーマしか受け付けない。
         # memory差分はルートが配列である前提（キーの捏造を防ぐための設計）なので、
         # スキーマは指示文として渡し、パース側で吸収する。
-        system_text = _as_text(system_instruction)
+        instructions = _as_text(system_instruction)
         if response_schema:
-            system_text += _json_only_instruction(response_schema)
-
-        api_messages = []
-        if system_text:
-            api_messages.append({"role": "system", "content": system_text})
+            instructions += _json_only_instruction(response_schema)
 
         # 過去の履歴 → 今回のターン、の順で組み立てる。
-        api_messages.extend(
+        input_items = [
             {"role": role, "content": text}
             for role, text in _normalize_messages(messages)
-        )
+        ]
 
         if prompt or blobs:
             content = self._format_blobs(blobs or [])
             if prompt:
-                content.append({"type": "text", "text": prompt})
-            api_messages.append({"role": "user", "content": content})
+                content.append({"type": "input_text", "text": prompt})
+            input_items.append({"role": "user", "content": content})
 
         kwargs = {
             "model": model,
-            "messages": api_messages,
-            # max_tokensは非推奨で、推論モデル（o系）では受け付けられない。
-            # reasoning_effortを送る相手はその系列なので、max_tokensのままでは
-            # 思考を指定した瞬間に400になる。
-            "max_completion_tokens": max_tokens,
+            "input": input_items,
+            # 思考に使ったトークンも、この上限の中に数えられる。
+            "max_output_tokens": max_tokens,
+            # Responsesは既定で応答をOpenAI側に保存し、後の呼び出しから参照できる
+            # ようにする。文脈はAgentが毎回組み立てて渡すので、保存は使わない。
+            "store": False,
         }
-        # 指定された時だけ送る。推論モデル（o系 / gpt-5系）は受け付けないため、
+        if instructions:
+            kwargs["instructions"] = instructions
+        # 指定された時だけ送る。推論モデル（o系 / gpt-5系以降）は受け付けないため、
         # そちらを使う場合は利用側がtemperatureを指定しない。
         if temperature is not None:
             kwargs["temperature"] = temperature
@@ -770,45 +778,67 @@ class OpenAILLM(BaseLLM):
                     "required" if tool_choice == "any" else tool_choice
                 )
 
-        # OpenAIはreasoning_effortという語彙で受け取る。ThoughtLevelの
-        # 段階名をそのまま送る（Geminiのthinking_levelと同じ扱い）。
+        # ThoughtLevelの段階名をそのまま送る（Geminiのthinking_levelと同じ扱い）。
         # 対応表は持たない——受け付ける値がモデルごとに違うため。
         if thought_level is not None:
-            kwargs["reasoning_effort"] = thought_level.name.lower()
+            kwargs["reasoning"] = {"effort": thought_level.name.lower()}
 
-        response = self.client.chat.completions.create(**kwargs)
+        response = self.client.responses.create(**kwargs)
 
         input_tokens = 0
         output_tokens = 0
         cached_tokens = 0
-        if hasattr(response, "usage") and response.usage:
-            input_tokens = response.usage.prompt_tokens or 0
-            output_tokens = response.usage.completion_tokens or 0
-            # OpenAIもキャッシュ分をprompt_tokensの内数として報告する。
-            details = getattr(response.usage, "prompt_tokens_details", None)
+        cache_write_tokens = 0
+        if response.usage:
+            input_tokens = response.usage.input_tokens or 0
+            output_tokens = response.usage.output_tokens or 0
+            # キャッシュの読み出し分も、input_tokensの内数として報告される。
+            details = getattr(response.usage, "input_tokens_details", None)
             cached_tokens = getattr(details, "cached_tokens", 0) or 0
+            cache_write_tokens = getattr(details, "cache_write_tokens", 0) or 0
 
-        message = response.choices[0].message
-        # OpenAIは引数をJSON文字列で返すため、ここで辞書へ戻す。
-        # 壊れたJSONが来た場合に例外で落とさず、空の引数として扱う
-        # （呼び出し自体は実行され、引数不足のエラーとして結果に現れる）。
+        # outputには、回答（message）・呼び出し要求（function_call）・思考の要約
+        # （reasoning）が並んで返る。回答と呼び出し要求だけを拾う。
+        texts = []
         calls = []
-        for c in message.tool_calls or []:
-            try:
-                args = json.loads(c.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            calls.append(FunctionCall(name=c.function.name, args=args))
+        refused = False
+        for item in response.output:
+            if item.type == "message":
+                for part in item.content:
+                    if part.type == "output_text":
+                        texts.append(part.text)
+                    elif part.type == "refusal":
+                        refused = True
+            elif item.type == "function_call":
+                # 引数はJSON文字列で返るため、ここで辞書へ戻す。
+                # 壊れたJSONが来た場合に例外で落とさず、空の引数として扱う
+                # （呼び出し自体は実行され、引数不足のエラーとして結果に現れる）。
+                try:
+                    args = json.loads(item.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                calls.append(FunctionCall(name=item.name, args=args))
+
+        if response.status == "incomplete":
+            reason = getattr(response.incomplete_details, "reason", None)
+            stop_reason = _normalize_stop_reason(reason, _OPENAI_STOP_REASONS)
+        elif refused:
+            stop_reason = "refusal"
+        elif calls:
+            stop_reason = "tool_use"
+        elif response.status == "completed":
+            stop_reason = "end"
+        else:
+            stop_reason = _normalize_stop_reason(response.status, _OPENAI_STOP_REASONS)
 
         return LLMResponse(
-            text=message.content or "",
+            text="".join(texts),
             function_calls=calls,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_tokens=cached_tokens,
-            stop_reason=_normalize_stop_reason(
-                response.choices[0].finish_reason, _OPENAI_STOP_REASONS
-            ),
+            cache_write_tokens=cache_write_tokens,
+            stop_reason=stop_reason,
         )
 
     @with_timing
