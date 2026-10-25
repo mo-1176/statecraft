@@ -140,6 +140,34 @@ def test_max_stepsに達したら打ち切って回答する():
     assert events[-1].phase is Phase.CUTOFF_ANSWER
 
 
+def test_tasksを決めるステップに残りの実行回数を見せる(search_tool):
+    """
+    初期構築は全ステップ、記憶の更新は使った分を引いた回数を見せる。
+    引数を決めるステップと回答のステップには見せない。
+    """
+    llm = FakeLLM(
+        [
+            diff_response([task_row("t-1", "規程を調べる", "next", ["search_rules"])]),
+            call_response("search_rules", topic="貸出"),
+            diff_response(
+                [
+                    {"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "一般は5冊まで"},
+                    task_row("t-1", "規程を調べる", "done", ["search_rules"], outcome="reached"),
+                ]
+            ),
+            text_response("一般の方は5冊までです。"),
+        ]
+    )
+    agent = build_agent(llm, tools=[search_tool], max_steps=3)
+    agent.respond(message="貸出は何冊まで？")
+
+    initial, call, update, answer = (c["prompt"] for c in llm.calls)
+    assert "あと3回" in initial
+    assert "残りの実行回数" not in call
+    assert "あと2回" in update
+    assert "残りの実行回数" not in answer
+
+
 def test_同じ実行を繰り返すと停滞として打ち切る(search_tool):
     """
     重複拒否で毎ステップ同じエラーが返る状況。
@@ -606,8 +634,8 @@ def test_ありかだけ分かったタスクをdoneにすると差し戻す(sea
     assert "ありかが分かっただけのタスクはdoneにしない" in llm.calls[3]["prompt"]
 
 
-def test_ありかが分かった時はdecisionsで止められない(search_tool):
-    """「深追いは不要」とdecisionsへ書いて、答えの無い結果のまま回答へ進ませない。"""
+def test_ありかが分かっても取りに行かない理由を書けば止められる(search_tool):
+    """取りに行くかはモデルに任せる。理由をdecisionsへ書けば、差し戻さずに回答へ進む。"""
     llm = FakeLLM(
         [
             diff_response([task_row("t-1", "貸出上限を調べる", "next", ["search_rules"])]),
@@ -615,11 +643,47 @@ def test_ありかが分かった時はdecisionsで止められない(search_too
             diff_response(
                 [
                     task_row("t-1", "貸出上限を調べる", "unnecessary", ["search_rules"], outcome="located"),
-                    {"field": "decisions", "id": "d-1", "text": "これ以上の深追いは不要と判断"},
+                    {"field": "decisions", "id": "d-1", "text": "上限は答えの骨組みに要らないため、取りに行かない"},
                 ]
             ),
+            text_response("利用規程に載っています。"),
+        ]
+    )
+    agent = build_agent(llm, tools=[search_tool])
+
+    response = agent.respond(message="貸出規程はどこで見られる？")
+
+    assert response.text == "利用規程に載っています。"
+    assert search_tool.calls == ["貸出"]
+    # 記憶の更新が差し戻されていない
+    assert len(llm.calls) == 4
+
+
+def test_ありかが分かったら立ててあったタスクを次に回せる(search_tool):
+    """新しいidでなくても、立ててあった結果待ちを次に回すのは正しい次の手である。"""
+    llm = FakeLLM(
+        [
             diff_response(
-                [task_row("t-2", "利用規程から貸出上限を確かめる", "next", ["search_rules"])]
+                [
+                    task_row("t-1", "貸出上限のありかを探す", "next", ["search_rules"]),
+                    waiting_row(
+                        "t-2",
+                        "見つかった規程から貸出上限を確かめる",
+                        ["search_rules"],
+                        run_when="規程の場所が分かったら",
+                        skip_when="規程が無いと分かったら",
+                    ),
+                ]
+            ),
+            call_response("search_rules", topic="貸出"),
+            diff_response(
+                [
+                    task_row("t-1", "利用規程に載っていると分かった", "unnecessary", ["search_rules"], outcome="located"),
+                    {
+                        **task_row("t-2", "利用規程から貸出上限を確かめる", "next", ["search_rules"]),
+                        "resolved_by": "run_when",
+                    },
+                ]
             ),
             call_response("search_rules", topic="利用規程"),
             diff_response(
@@ -632,9 +696,10 @@ def test_ありかが分かった時はdecisionsで止められない(search_too
 
     response = agent.respond(message="貸出は何冊まで？")
 
-    assert "取りに行く手段があることを示している" in llm.calls[3]["prompt"]
     assert response.text == "5冊までです。"
     assert search_tool.calls == ["貸出", "利用規程"]
+    # 記憶の更新が差し戻されていない
+    assert len(llm.calls) == 6
 
 
 def test_ありかだけ分かって次の手が無いと差し戻す(search_tool):
@@ -662,7 +727,7 @@ def test_ありかだけ分かって次の手が無いと差し戻す(search_too
 
     response = agent.respond(message="貸出は何冊まで？")
 
-    assert "どのtool / agentで取りに行けるかを考え" in llm.calls[3]["prompt"]
+    assert "次の手を同じ更新に含めること" in llm.calls[3]["prompt"]
     assert response.text == "5冊までです。"
     assert search_tool.calls == ["貸出", "利用規程"]
     assert len(llm.calls) == 7
