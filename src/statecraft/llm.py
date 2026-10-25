@@ -303,12 +303,12 @@ def _extension_for(mime_type: str) -> str:
 
 def _json_only_instruction(response_schema) -> str:
     """
-    response_schemaに相当する仕組みを持たないプロバイダ向けに、
-    スキーマを指示文へ落とし込む。
+    構造を強制できない場合に、スキーマを指示文へ落とし込む。
 
-    Geminiは構造を強制できるが、OpenAIとClaudeにはルートが配列のスキーマを
-    強制する手段が無い。受け取って無視すると「指定したのに効かない」状態に
-    なるため、最低限プロンプトとして伝える（受け取り側は寛容にパースする）。
+    Claudeにはルートが配列のスキーマを強制する手段が無い。OpenAIでも、strictに
+    直せないスキーマと、strictを断ったモデルではこちらになる。受け取って無視すると
+    「指定したのに効かない」状態になるため、最低限プロンプトとして伝える
+    （受け取り側は寛容にパースする）。
     """
     lines = [
         "",
@@ -318,6 +318,169 @@ def _json_only_instruction(response_schema) -> str:
         json.dumps(response_schema, ensure_ascii=False),
     ]
     return "\n".join(lines)
+
+
+def _with_last_block(blocks: list[str], addition: str) -> list[str]:
+    """最後の段（phase固有）へ足す。"""
+    return [*blocks[:-1], blocks[-1] + addition] if blocks else [addition]
+
+
+# ---- OpenAIのstrictモード（Structured Outputs / strictなfunction tool） ----
+# strictにすると、出力と引数がスキーマどおりになることをAPIが保証する。
+# 指示文で頼むだけだと、GPTは差分の代わりに回答の文を書いたり、引数に無い項目を
+# 足したりする（実測。差し戻しのやり直しで、生成をまるごと払い直していた）。
+
+# strictなスキーマで使えるキーワード。これ以外を含むスキーマは400になるので、
+# strictにせず従来どおりに渡す。
+_STRICT_KEYWORDS = frozenset(
+    {
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "enum",
+        "const",
+        "anyOf",
+        "description",
+        "pattern",
+        "format",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minItems",
+        "maxItems",
+    }
+)
+# 意味を変えない注釈。strictでは受け付けられないことがあるので、落として送る。
+_ANNOTATION_KEYWORDS = frozenset({"title", "default", "examples", "$schema"})
+# strictはルートがオブジェクトのスキーマしか受け付けない。memory差分はルートが
+# 配列なので、このキーで包んで送り、受け取ったら剥がす。
+_STRICT_ROOT_KEY = "result"
+
+
+def _is_object_schema(schema: dict) -> bool:
+    types = schema.get("type")
+    return (
+        types == "object"
+        or (isinstance(types, list) and "object" in types)
+        or (types is None and "properties" in schema)
+    )
+
+
+def _strict_schema(schema: Any) -> dict | None:
+    """
+    スキーマを、strictモードが受け付ける形に直す。直せなければNone。
+
+    strictは、すべてのオブジェクトに「全プロパティが必須・additionalProperties: false」
+    を求める。任意だったプロパティは、nullも取れる必須のプロパティにする
+    （返ってきたnullは _drop_absent が取り除き、指定が無かったものとして扱う）。
+    中身を決めていないオブジェクト（自由なキーの辞書）はstrictにできない。
+    """
+    if not isinstance(schema, dict):
+        return None
+    if set(schema) - _STRICT_KEYWORDS - _ANNOTATION_KEYWORDS:
+        return None
+    out = {k: v for k, v in schema.items() if k not in _ANNOTATION_KEYWORDS}
+
+    if "anyOf" in out:
+        variants = [_strict_schema(s) for s in out["anyOf"]]
+        if any(v is None for v in variants):
+            return None
+        out["anyOf"] = variants
+
+    if _is_object_schema(out):
+        props = out.get("properties")
+        if not props or out.get("additionalProperties", False) is not False:
+            return None
+        required = set(out.get("required", []))
+        strict_props = {}
+        for name, prop in props.items():
+            converted = _strict_schema(prop)
+            if converted is None:
+                return None
+            strict_props[name] = converted if name in required else _nullable(converted)
+        out["properties"] = strict_props
+        out["required"] = list(props)
+        out["additionalProperties"] = False
+
+    if out.get("type") == "array" or "items" in out:
+        items = _strict_schema(out.get("items"))
+        if items is None:
+            return None
+        out["items"] = items
+    return out
+
+
+def _nullable(schema: dict) -> dict:
+    """任意のプロパティを、nullも取れる形にする（strictでは必須にするため）。"""
+    types = schema.get("type")
+    if isinstance(types, str) and "const" not in schema:
+        out = {**schema, "type": [types, "null"]}
+        if "enum" in out:
+            out["enum"] = [*out["enum"], None]
+        return out
+    return {"anyOf": [schema, {"type": "null"}]}
+
+
+def _drop_absent(value: Any, schema: Any) -> Any:
+    """
+    strictのために足したnullを取り除く。元のスキーマで任意だったプロパティの
+    nullだけを消す（元から必須のプロパティのnullは、そのまま残す）。
+    """
+    if not isinstance(schema, dict):
+        return value
+    if isinstance(value, dict):
+        props = schema.get("properties") or {}
+        required = set(schema.get("required", []))
+        return {
+            k: _drop_absent(v, props.get(k))
+            for k, v in value.items()
+            if not (v is None and k not in required)
+        }
+    if isinstance(value, list):
+        return [_drop_absent(v, schema.get("items")) for v in value]
+    return value
+
+
+def _strict_text_format(response_schema: dict) -> tuple[dict, bool] | None:
+    """
+    response_schemaを、text.formatに渡すstrictなjson_schemaにする。
+    返り値は（format、ルートを包んだか）。strictに直せなければNone。
+    """
+    wrapped = not _is_object_schema(response_schema)
+    schema = (
+        {
+            "type": "object",
+            "properties": {_STRICT_ROOT_KEY: response_schema},
+            "required": [_STRICT_ROOT_KEY],
+        }
+        if wrapped
+        else response_schema
+    )
+    strict = _strict_schema(schema)
+    if strict is None:
+        return None
+    return {
+        "type": "json_schema",
+        "name": "response",
+        "schema": strict,
+        "strict": True,
+    }, wrapped
+
+
+def _from_strict_text(text: str, response_schema: dict, wrapped: bool) -> str:
+    """strictで返ったJSONから、包んだキーと足したnullを取り除いて、元の形に戻す。"""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        # 上限で途中まで返った場合など。受け取り側の検査で差し戻させる。
+        return text
+    if wrapped and isinstance(data, dict):
+        data = data.get(_STRICT_ROOT_KEY)
+    return json.dumps(_drop_absent(data, response_schema), ensure_ascii=False)
 
 
 # ---- 1. 統一規格（基底クラス） ----
@@ -631,6 +794,8 @@ class OpenAILLM(BaseLLM):
 
     system_instructionは、instructionsではなくinputの先頭のdeveloperメッセージで
     渡す。キャッシュの区切りを打てるのがそこだけのため（_developer_messageを参照）。
+
+    response_schemaとtoolの引数は、strictにできる限りstrictで送る（_strict_schema）。
     """
 
     # 1リクエストで書けるキャッシュは4か所まで（自動の区切りを止めた場合）。
@@ -644,6 +809,10 @@ class OpenAILLM(BaseLLM):
         # 受け付けず400になる。対応表は持たず、断られたモデルだけを覚えて、
         # 以降は区切り無しで送る。
         self._without_cache_breakpoints: set[str] = set()
+        # strictを断ったモデル。区切りと同じく、断られたら覚えて、以降は
+        # 出力のスキーマを指示文で、toolの引数をstrict無しで送る。
+        self._without_structured_output: set[str] = set()
+        self._without_strict_tools: set[str] = set()
 
     def _developer_message(self, blocks: list[str], breakpoints: bool) -> dict:
         """
@@ -694,27 +863,37 @@ class OpenAILLM(BaseLLM):
         self._without_cache_breakpoints.add(model)
         return self.client.responses.create(**request(False))
 
-    def _format_tools(self, tools: list[Any]) -> list[dict]:
+    def _format_tools(
+        self, tools: list[Any], *, strict: bool
+    ) -> tuple[list[dict], dict[str, dict]]:
+        """
+        toolをfunction toolの形にする。返り値は（tool定義、strictにしたtoolの元の引数スキーマ）。
+
+        strict: 引数のスキーマをstrictに直せるtoolはstrictにする。任意の引数は
+            nullも取れる必須の引数になるので、返ってきたnullは元のスキーマで取り除く。
+        """
         formatted = []
+        strict_originals: dict[str, dict] = {}
         for t in tools:
             # ToolとAgentの両方を受け取るため、継承ではなくto_declaration()の
             # 有無で判定する（AgentはToolを継承していない）。
             if hasattr(t, "to_declaration"):
                 d = t.to_declaration()
+                params = _strict_schema(d["parameters"]) if strict else None
+                if params is not None:
+                    strict_originals[d["name"]] = d["parameters"]
                 formatted.append(
                     {
                         "type": "function",
                         "name": d["name"],
                         "description": d["description"],
-                        "parameters": d["parameters"],
-                        # strictは引数のスキーマに「全項目必須・additionalProperties: false」
-                        # を求める。任意の引数を持つtoolがそのままでは渡せないため使わない。
-                        "strict": False,
+                        "parameters": params if params is not None else d["parameters"],
+                        "strict": params is not None,
                     }
                 )
             else:
                 formatted.append(t)
-        return formatted
+        return formatted, strict_originals
 
     def _format_blobs(self, blobs: list[dict]) -> list[dict]:
         """
@@ -796,17 +975,16 @@ class OpenAILLM(BaseLLM):
         max_tokens: int,
         thought_level: ThoughtLevel | None = None,
     ) -> LLMResponse:
-        # Responsesにも構造を強制する手段（text.formatのjson_schema）はあるが、
-        # ルートがオブジェクトで、全項目が必須のスキーマしか受け付けない。
-        # memory差分はルートが配列である前提（キーの捏造を防ぐための設計）なので、
-        # スキーマは指示文として渡し、パース側で吸収する。
+        # 出力の構造は、text.formatのstrictなjson_schemaで強制する。strictは
+        # ルートがオブジェクトで全項目が必須のスキーマしか受け付けないため、
+        # _strict_text_formatが包み直す（memory差分はルートが配列のまま設計を保つ）。
+        # strictに直せないスキーマと、strictを断ったモデルでは、指示文で渡す。
         blocks = _as_blocks(system_instruction)
-        if response_schema:
-            instruction = _json_only_instruction(response_schema)
-            # 最後の段（phase固有）へ足す。理由はClaudeLLMと同じ。
-            blocks = (
-                [*blocks[:-1], blocks[-1] + instruction] if blocks else [instruction]
-            )
+        structured = None
+        if response_schema and model not in self._without_structured_output:
+            structured = _strict_text_format(response_schema)
+        if response_schema and structured is None:
+            blocks = _with_last_block(blocks, _json_only_instruction(response_schema))
 
         # 過去の履歴 → 今回のターン、の順で組み立てる。
         conversation = [
@@ -832,19 +1010,45 @@ class OpenAILLM(BaseLLM):
         # そちらを使う場合は利用側がtemperatureを指定しない。
         if temperature is not None:
             kwargs["temperature"] = temperature
+        strict_tools: dict[str, dict] = {}
         if tools:
-            kwargs["tools"] = self._format_tools(tools)
+            kwargs["tools"], strict_tools = self._format_tools(
+                tools, strict=model not in self._without_strict_tools
+            )
             if tool_choice:
                 kwargs["tool_choice"] = (
                     "required" if tool_choice == "any" else tool_choice
                 )
+        if structured:
+            kwargs["text"] = {"format": structured[0]}
 
         # ThoughtLevelの段階名をそのまま送る（Geminiのthinking_levelと同じ扱い）。
         # 対応表は持たない——受け付ける値がモデルごとに違うため。
         if thought_level is not None:
             kwargs["reasoning"] = {"effort": thought_level.name.lower()}
 
-        response = self._create(kwargs, blocks, conversation)
+        # strictを断られたら、そのモデルを覚えてstrict無しで送り直す。
+        # 出力とtoolの両方を断られる場合に備えて、2回まで落とす。
+        for _ in range(3):
+            try:
+                response = self._create(kwargs, blocks, conversation)
+                break
+            except self._bad_request as e:
+                param = str(e.param or "")
+                if structured and param.startswith("text"):
+                    self._without_structured_output.add(model)
+                    structured = None
+                    del kwargs["text"]
+                    blocks = _with_last_block(
+                        blocks, _json_only_instruction(response_schema)
+                    )
+                elif strict_tools and param.startswith("tools"):
+                    self._without_strict_tools.add(model)
+                    kwargs["tools"], strict_tools = self._format_tools(
+                        tools, strict=False
+                    )
+                else:
+                    raise
 
         input_tokens = 0
         output_tokens = 0
@@ -878,6 +1082,9 @@ class OpenAILLM(BaseLLM):
                     args = json.loads(item.arguments or "{}")
                 except json.JSONDecodeError:
                     args = {}
+                if item.name in strict_tools:
+                    # strictで必須にした任意の引数は、nullで返る。渡さなかった扱いに戻す。
+                    args = _drop_absent(args, strict_tools[item.name])
                 calls.append(FunctionCall(name=item.name, args=args))
 
         if response.status == "incomplete":
@@ -892,8 +1099,12 @@ class OpenAILLM(BaseLLM):
         else:
             stop_reason = _normalize_stop_reason(response.status, _OPENAI_STOP_REASONS)
 
+        text = "".join(texts)
+        if structured and text:
+            text = _from_strict_text(text, response_schema, wrapped=structured[1])
+
         return LLMResponse(
-            text="".join(texts),
+            text=text,
             function_calls=calls,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -1138,12 +1349,9 @@ class ClaudeLLM(BaseLLM):
         #     代入ではなくマージに直す必要がある
         blocks = _as_blocks(system_instruction)
         if response_schema:
-            instruction = _json_only_instruction(response_schema)
             # 最後の段（phase固有）へ足す。phaseが決まればスキーマも決まるので、
             # 別の段にするとその段だけキャッシュが当たらなくなる。
-            blocks = (
-                [*blocks[:-1], blocks[-1] + instruction] if blocks else [instruction]
-            )
+            blocks = _with_last_block(blocks, _json_only_instruction(response_schema))
         if blocks:
             kwargs["system"] = self._cached_system(blocks)
 
