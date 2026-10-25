@@ -1221,7 +1221,9 @@ class Agent:
         # 全員が同じ形で読む（窓口だけがマルチターンで受け取ると、委譲先と
         # 見えている経緯の形が食い違い、窓口には二重に載る）。
         # プロンプトの組み立ては再試行のたびに同じ結果になるので1回だけ行う。
-        prompt = self._build_prompt(tool_results=tool_results, extra=extra_prompt)
+        prompt = self._build_prompt(
+            tool_results=tool_results, extra=extra_prompt, phase=phase
+        )
         system_instruction = self._build_system_instruction(phase)
 
         # 実際に使うモデル。再試行で差し替わりうるので、cfgとは別に持つ。
@@ -1380,17 +1382,16 @@ class Agent:
             if task.id in executed_ids and task.status in pending
         ]
 
-    def _outcome_errors(
-        self, executed_ids: set[str], rows: list, task_ids_before: set[str]
-    ) -> list[DiffError]:
+    def _outcome_errors(self, executed_ids: set[str], rows: list) -> list[DiffError]:
         """
         実行したタスクを片付ける行に、結果が目的に届いたか（outcome）を書かせる。
 
         「目的に届いた時だけdone」と文章で求めても、「調査完了」とだけ書いて
         doneにされ、問いに答えていない結果のまま回答へ進んだ。届いたかを値で
         書かせ、届かなかった（not_reached）か、ありかだけ分かった（located）なら、
-        次の手（依頼を変えた新しいタスク、または手段が無い理由のdecisions）を
-        同じ更新に含めさせる。
+        次の手（取りに行くタスク、または取りに行かない理由のdecisions）を
+        同じ更新に含めさせる。取りに行くかどうかはモデルに任せ、どちらも無いまま
+        片付ける食い違いだけを止める。
 
         rowsは、この更新の試行をまたいで積んだ行。差し戻しで直した行と、
         1回目に通った行（新しいタスクやdecisions）の両方を見るため。
@@ -1417,17 +1418,18 @@ class Agent:
                         lowest[row_id] = outcome
 
         pending = (TaskStatus.NEXT, TaskStatus.NEXT_PARALLEL, TaskStatus.CONDITIONAL)
-        has_new_task = any(
+        # 次の手としてのタスクは、新しいidに限らない。初期構築で立ててあった
+        # 「見つかったら本文を開く」タスクを次に回すのも、正しい次の手である
+        # （新しいidに限っていた頃、それを3回差し戻して更新を使い切った）。
+        has_next_task = any(
             row.get("field") == "tasks"
-            and str(row.get("id", "")).strip() not in task_ids_before
+            and str(row.get("id", "")).strip() not in executed_ids
             and row.get("status") in {s.value for s in pending}
             for row in rows
         )
-        # 届かなかった時は、取り直さない理由（decisions）でも次の手として認める。
-        # ありかが分かった時は認めない。ありかが分かっていることが、取りに行く
-        # 手段があることを示しているため。decisionsで「深追いは不要」と書いて
-        # 止め、答えの無い抜粋のまま回答へ進む失敗が実際に起きた。
-        has_follow_up = has_new_task or any(row.get("field") == "decisions" for row in rows)
+        # 取りに行かない理由（decisions）も次の手として認める。止める時は、骨組みを
+        # どの事実で埋めたかをdecisionsへ書かせているため、理由の無い打ち切りにならない。
+        has_follow_up = has_next_task or any(row.get("field") == "decisions" for row in rows)
 
         errors = []
         for task in self.private_memory.tasks:
@@ -1445,33 +1447,32 @@ class Agent:
                     f"このタスクは、この更新の前の試行で{lowest[task.id]}と判定している。"
                     "差し戻しの間に新しい結果は届いていないので、判定を上げることはできない。"
                     f"outcomeは{lowest[task.id]}のままにすること。答えにまだ要り、まだ取り直していないなら、"
-                    "取りに行く新しいidのタスクを立てる。取り直しても届かなかった時と、取り直さない時は、"
-                    "足りない情報と試した手段をdecisionsへ書く。"
+                    "取りに行くタスクを立てる（立ててあったタスクを次に回してもよい）。"
+                    "取り直しても届かなかった時と、取り直さない時は、足りない情報と試した手段をdecisionsへ書く。"
                 )
             elif outcome == "located" and task.status is TaskStatus.DONE:
                 message = (
-                    "答えのありかが分かっただけのタスクはdoneにしない。unnecessaryにし、"
-                    "分かったありかから答えそのものを取りに行く新しいidのタスクを立てること。"
+                    "答えのありかが分かっただけのタスクはdoneにしない。unnecessaryにすること。"
+                    "答えにまだ要るなら、ありかから答えを取りに行くタスクを立て（立ててあったタスクを"
+                    "次に回してもよい）、取りに行かないなら、理由をdecisionsへ書く。"
                 )
-            elif outcome == "located" and not has_new_task:
+            elif outcome == "located" and not has_follow_up:
                 message = (
-                    "答えのありかが分かった時は、そこから答えそのものを、どのtool / agentで"
-                    "取りに行けるかを考え、新しいidのタスクを立てること。ありかが分かっていることが、"
-                    "取りに行く手段があることを示している。"
+                    "答えのありかが分かった時は、次の手を同じ更新に含めること。答えにまだ要るなら、"
+                    "ありかから答えを取りに行くタスクを立て（立ててあったタスクを次に回してもよい）、"
+                    "取りに行かないなら、理由をdecisionsへ書く。"
                 )
             elif outcome == "not_reached" and task.status is TaskStatus.DONE:
                 message = (
                     "目的に届かなかったタスクはdoneにしない。unnecessaryにすること。"
-                    "答えにまだ要り、まだ取り直していないなら、足りない情報を、それを取れるtool / agent"
-                    "（無ければ代わりの手段）で取りに行く新しいidのタスクとして立てる。"
+                    "答えにまだ要り、まだ取り直していないなら、問い方か相手を変えて取りに行くタスクを立てる。"
                     "取り直しても届かなかった時と、取り直さない時は、足りない情報と試した手段をdecisionsへ書く。"
                 )
             elif outcome == "not_reached" and not has_follow_up:
                 message = (
-                    "目的に届かなかった時は、答えるのに何が足りないのか、それをどのtool / agentで"
-                    "取れるか（無ければ代わりの手段）を考え、答えにまだ要り、まだ取り直していないなら"
-                    "新しいidのタスクを立てること。取り直しても届かなかった時と、取り直さない時は、"
-                    "足りない情報と試した手段をdecisionsへ書く。"
+                    "目的に届かなかった時は、次の手を同じ更新に含めること。答えにまだ要り、まだ取り直して"
+                    "いないなら、問い方か相手を変えて取りに行くタスクを立てる。取り直しても届かなかった時と、"
+                    "取り直さない時は、足りない情報と試した手段をdecisionsへ書く。"
                 )
             else:
                 continue
@@ -1581,8 +1582,6 @@ class Agent:
         # 差分の適用は試行ごとに繰り返されるので、実行したタスクは試行に入る前に
         # 控える（1回目の適用の後に控えると、書き換えた後のtasksを見てしまう）。
         executed_ids = self._executed_task_ids(executed) if executed else set()
-        # 届かなかった時の「新しいタスク」を見分けるため、更新前にあったidを控える。
-        task_ids_before = {t.id for t in self.private_memory.tasks}
         # 今回の実行の結果を待っていたタスクを見分けるため、更新前の結果待ちを控える。
         waiting_before = {
             t.id for t in self.private_memory.tasks if t.status is TaskStatus.CONDITIONAL
@@ -1626,7 +1625,7 @@ class Agent:
                 if executed_ids:
                     errors.extend(self._stale_task_errors(executed_ids))
                     errors.extend(
-                        self._outcome_errors(executed_ids, seen_rows, task_ids_before)
+                        self._outcome_errors(executed_ids, seen_rows)
                     )
                 errors.extend(self._conditional_errors(seen_rows, waiting_before))
 
@@ -2283,7 +2282,9 @@ class Agent:
         )
         return [b for b in (universal, per_agent, per_phase) if b]
 
-    def _build_prompt(self, *, tool_results: str = "", extra: str = "") -> str:
+    def _build_prompt(
+        self, *, tool_results: str = "", extra: str = "", phase: Phase | None = None
+    ) -> str:
         """
         毎ステップ変化する部分。llm.generate(prompt=...)へ渡す。
 
@@ -2294,6 +2295,7 @@ class Agent:
         tool_results: 今回の実行結果を評価対象として渡す。
         extra: phaseごとの追加指示（出力例、立て直しの注意文など）。
             連結をここで行うのは、現在時刻を必ず最後に置くため。
+        phase: 残りの実行回数を見せるかどうかの判断に使う。
         """
         run = self.current_input or RunInput(message="")
 
@@ -2307,6 +2309,7 @@ class Agent:
             section("あなたの実行履歴", self.render_tool_history()),
             section("今回の実行結果", tool_results),
             extra,
+            section("残りの実行回数", self._render_remaining_steps(phase)),
             # 秒まで出すのは、開館時間や締め切りのように時刻で可否が変わる判断を
             # させるため。生成ごとに必ず変わる唯一の値なので、いちばん最後に置く。
             # 前に置くと、後ろに続くものがキャッシュの一致範囲から外れる
@@ -2316,6 +2319,28 @@ class Agent:
             section(
                 "現在時刻", datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
             ),
+        )
+
+    def _render_remaining_steps(self, phase: Phase | None) -> str:
+        """
+        tasksを決めるphase（初期構築と記憶の更新）に、あと何回実行できるかを示す。
+
+        上限を知らないまま調べ続けると、答えをまとめる前にmax_stepsで打ち切られる。
+        残りが分かれば、答えを大きく変える不足から先に取りに行ける。
+        初期構築はループの前なので、全ステップが残っている。
+        """
+        if phase is Phase.INITIAL_MEMORY:
+            remaining = self.max_steps
+        elif phase is Phase.MEMORY_UPDATE:
+            remaining = self.max_steps - self._step_no
+        else:
+            return ""
+        if remaining <= 0:
+            return "これ以上は実行できない。次は、ここまでの情報で回答する。"
+        return (
+            f"あと{remaining}回まで、tool / agentを実行できる。これは許される上限であり、"
+            "使い切る目安ではない。実行するのは、依頼者へ最終的に返す答えに直結するものだけにする。"
+            "上限に達すると、そこまでの情報で回答する。"
         )
 
     def _direct_request_stance(self) -> str:
@@ -2331,6 +2356,11 @@ class Agent:
         「省略を履歴で補え」とだけ言うと、補う材料に過去の回答が使われる。
         過去の回答は、利用者が受け入れたかどうかで扱いを分ける。一律に
         「利用者が使った語だけ」と縛ると、「じゃあそれで」のような受け入れを落とす。
+
+        過去の回答に触れずに聞き直された時の扱いは、ここではなくconversationの説明
+        （memory.py）に置く。委譲先も会話を読み、前の回答で挙げた候補を「名指しされた
+        製品」として調べるため（GPT-6 Solで実測。ここに置いた版では委譲先に見えず、
+        scoutが固定した）。
         """
         if not self.current_input or not self.current_input.from_user:
             return ""
