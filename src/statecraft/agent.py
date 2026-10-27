@@ -38,7 +38,6 @@ from .memory import (
     DIFF_EXAMPLE,
     DISABLE_FIELD,
     ROUTING_GUIDE,
-    TASK_OUTCOMES,
     DiffError,
     MemoryEntry,
     PrivateMemory,
@@ -58,10 +57,6 @@ from .prompts import (
 )
 from .tools import Tool, ToolResult
 from .utils import format_message, with_timing
-
-# outcomeの良さの順。差し戻しの間に判定を上げさせないために比べる（_outcome_errors）。
-_OUTCOME_RANK = {"not_reached": 0, "located": 1, "reached": 2}
-assert set(_OUTCOME_RANK) == set(TASK_OUTCOMES)
 
 
 def _extract_rows(text: str) -> list | None:
@@ -1382,160 +1377,6 @@ class Agent:
             if task.id in executed_ids and task.status in pending
         ]
 
-    def _outcome_errors(self, executed_ids: set[str], rows: list) -> list[DiffError]:
-        """
-        実行したタスクを片付ける行に、結果が目的に届いたか（outcome）を書かせる。
-
-        「目的に届いた時だけdone」と文章で求めても、「調査完了」とだけ書いて
-        doneにされ、問いに答えていない結果のまま回答へ進んだ。届いたかを値で
-        書かせ、届かなかった（not_reached）か、ありかだけ分かった（located）なら、
-        次の手（取りに行くタスク、または取りに行かない理由のdecisions）を
-        同じ更新に含めさせる。取りに行くかどうかはモデルに任せ、どちらも無いまま
-        片付ける食い違いだけを止める。
-
-        rowsは、この更新の試行をまたいで積んだ行。差し戻しで直した行と、
-        1回目に通った行（新しいタスクやdecisions）の両方を見るため。
-        nextのまま残ったタスクは_stale_task_errorsが扱うので、ここでは見ない。
-
-        前の試行で付けたoutcomeより良い判定へは、書き換えさせない。差し戻しの
-        間に新しい結果は届いていないので、判定が上がる材料が無い。not_reachedと
-        正しく判定したのに、次の手を立てる代わりにreachedへ書き換えて差し戻しを
-        抜け、答えの無いまま回答へ進む失敗が実際に起きた。
-        """
-        latest: dict[str, dict] = {}
-        # この更新の試行の中で、タスクごとに付けた最も低いoutcome
-        lowest: dict[str, str] = {}
-        for row in rows:
-            if row.get("field") == "tasks":
-                row_id = str(row.get("id", "")).strip()
-                if row_id in executed_ids:
-                    latest[row_id] = row
-                    outcome = row.get("outcome")
-                    if outcome in _OUTCOME_RANK and (
-                        row_id not in lowest
-                        or _OUTCOME_RANK[outcome] < _OUTCOME_RANK[lowest[row_id]]
-                    ):
-                        lowest[row_id] = outcome
-
-        pending = (TaskStatus.NEXT, TaskStatus.NEXT_PARALLEL, TaskStatus.CONDITIONAL)
-        # 次の手としてのタスクは、新しいidに限らない。初期構築で立ててあった
-        # 「見つかったら本文を開く」タスクを次に回すのも、正しい次の手である
-        # （新しいidに限っていた頃、それを3回差し戻して更新を使い切った）。
-        has_next_task = any(
-            row.get("field") == "tasks"
-            and str(row.get("id", "")).strip() not in executed_ids
-            and row.get("status") in {s.value for s in pending}
-            for row in rows
-        )
-        # 取りに行かない理由（decisions）も次の手として認める。止める時は、骨組みを
-        # どの事実で埋めたかをdecisionsへ書かせているため、理由の無い打ち切りにならない。
-        has_follow_up = has_next_task or any(row.get("field") == "decisions" for row in rows)
-
-        errors = []
-        for task in self.private_memory.tasks:
-            if task.id not in executed_ids or task.status in pending:
-                continue
-            outcome = latest.get(task.id, {}).get("outcome")
-            entry = {"field": "tasks", "id": task.id, "status": task.status.value}
-            if outcome not in TASK_OUTCOMES:
-                message = (
-                    "今回実行したタスクを更新する行には、outcomeに、結果がこのタスクの"
-                    "目的に届いたか（reached / located / not_reached）を必ず指定すること。"
-                )
-            elif _OUTCOME_RANK[outcome] > _OUTCOME_RANK[lowest[task.id]]:
-                message = (
-                    f"このタスクは、この更新の前の試行で{lowest[task.id]}と判定している。"
-                    "差し戻しの間に新しい結果は届いていないので、判定を上げることはできない。"
-                    f"outcomeは{lowest[task.id]}のままにすること。答えにまだ要り、まだ取り直していないなら、"
-                    "取りに行くタスクを立てる（立ててあったタスクを次に回してもよい）。"
-                    "取り直しても届かなかった時と、取り直さない時は、足りない情報と試した手段をdecisionsへ書く。"
-                )
-            elif outcome == "located" and task.status is TaskStatus.DONE:
-                message = (
-                    "答えのありかが分かっただけのタスクはdoneにしない。unnecessaryにすること。"
-                    "答えにまだ要るなら、ありかから答えを取りに行くタスクを立て（立ててあったタスクを"
-                    "次に回してもよい）、取りに行かないなら、理由をdecisionsへ書く。"
-                )
-            elif outcome == "located" and not has_follow_up:
-                message = (
-                    "答えのありかが分かった時は、次の手を同じ更新に含めること。答えにまだ要るなら、"
-                    "ありかから答えを取りに行くタスクを立て（立ててあったタスクを次に回してもよい）、"
-                    "取りに行かないなら、理由をdecisionsへ書く。"
-                )
-            elif outcome == "not_reached" and task.status is TaskStatus.DONE:
-                message = (
-                    "目的に届かなかったタスクはdoneにしない。unnecessaryにすること。"
-                    "答えにまだ要り、まだ取り直していないなら、問い方か相手を変えて取りに行くタスクを立てる。"
-                    "取り直しても届かなかった時と、取り直さない時は、足りない情報と試した手段をdecisionsへ書く。"
-                )
-            elif outcome == "not_reached" and not has_follow_up:
-                message = (
-                    "目的に届かなかった時は、次の手を同じ更新に含めること。答えにまだ要り、まだ取り直して"
-                    "いないなら、問い方か相手を変えて取りに行くタスクを立てる。取り直しても届かなかった時と、"
-                    "取り直さない時は、足りない情報と試した手段をdecisionsへ書く。"
-                )
-            else:
-                continue
-            errors.append(DiffError("tasks", entry, message))
-        return errors
-
-    def _conditional_errors(self, rows: list, waiting_before: set[str]) -> list[DiffError]:
-        """
-        結果待ち（conditional）のタスクを、立てた時に決めた条件と照らして扱わせる。
-
-        立てる時は、何が分かったら実行するか（run_when）と、何が分かったら不要か
-        （skip_when）を書かせる。結果を見た後で「十分だった」と計画を取り消すのを、
-        結果を見る前に決めた条件と照らして判断させるため。検索で探し、見つけた
-        ページを読むと計画しておきながら、抜粋を見て読む方を取り消す失敗が実際に起きた。
-        条件を先に書かせるのは、本当に不要になる場合（在架と分かったので予約しない、
-        静的な資料で値が分かったので観測しない）を、道具の種類で決め打ちせずに残すため。
-
-        実行しないまま片付ける時は、どちらの条件に当たったか（resolved_by）を書かせ、
-        行き先と食い違えば差し戻す。次に実行するタスクが無いのに結果待ちを残した
-        時も差し戻す（残したままだと、決めないまま実行されずに回答へ進む）。
-
-        状態は差分を適用した後のmemoryで見る。resolved_byはmemoryに残さない値なので、
-        試行をまたいで積んだ行から読む。
-        """
-        resolved: dict[str, str] = {}
-        for row in rows:
-            if isinstance(row, dict) and row.get("field") == "tasks" and row.get("resolved_by"):
-                resolved[str(row.get("id", "")).strip()] = str(row["resolved_by"])
-
-        runnable = (TaskStatus.NEXT, TaskStatus.NEXT_PARALLEL)
-        has_next = any(t.status in runnable for t in self.private_memory.tasks)
-        errors = []
-        for task in self.private_memory.tasks:
-            entry = {"field": "tasks", "id": task.id, "status": task.status.value}
-            conditions = f"実行する条件: {task.run_when} / 不要になる条件: {task.skip_when}"
-            choice = resolved.get(task.id)
-            if task.status is TaskStatus.CONDITIONAL and not (task.run_when and task.skip_when):
-                message = (
-                    "結果待ち（conditional）のタスクには、立てる時に、何が分かったら実行するか"
-                    "（run_when）と、何が分かったら不要になるか（skip_when）を書くこと。"
-                )
-            elif task.status is TaskStatus.CONDITIONAL and not has_next and task.id in waiting_before:
-                message = (
-                    "次に実行するタスクが無いのに、このタスクが結果待ちのまま残っている。"
-                    f"このままでは実行されないまま回答へ進むので、立てた時の条件（{conditions}）と"
-                    "照らし、実行する条件に当たったならnextへ上げ、不要になる条件に当たったなら"
-                    "unnecessaryにして、どちらに当たったかをresolved_byに書くこと。"
-                )
-            elif task.id not in waiting_before:
-                continue
-            elif task.status in (TaskStatus.UNNECESSARY, TaskStatus.DONE) and choice != "skip_when":
-                message = (
-                    "結果待ちだったこのタスクを、実行しないまま片付けている。片付けてよいのは、"
-                    f"立てた時の不要になる条件に当たった時である（{conditions}）。"
-                    "当たったならresolved_byにskip_whenと書き、実行する条件に当たったならnextへ上げること。"
-                )
-            elif task.status in runnable and choice == "skip_when":
-                message = "不要になる条件（skip_when）に当たったなら、nextではなくunnecessaryにすること。"
-            else:
-                continue
-            errors.append(DiffError("tasks", entry, message))
-        return errors
-
     def _update_memory(
         self,
         *,
@@ -1582,12 +1423,6 @@ class Agent:
         # 差分の適用は試行ごとに繰り返されるので、実行したタスクは試行に入る前に
         # 控える（1回目の適用の後に控えると、書き換えた後のtasksを見てしまう）。
         executed_ids = self._executed_task_ids(executed) if executed else set()
-        # 今回の実行の結果を待っていたタスクを見分けるため、更新前の結果待ちを控える。
-        waiting_before = {
-            t.id for t in self.private_memory.tasks if t.status is TaskStatus.CONDITIONAL
-        }
-        # outcomeの検証は試行をまたいで行う（1回目に通った行も次の手として数える）。
-        seen_rows: list[dict] = []
         # 0以下だとループが一度も回らず、memoryを作らないまま「更新しました」と
         # 通知してしまう。最低1回は必ず生成する。
         for attempt in range(1, max(1, self.max_memory_retries) + 1):
@@ -1621,13 +1456,8 @@ class Agent:
                 applied_seq = diff.apply_seq
                 # 書き込みが通ったうえで、実行済みのタスクが放置されていないかを見る。
                 # apply_diffは1行ずつしか見ないので「書かれなかったこと」は拾えない。
-                seen_rows.extend(r for r in rows if isinstance(r, dict))
                 if executed_ids:
                     errors.extend(self._stale_task_errors(executed_ids))
-                    errors.extend(
-                        self._outcome_errors(executed_ids, seen_rows)
-                    )
-                errors.extend(self._conditional_errors(seen_rows, waiting_before))
 
             ignored_all.extend(ignored)
 

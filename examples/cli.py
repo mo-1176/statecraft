@@ -35,6 +35,7 @@ def dump_memory(net: Network) -> None:
         print(f"■ requests（システムが書き込む）\n    {shared.requests.text}")
 
     for name in (
+        "user_back_grounds",
         "state_briefing",
         "vars",
         "facts",

@@ -186,17 +186,11 @@ def test_配列の出力はstrictで送り元の形で受け取る(make_llm):
     returned = {
         "result": [
             {
-                "field": "facts",
-                "id": "fact-1",
+                "field": "tasks",
+                "id": "t-1",
                 "text": "内容",
-                "basis": "general",
-                "source": None,
-                "status": None,
+                "status": "next",
                 "target_names": None,
-                "run_when": None,
-                "skip_when": None,
-                "resolved_by": None,
-                "outcome": None,
             }
         ]
     }
@@ -205,7 +199,7 @@ def test_配列の出力はstrictで送り元の形で受け取る(make_llm):
     res = generate(llm, response_schema=DIFF_SCHEMA)
 
     assert json.loads(res.text) == [
-        {"field": "facts", "id": "fact-1", "text": "内容", "basis": "general"}
+        {"field": "tasks", "id": "t-1", "text": "内容", "status": "next"}
     ]
     request = responses.requests[0]
     assert request["text"]["format"]["type"] == "json_schema"

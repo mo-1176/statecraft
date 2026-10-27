@@ -20,7 +20,7 @@ def memories():
 # ---- 追記と更新 ----
 def test_新しいidは追記される(memories):
     shared, private = memories
-    result = apply_diff([{"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "本は5冊まで"}], shared, private)
+    result = apply_diff([{"field": "facts", "id": "f-1", "text": "本は5冊まで"}], shared, private)
 
     assert result.errors == []
     assert [(e.id, e.text) for e in shared.facts] == [("f-1", "本は5冊まで")]
@@ -28,8 +28,8 @@ def test_新しいidは追記される(memories):
 
 def test_同じidは差し替えになる(memories):
     shared, private = memories
-    apply_diff([{"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "古い内容"}], shared, private)
-    apply_diff([{"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "新しい内容"}], shared, private)
+    apply_diff([{"field": "facts", "id": "f-1", "text": "古い内容"}], shared, private)
+    apply_diff([{"field": "facts", "id": "f-1", "text": "新しい内容"}], shared, private)
 
     # 増えずに中身だけ入れ替わる
     assert len(shared.facts) == 1
@@ -41,14 +41,14 @@ def test_差し替えても順序は変わらない(memories):
     shared, private = memories
     apply_diff(
         [
-            {"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "1つ目"},
-            {"field": "facts", "basis": "primary", "source": "規程書", "id": "f-2", "text": "2つ目"},
-            {"field": "facts", "basis": "primary", "source": "規程書", "id": "f-3", "text": "3つ目"},
+            {"field": "facts", "id": "f-1", "text": "1つ目"},
+            {"field": "facts", "id": "f-2", "text": "2つ目"},
+            {"field": "facts", "id": "f-3", "text": "3つ目"},
         ],
         shared,
         private,
     )
-    apply_diff([{"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "1つ目（更新）"}], shared, private)
+    apply_diff([{"field": "facts", "id": "f-1", "text": "1つ目（更新）"}], shared, private)
 
     assert [e.id for e in shared.facts] == ["f-1", "f-2", "f-3"]
     assert shared.facts[0].text == "1つ目（更新）"
@@ -60,8 +60,8 @@ def test_削除する手段は無い(memories):
     消す指示に見える書き方をしても、消えずに上書きになるだけで済むこと。
     """
     shared, private = memories
-    apply_diff([{"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "残るべき事実"}], shared, private)
-    apply_diff([{"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": ""}], shared, private)
+    apply_diff([{"field": "facts", "id": "f-1", "text": "残るべき事実"}], shared, private)
+    apply_diff([{"field": "facts", "id": "f-1", "text": ""}], shared, private)
 
     # textが空になるだけで、項目そのものは残る
     assert len(shared.facts) == 1
@@ -114,9 +114,9 @@ def test_失敗した行以外は適用される(memories):
     shared, private = memories
     result = apply_diff(
         [
-            {"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "通る行"},
+            {"field": "facts", "id": "f-1", "text": "通る行"},
             {"field": "nonexistent", "id": "x", "text": "落ちる行"},
-            {"field": "facts", "basis": "primary", "source": "規程書", "id": "f-2", "text": "これも通る行"},
+            {"field": "facts", "id": "f-2", "text": "これも通る行"},
         ],
         shared,
         private,
@@ -129,7 +129,7 @@ def test_失敗した行以外は適用される(memories):
 def test_行がオブジェクトでなくてもそこだけ失敗する(memories):
     shared, private = memories
     result = apply_diff(
-        ["ただの文字列", {"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "通る行"}], shared, private
+        ["ただの文字列", {"field": "facts", "id": "f-1", "text": "通る行"}], shared, private
     )
 
     assert len(result.errors) == 1
@@ -145,7 +145,7 @@ def test_fieldが文字列でなくても例外にならない(memories):
     result = apply_diff(
         [
             {"field": ["facts"], "id": "f-1", "text": "壊れた行"},
-            {"field": "facts", "basis": "primary", "source": "規程書", "id": "f-2", "text": "通る行"},
+            {"field": "facts", "id": "f-2", "text": "通る行"},
         ],
         shared,
         private,
@@ -168,8 +168,8 @@ def test_ルートが配列でなければ全体を1件の失敗にする(memori
 def test_空のidは弾かれる(memories):
     """空idを通すと、_upsertが同一idとみなして無関係な項目を上書きする。"""
     shared, private = memories
-    apply_diff([{"field": "facts", "basis": "primary", "source": "規程書", "id": "", "text": "1件目"}], shared, private)
-    result = apply_diff([{"field": "facts", "basis": "primary", "source": "規程書", "id": "  ", "text": "2件目"}], shared, private)
+    apply_diff([{"field": "facts", "id": "", "text": "1件目"}], shared, private)
+    result = apply_diff([{"field": "facts", "id": "  ", "text": "2件目"}], shared, private)
 
     assert len(result.errors) == 1
     assert "idが空" in result.errors[0].message
@@ -178,7 +178,7 @@ def test_空のidは弾かれる(memories):
 
 def test_textが無い行は失敗する(memories):
     shared, private = memories
-    result = apply_diff([{"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1"}], shared, private)
+    result = apply_diff([{"field": "facts", "id": "f-1"}], shared, private)
 
     assert len(result.errors) == 1
     assert shared.facts == []
@@ -348,8 +348,8 @@ def test_未処理のdisable行はignoredへ載る(memories):
 # ---- apply_seq ----
 def test_apply_seqは適用ごとに増える(memories):
     shared, private = memories
-    first = apply_diff([{"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "a"}], shared, private)
-    second = apply_diff([{"field": "facts", "basis": "primary", "source": "規程書", "id": "f-2", "text": "b"}], shared, private)
+    first = apply_diff([{"field": "facts", "id": "f-1", "text": "a"}], shared, private)
+    second = apply_diff([{"field": "facts", "id": "f-2", "text": "b"}], shared, private)
 
     assert second.apply_seq > first.apply_seq
 
@@ -432,67 +432,24 @@ def test_依頼者への問いは調べる問いと別の置き場に入る(memo
     assert "■ questions_to_ask" in shared.reading_guide()
 
 
-# ---- factsの根拠の種類と出典 ----
-def test_根拠の種類が無いfactsは差し戻される(memories):
-    """出典の無い価格や記事の記載が、確認した事実として回答まで運ばれるのを防ぐ。"""
-    shared, private = memories
-    result = apply_diff([{"field": "facts", "id": "f-1", "text": "定価は249ドル"}], shared, private)
-
-    assert shared.facts == []
-    assert "basis" in result.errors[0].message
-
-
-def test_出典が無いfactsは一般知識以外なら差し戻される(memories):
-    shared, private = memories
-    result = apply_diff(
-        [
-            {"field": "facts", "id": "f-1", "text": "定価は249ドル", "basis": "secondary"},
-            {"field": "facts", "id": "f-2", "text": "FETは反応が速い", "basis": "general"},
-        ],
-        shared,
-        private,
-    )
-
-    assert [e.id for e in shared.facts] == ["f-2"]
-    assert "source" in result.errors[0].message
-    # 一般知識は出典を省略でき、その旨が出典として残る
-    assert shared.facts[0].source == "一般知識"
-
-
-def test_根拠の種類と出典は読む側に本文と並べて見える(memories):
+def test_依頼者の読みは総括と別の置き場に入る(memories):
+    """state_briefingは毎回追記されるので、依頼者の読みは別に置き、変わった時だけ書き換える。"""
     shared, private = memories
     apply_diff(
         [
-            {
-                "field": "facts",
-                "id": "f-1",
-                "text": "セール時は約1万円",
-                "basis": "secondary",
-                "source": "https://example.com/blog",
-            }
+            {"field": "user_back_grounds", "id": "依頼の読み", "text": "上限を知らないと読める"},
+            {"field": "state_briefing", "id": "brief-1", "text": "上限は10件と分かった"},
         ],
         shared,
         private,
     )
-
-    # 本文は書いたとおりに保つ（更新のたびに付け足されて重ならないように）
-    assert shared.facts[0].text == "セール時は約1万円"
-    assert "［根拠: 二次情報 / 出典: https://example.com/blog］" in shared.render()
-
-
-def test_toolが直接書くfactsは観測としてtool名を出典にする(memories):
-    """toolは根拠の種類を知らない。返した値をそのまま記録したものなので観測とする。"""
-    shared, private = memories
-    result = apply_diff(
-        [{"field": "facts", "text": "在庫は3冊"}], shared, private, id_prefix="fetch_stock"
+    apply_diff(
+        [{"field": "user_back_grounds", "id": "依頼の読み", "text": "上限は知っていると分かった"}],
+        shared,
+        private,
     )
 
-    assert result.errors == []
-    assert (shared.facts[0].basis, shared.facts[0].source) == ("observed", "fetch_stock")
-
-
-def test_facts以外には根拠の種類を求めない(memories):
-    shared, private = memories
-    result = apply_diff([{"field": "hypotheses", "id": "h-1", "text": "x"}], shared, private)
-
-    assert result.errors == []
+    assert [e.text for e in shared.user_back_grounds] == ["上限は知っていると分かった"]
+    assert [e.id for e in shared.state_briefing] == ["brief-1"]
+    assert "■ user_back_grounds" in shared.writing_guide()
+    assert "■ user_back_grounds" in shared.reading_guide()

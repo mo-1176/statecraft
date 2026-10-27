@@ -103,13 +103,11 @@ def diff_response(rows: list) -> LLMResponse:
     return LLMResponse(text=json.dumps(rows, ensure_ascii=False))
 
 
-def task_row(task_id: str, text: str, status: str, targets=None, outcome=None) -> dict:
-    """tasks用の差分1行。outcomeは今回実行したタスクを片付ける時に付ける。"""
+def task_row(task_id: str, text: str, status: str, targets=None) -> dict:
+    """tasks用の差分1行。"""
     row = {"field": "tasks", "id": task_id, "text": text, "status": status}
     if targets is not None:
         row["target_names"] = targets
-    if outcome is not None:
-        row["outcome"] = outcome
     return row
 
 

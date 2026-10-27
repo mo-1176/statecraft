@@ -298,7 +298,7 @@ front      function_call    記憶を読んで答える
 | 主体 | 何を書くか |
 |---|---|
 | `INITIAL_MEMORY` | 目標・タスク・調べる前の理解。ツールの無効化もここだけ |
-| `MEMORY_UPDATE` | 実行結果の評価。`facts` / `actions` / `state_briefing` / `decisions` と `tasks` の更新 |
+| `MEMORY_UPDATE` | 実行結果の評価。`facts` / `actions` / `user_back_grounds` / `state_briefing` / `decisions` と `tasks` の更新 |
 | `issue_reservation`（tool直書き） | 受付番号。LLMの要約を通さず `vars` へ入る |
 
 ### ツールの結果はどこへ行くか
