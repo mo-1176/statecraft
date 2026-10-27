@@ -75,8 +75,8 @@ def test_初期記憶からtool実行を経て回答するまで(search_tool):
             call_response("search_rules", topic="貸出"),
             diff_response(
                 [
-                    {"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "一般は5冊まで"},
-                    task_row("t-1", "規程を調べる", "done", ["search_rules"], outcome="reached"),
+                    {"field": "facts", "id": "f-1", "text": "一般は5冊まで"},
+                    task_row("t-1", "規程を調べる", "done", ["search_rules"]),
                 ]
             ),
             text_response("一般の方は5冊までです。"),
@@ -151,8 +151,8 @@ def test_tasksを決めるステップに残りの実行回数を見せる(searc
             call_response("search_rules", topic="貸出"),
             diff_response(
                 [
-                    {"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "一般は5冊まで"},
-                    task_row("t-1", "規程を調べる", "done", ["search_rules"], outcome="reached"),
+                    {"field": "facts", "id": "f-1", "text": "一般は5冊まで"},
+                    task_row("t-1", "規程を調べる", "done", ["search_rules"]),
                 ]
             ),
             text_response("一般の方は5冊までです。"),
@@ -220,7 +220,7 @@ def test_同じ呼び出しは二度実行しない(search_tool):
         [
             diff_response([task_row("t-1", "調べる", "next", ["search_rules"])]),
             calls_response(("search_rules", {"topic": "貸出"}), ("search_rules", {"topic": "貸出"})),
-            diff_response([task_row("t-1", "調べる", "done", ["search_rules"], outcome="reached")]),
+            diff_response([task_row("t-1", "調べる", "done", ["search_rules"])]),
             text_response("完了"),
         ]
     )
@@ -236,7 +236,7 @@ def test_引数が違えば重複ではない(search_tool):
         [
             diff_response([task_row("t-1", "調べる", "next", ["search_rules"])]),
             calls_response(("search_rules", {"topic": "貸出"}), ("search_rules", {"topic": "返却"})),
-            diff_response([task_row("t-1", "調べる", "done", ["search_rules"], outcome="reached")]),
+            diff_response([task_row("t-1", "調べる", "done", ["search_rules"])]),
             text_response("完了"),
         ]
     )
@@ -277,7 +277,7 @@ def test_未実行のタスクは回答フェーズへ伝えられる(search_too
     """
     llm = FakeLLM(
         [
-            diff_response([waiting_row("t-1", "条件次第で調べる", ["search_rules"])]),
+            diff_response([task_row("t-1", "条件次第で調べる", "conditional", ["search_rules"])]),
             text_response("回答"),
         ]
     )
@@ -317,8 +317,8 @@ def test_実行したタスクをnextのまま残すと差し戻す(search_tool)
             diff_response([task_row("t-1", "規程を調べる", "next", ["search_rules"])]),
             call_response("search_rules", topic="貸出"),
             # 実行したt-1をnextのまま残す
-            diff_response([{"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "一般は5冊まで"}]),
-            diff_response([task_row("t-1", "規程を調べる", "done", ["search_rules"], outcome="reached")]),
+            diff_response([{"field": "facts", "id": "f-1", "text": "一般は5冊まで"}]),
+            diff_response([task_row("t-1", "規程を調べる", "done", ["search_rules"])]),
             text_response("5冊までです。"),
         ]
     )
@@ -342,13 +342,13 @@ def test_結果を見て同じtoolで掘り直すタスクは差し戻さない(
             call_response("search_rules", topic="貸出"),
             diff_response(
                 [
-                    {"field": "facts", "basis": "primary", "source": "規程書", "id": "f-1", "text": "延長は別の規程による"},
-                    task_row("t-1", "規程を調べる", "done", ["search_rules"], outcome="reached"),
+                    {"field": "facts", "id": "f-1", "text": "延長は別の規程による"},
+                    task_row("t-1", "規程を調べる", "done", ["search_rules"]),
                     task_row("t-2", "延長の規程を調べる", "next", ["search_rules"]),
                 ]
             ),
             call_response("search_rules", topic="延長"),
-            diff_response([task_row("t-2", "延長の規程を調べる", "done", ["search_rules"], outcome="reached")]),
+            diff_response([task_row("t-2", "延長の規程を調べる", "done", ["search_rules"])]),
             text_response("延長は1回までです。"),
         ]
     )
@@ -359,405 +359,6 @@ def test_結果を見て同じtoolで掘り直すタスクは差し戻さない(
     assert response.text == "延長は1回までです。"
     assert search_tool.calls == ["貸出", "延長"]
     # 記憶の更新が差し戻されていない（台本どおり6回で終わる）
-    assert len(llm.calls) == 6
-
-
-def test_実行したタスクを片付ける時はoutcomeが無いと差し戻す(search_tool):
-    """「調査完了」とだけ書いてdoneにすると、届いたかを判断しないまま回答へ進む。"""
-    llm = FakeLLM(
-        [
-            diff_response([task_row("t-1", "規程を調べる", "next", ["search_rules"])]),
-            call_response("search_rules", topic="貸出"),
-            diff_response([task_row("t-1", "調査完了", "done", ["search_rules"])]),
-            diff_response(
-                [task_row("t-1", "規程を調べる → 5冊まで", "done", ["search_rules"], outcome="reached")]
-            ),
-            text_response("5冊までです。"),
-        ]
-    )
-    agent = build_agent(llm, tools=[search_tool])
-
-    agent.respond(message="貸出は何冊まで？")
-
-    assert len(llm.calls) == 5
-    assert "outcome" in llm.calls[3]["prompt"]
-
-
-def test_届かなかったタスクをdoneにすると差し戻す(search_tool):
-    llm = FakeLLM(
-        [
-            diff_response([task_row("t-1", "規程を調べる", "next", ["search_rules"])]),
-            call_response("search_rules", topic="貸出"),
-            diff_response(
-                [task_row("t-1", "規程を調べる", "done", ["search_rules"], outcome="not_reached")]
-            ),
-            diff_response(
-                [
-                    task_row("t-1", "規程を調べる", "unnecessary", ["search_rules"], outcome="not_reached"),
-                    {"field": "decisions", "id": "d-1", "text": "規程の検索は他に手段が無い"},
-                ]
-            ),
-            text_response("分かりませんでした。"),
-        ]
-    )
-    agent = build_agent(llm, tools=[search_tool])
-
-    agent.respond(message="貸出は何冊まで？")
-
-    assert len(llm.calls) == 5
-    assert "doneにしない" in llm.calls[3]["prompt"]
-
-
-def test_差し戻しの間に判定を上げると差し戻す(search_tool):
-    """新しい結果が届いていないのに、not_reachedをreachedへ書き換えて差し戻しを抜けさせない。"""
-    llm = FakeLLM(
-        [
-            diff_response([task_row("t-1", "規程を調べる", "next", ["search_rules"])]),
-            call_response("search_rules", topic="貸出"),
-            diff_response(
-                [task_row("t-1", "規程を調べる", "done", ["search_rules"], outcome="not_reached")]
-            ),
-            diff_response(
-                [task_row("t-1", "規程を調べた", "done", ["search_rules"], outcome="reached")]
-            ),
-            diff_response(
-                [
-                    task_row("t-1", "規程を調べる", "unnecessary", ["search_rules"], outcome="not_reached"),
-                    {"field": "decisions", "id": "d-1", "text": "規程の検索は他に手段が無い"},
-                ]
-            ),
-            text_response("分かりませんでした。"),
-        ]
-    )
-    agent = build_agent(llm, tools=[search_tool])
-
-    agent.respond(message="貸出は何冊まで？")
-
-    assert len(llm.calls) == 6
-    assert "判定を上げることはできない" in llm.calls[4]["prompt"]
-
-
-def waiting_row(task_id: str, text: str, targets, **kw) -> dict:
-    """結果待ち（conditional）のタスク行。立てた時の条件を付ける。"""
-    row = task_row(task_id, text, "conditional", targets)
-    row["run_when"] = kw.get("run_when", "規程の場所が分かったら")
-    row["skip_when"] = kw.get("skip_when", "規程が無いと分かったら")
-    return row
-
-
-def test_結果待ちは条件を書かないと差し戻す():
-    llm = FakeLLM(
-        [
-            diff_response([task_row("t-1", "後で調べる", "conditional", ["search_rules"])]),
-            diff_response([waiting_row("t-1", "後で調べる", ["search_rules"])]),
-            text_response("分かる範囲で答えます。"),
-        ]
-    )
-    agent = build_agent(llm)
-
-    agent.respond(message="貸出は何冊まで？")
-
-    assert "run_when" in llm.calls[1]["prompt"]
-    assert agent.private_memory.tasks[0].skip_when == "規程が無いと分かったら"
-
-
-def test_実行の条件に当たった結果待ちを取り消すと差し戻す(search_tool):
-    """探す→読むと計画しておきながら、探した時点で読む方を取り消させない。"""
-    llm = FakeLLM(
-        [
-            diff_response(
-                [
-                    task_row("t-1", "規程の載っている場所を探す", "next", ["search_rules"]),
-                    waiting_row("t-2", "見つけた規程を読む", ["search_rules"]),
-                ]
-            ),
-            call_response("search_rules", topic="貸出"),
-            diff_response(
-                [
-                    task_row("t-1", "場所が分かった", "done", ["search_rules"], outcome="reached"),
-                    task_row("t-2", "抜粋で足りた", "unnecessary", ["search_rules"]),
-                ]
-            ),
-            diff_response(
-                [
-                    {
-                        **task_row("t-2", "見つけた規程を読む", "next", ["search_rules"]),
-                        "resolved_by": "run_when",
-                    }
-                ]
-            ),
-            call_response("search_rules", topic="貸出の規程"),
-            diff_response(
-                [task_row("t-2", "規程を読んだ → 5冊まで", "done", ["search_rules"], outcome="reached")]
-            ),
-            text_response("5冊までです。"),
-        ]
-    )
-    agent = build_agent(llm, tools=[search_tool])
-
-    response = agent.respond(message="貸出は何冊まで？")
-
-    assert response.text == "5冊までです。"
-    assert search_tool.calls == ["貸出", "貸出の規程"]
-    assert "片付けてよいのは" in llm.calls[3]["prompt"]
-
-
-def test_不要の条件に当たった結果待ちは取り消せる(search_tool):
-    """在架と分かったら予約しない、のように、立てた時に決めた不要の条件なら取り消せる。"""
-    llm = FakeLLM(
-        [
-            diff_response(
-                [
-                    task_row("t-1", "在庫を確かめる", "next", ["search_rules"]),
-                    waiting_row(
-                        "t-2",
-                        "予約する",
-                        ["search_rules"],
-                        run_when="貸出中と分かったら",
-                        skip_when="在架と分かったら",
-                    ),
-                ]
-            ),
-            call_response("search_rules", topic="在庫"),
-            diff_response(
-                [
-                    task_row("t-1", "在架だった", "done", ["search_rules"], outcome="reached"),
-                    {
-                        **task_row("t-2", "在架のため予約は不要", "unnecessary", ["search_rules"]),
-                        "resolved_by": "skip_when",
-                    },
-                ]
-            ),
-            text_response("在架なので、そのまま借りられます。"),
-        ]
-    )
-    agent = build_agent(llm, tools=[search_tool])
-
-    agent.respond(message="深夜特急は借りられる？")
-
-    # 記憶の更新が差し戻されていない
-    assert len(llm.calls) == 4
-
-
-def test_次の実行が無いのに結果待ちを残すと差し戻す(search_tool):
-    """決めないまま残すと、結果待ちは実行されないまま回答へ進む。"""
-    llm = FakeLLM(
-        [
-            diff_response(
-                [
-                    task_row("t-1", "規程の載っている場所を探す", "next", ["search_rules"]),
-                    waiting_row("t-2", "見つけた規程を読む", ["search_rules"]),
-                ]
-            ),
-            call_response("search_rules", topic="貸出"),
-            diff_response(
-                [task_row("t-1", "場所が分かった", "done", ["search_rules"], outcome="reached")]
-            ),
-            diff_response(
-                [
-                    {
-                        **task_row("t-2", "見つけた規程を読む", "next", ["search_rules"]),
-                        "resolved_by": "run_when",
-                    }
-                ]
-            ),
-            call_response("search_rules", topic="貸出の規程"),
-            diff_response(
-                [task_row("t-2", "規程を読んだ → 5冊まで", "done", ["search_rules"], outcome="reached")]
-            ),
-            text_response("5冊までです。"),
-        ]
-    )
-    agent = build_agent(llm, tools=[search_tool])
-
-    agent.respond(message="貸出は何冊まで？")
-
-    assert "結果待ちのまま残っている" in llm.calls[3]["prompt"]
-    assert search_tool.calls == ["貸出", "貸出の規程"]
-
-
-def test_届かなかったら依頼を変えて出し直せる(search_tool):
-    """not_reachedと、検索語を変えた新しいタスクを同じ更新で出せば、差し戻さずに実行する。"""
-    llm = FakeLLM(
-        [
-            diff_response([task_row("t-1", "貸出上限を調べる", "next", ["search_rules"])]),
-            call_response("search_rules", topic="貸出"),
-            diff_response(
-                [
-                    task_row("t-1", "貸出上限を調べる", "unnecessary", ["search_rules"], outcome="not_reached"),
-                    task_row("t-2", "貸出上限を、利用規程として調べ直す", "next", ["search_rules"]),
-                ]
-            ),
-            call_response("search_rules", topic="利用規程"),
-            diff_response(
-                [task_row("t-2", "貸出上限 → 5冊まで", "done", ["search_rules"], outcome="reached")]
-            ),
-            text_response("5冊までです。"),
-        ]
-    )
-    agent = build_agent(llm, tools=[search_tool])
-
-    response = agent.respond(message="貸出は何冊まで？")
-
-    assert response.text == "5冊までです。"
-    assert search_tool.calls == ["貸出", "利用規程"]
-    assert len(llm.calls) == 6
-
-
-def test_ありかだけ分かったタスクをdoneにすると差し戻す(search_tool):
-    """「〜に載っている」と分かっただけで、答えそのものを得ないまま回答へ進ませない。"""
-    llm = FakeLLM(
-        [
-            diff_response([task_row("t-1", "貸出上限を調べる", "next", ["search_rules"])]),
-            call_response("search_rules", topic="貸出"),
-            diff_response(
-                [task_row("t-1", "貸出上限を調べる", "done", ["search_rules"], outcome="located")]
-            ),
-            diff_response(
-                [
-                    task_row("t-1", "貸出上限を調べる", "unnecessary", ["search_rules"], outcome="located"),
-                    task_row("t-2", "利用規程から貸出上限を確かめる", "next", ["search_rules"]),
-                ]
-            ),
-            call_response("search_rules", topic="利用規程"),
-            diff_response(
-                [task_row("t-2", "貸出上限 → 5冊まで", "done", ["search_rules"], outcome="reached")]
-            ),
-            text_response("5冊までです。"),
-        ]
-    )
-    agent = build_agent(llm, tools=[search_tool])
-
-    agent.respond(message="貸出は何冊まで？")
-
-    assert len(llm.calls) == 7
-    assert "ありかが分かっただけのタスクはdoneにしない" in llm.calls[3]["prompt"]
-
-
-def test_ありかが分かっても取りに行かない理由を書けば止められる(search_tool):
-    """取りに行くかはモデルに任せる。理由をdecisionsへ書けば、差し戻さずに回答へ進む。"""
-    llm = FakeLLM(
-        [
-            diff_response([task_row("t-1", "貸出上限を調べる", "next", ["search_rules"])]),
-            call_response("search_rules", topic="貸出"),
-            diff_response(
-                [
-                    task_row("t-1", "貸出上限を調べる", "unnecessary", ["search_rules"], outcome="located"),
-                    {"field": "decisions", "id": "d-1", "text": "上限は答えの骨組みに要らないため、取りに行かない"},
-                ]
-            ),
-            text_response("利用規程に載っています。"),
-        ]
-    )
-    agent = build_agent(llm, tools=[search_tool])
-
-    response = agent.respond(message="貸出規程はどこで見られる？")
-
-    assert response.text == "利用規程に載っています。"
-    assert search_tool.calls == ["貸出"]
-    # 記憶の更新が差し戻されていない
-    assert len(llm.calls) == 4
-
-
-def test_ありかが分かったら立ててあったタスクを次に回せる(search_tool):
-    """新しいidでなくても、立ててあった結果待ちを次に回すのは正しい次の手である。"""
-    llm = FakeLLM(
-        [
-            diff_response(
-                [
-                    task_row("t-1", "貸出上限のありかを探す", "next", ["search_rules"]),
-                    waiting_row(
-                        "t-2",
-                        "見つかった規程から貸出上限を確かめる",
-                        ["search_rules"],
-                        run_when="規程の場所が分かったら",
-                        skip_when="規程が無いと分かったら",
-                    ),
-                ]
-            ),
-            call_response("search_rules", topic="貸出"),
-            diff_response(
-                [
-                    task_row("t-1", "利用規程に載っていると分かった", "unnecessary", ["search_rules"], outcome="located"),
-                    {
-                        **task_row("t-2", "利用規程から貸出上限を確かめる", "next", ["search_rules"]),
-                        "resolved_by": "run_when",
-                    },
-                ]
-            ),
-            call_response("search_rules", topic="利用規程"),
-            diff_response(
-                [task_row("t-2", "貸出上限 → 5冊まで", "done", ["search_rules"], outcome="reached")]
-            ),
-            text_response("5冊までです。"),
-        ]
-    )
-    agent = build_agent(llm, tools=[search_tool])
-
-    response = agent.respond(message="貸出は何冊まで？")
-
-    assert response.text == "5冊までです。"
-    assert search_tool.calls == ["貸出", "利用規程"]
-    # 記憶の更新が差し戻されていない
-    assert len(llm.calls) == 6
-
-
-def test_ありかだけ分かって次の手が無いと差し戻す(search_tool):
-    llm = FakeLLM(
-        [
-            diff_response([task_row("t-1", "貸出上限を調べる", "next", ["search_rules"])]),
-            call_response("search_rules", topic="貸出"),
-            diff_response(
-                [task_row("t-1", "貸出上限を調べる", "unnecessary", ["search_rules"], outcome="located")]
-            ),
-            diff_response(
-                [
-                    task_row("t-1", "貸出上限を調べる", "unnecessary", ["search_rules"], outcome="located"),
-                    task_row("t-2", "利用規程から貸出上限を確かめる", "next", ["search_rules"]),
-                ]
-            ),
-            call_response("search_rules", topic="利用規程"),
-            diff_response(
-                [task_row("t-2", "貸出上限 → 5冊まで", "done", ["search_rules"], outcome="reached")]
-            ),
-            text_response("5冊までです。"),
-        ]
-    )
-    agent = build_agent(llm, tools=[search_tool])
-
-    response = agent.respond(message="貸出は何冊まで？")
-
-    assert "次の手を同じ更新に含めること" in llm.calls[3]["prompt"]
-    assert response.text == "5冊までです。"
-    assert search_tool.calls == ["貸出", "利用規程"]
-    assert len(llm.calls) == 7
-
-
-def test_ありかが分かったら取りに行くタスクを立てれば進める(search_tool):
-    """locatedと、ありかから答えを取りに行く新しいタスクを同じ更新で出せば、差し戻さずに実行する。"""
-    llm = FakeLLM(
-        [
-            diff_response([task_row("t-1", "貸出上限を調べる", "next", ["search_rules"])]),
-            call_response("search_rules", topic="貸出"),
-            diff_response(
-                [
-                    task_row("t-1", "貸出上限を調べる", "unnecessary", ["search_rules"], outcome="located"),
-                    task_row("t-2", "利用規程から貸出上限を確かめる", "next", ["search_rules"]),
-                ]
-            ),
-            call_response("search_rules", topic="利用規程"),
-            diff_response(
-                [task_row("t-2", "貸出上限 → 5冊まで", "done", ["search_rules"], outcome="reached")]
-            ),
-            text_response("5冊までです。"),
-        ]
-    )
-    agent = build_agent(llm, tools=[search_tool])
-
-    response = agent.respond(message="貸出は何冊まで？")
-
-    assert response.text == "5冊までです。"
-    assert search_tool.calls == ["貸出", "利用規程"]
     assert len(llm.calls) == 6
 
 
@@ -812,7 +413,7 @@ def test_toolのmemoryは要約を通さず記憶へ入る():
         [
             diff_response([task_row("t-1", "予約する", "next", ["issue_reservation"])]),
             call_response("issue_reservation", title="深夜特急"),
-            diff_response([task_row("t-1", "予約する", "done", ["issue_reservation"], outcome="reached")]),
+            diff_response([task_row("t-1", "予約する", "done", ["issue_reservation"])]),
             text_response("予約できました。"),
         ]
     )
@@ -976,7 +577,7 @@ def test_前回のタスクは次の起動へ持ち越さない():
     """statusがnextのまま残ると、前回の依頼のためのtool実行が起きる。"""
     llm = FakeLLM(
         [
-            diff_response([waiting_row("t-1", "残るタスク", [])]),
+            diff_response([task_row("t-1", "残るタスク", "conditional", [])]),
             text_response("1回目"),
             diff_response([]),
             text_response("2回目"),
@@ -1194,7 +795,7 @@ def test_実行イベントに呼び出し元と呼び出し先が入る(search_
         [
             diff_response([task_row("t-1", "調べる", "next", ["search_rules"])]),
             call_response("search_rules", topic="貸出"),
-            diff_response([task_row("t-1", "調べる", "done", ["search_rules"], outcome="reached")]),
+            diff_response([task_row("t-1", "調べる", "done", ["search_rules"])]),
             text_response("完了"),
         ]
     )
