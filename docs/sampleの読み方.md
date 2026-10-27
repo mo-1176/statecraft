@@ -92,8 +92,8 @@ examples/
   cli.py / chat.py / api.py       入口
   library/
     config/
-      agents.yaml                 front と librarian
-      tools.yaml                  5つのツール
+      agents.yaml                 front と librarian。末尾に全項目の見本（sample_agent）
+      tools.yaml                  5つのツール。末尾に全項目の見本（sample_tool）
       knowledges.yaml             用語辞書の登録
     prompts/
       agents/front/system_instruction.md
@@ -105,7 +105,7 @@ examples/
     guard/                        審査役（compliance）の設定。図書館とは別のネットワーク
       config/agents.yaml
       prompts/agents/compliance/system_instruction.md
-    tools.py                      ツールの実装（ダミーのデータ）
+    tools.py                      ツールの実装（ダミーのデータ）と、見本の実装（make_sample_tool）
     network.py                    組み立て（type とツールの実装の対応）
     observers.py                  interceptor に登録するもの（審査、表示、計測、再試行）
     carry_over.py                 次のターンへ引き継ぐ記憶
@@ -744,6 +744,8 @@ knowledgeは常にプロンプトの中に流し込まれるので、細かい�
 | `tools.py` | ツールの実装 |
 | `network.py` の `TOOL_FACTORIES` | `type` → ツールの関数を返すもの。settings はキーワード引数で渡る |
 | `observers.py` | 実行前の判定と観測。要らなければ `Interceptor()` だけでも動く |
+
+エージェントとツールを足すときは、`config/agents.yaml` の `sample_agent` と `config/tools.yaml` の `sample_tool` をコピーします。書ける項目が全部埋めてあり、見本自体も毎回読み込まれて検証されているので、項目名の綴りを間違えません。
 
 `session.py` / `carry_over.py` と3つの入口は、受付のエージェントの名前（`front`）と、引き継ぐ項目を合わせれば、そのまま使えます。審査役を使わないなら `guard/` と `Guard` は消して構いません。
 

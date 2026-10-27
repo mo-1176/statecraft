@@ -18,8 +18,8 @@ GUARD_ROOT = ROOT / "guard"
 
 
 class LibraryBuilder(NetworkBuilder):
-    # type → ツールの関数を返すもの。settings を受け取る場合は、キーワード引数で渡る
-    # （このサンプルのツールは settings を持たないので、関数をそのまま返す）。
+    # type → ツールの関数を返すもの。settings を受け取る場合は、キーワード引数で渡る。
+    # 図書館のツールは settings を持たないので、関数をそのまま返す lambda で足りる。
     # LLM（provider: gemini）は NetworkBuilder に最初から登録されている。
     TOOL_FACTORIES: ClassVar[dict[str, Callable[..., Callable]]] = {
         "search_rules": lambda: tools.search_rules,
@@ -27,6 +27,9 @@ class LibraryBuilder(NetworkBuilder):
         "check_stock": lambda: tools.check_stock,
         "issue_reservation": lambda: tools.issue_reservation,
         "send_overdue_notice": lambda: tools.send_overdue_notice,
+        # 全項目の見本（tools.yaml の sample_tool）。settings を受け取って関数を返すものは、
+        # lambda で包まずにそのまま登録する
+        "sample_tool": tools.make_sample_tool,
     }
 
 
