@@ -5,50 +5,67 @@ StateCraft は、複数のAIエージェントをひとつのチームとして�
 
 LLMの能力を引き出し、軽量モデルでも自律的に多くのタスクをこなせるようになります。
 
+**新しく作るなら、サンプル（`examples/library/`）を写して始めるのが一番早いです。** エージェントとツールの定義は YAML と Markdown に分けてあり、実行前の判定、進捗とコストの表示、記憶の引き継ぎ、CLI・対話・Web API の入口まで揃っています。中身を自分の題材へ入れ替えれば、そのまま動きます（→ [はじめ方](#はじめ方)）。
+
 ---
 
 ## 目次
 
-- [インストール](#インストール)
-- [サンプルを動かす](#サンプルを動かす)
-- [クイックスタート](#クイックスタート)
+- [はじめ方](#はじめ方) — サンプルを写して、自分のアプリにする
+  - [インストール](#インストール)
+  - [サンプルを動かす](#サンプルを動かす)
+  - [自分のアプリにする](#自分のアプリにする)
+  - [最小の形](#最小の形)
+- [設定ファイルから組み立てる](#設定ファイルから組み立てる) — YAML と Markdown でネットワークを定義する
 - [Tool](#tool) — 関数をエージェントが呼べるものにする
 - [Agent](#agent) — 記憶を持って多段の手順を進める
   - [初期記憶だけに渡すナレッジ](#初期記憶だけに渡すナレッジ)
   - [記憶](#記憶)
   - [モデルの割り当て](#モデルの割り当て)
   - [プロンプトキャッシュ](#プロンプトキャッシュ)
-- [Network](#network) — 1リクエスト分の配線
+- [Network](#network) — 共有記憶と配線の単位
   - [Agentを使い回す](#agentを使い回す--reset)
   - [よくある構成](#よくある構成)
-- [設定ファイルから組み立てる](#設定ファイルから組み立てる) — YAML と Markdown でネットワークを定義する
 - [Interceptor](#interceptor) — 観測と、実行前の判定
+- [設定ファイルを使わずに組む](#設定ファイルを使わずに組む) — Python のコードだけで組み立てる
 - [テスト](#テスト)
 - [実装状況](#実装状況)
 - [ドキュメント](#ドキュメント)
 
 ---
 
-## インストール
+## はじめ方
+
+サンプルを動かして何が起きるかを見てから、写して中身を入れ替えます。
+
+1. [インストール](#インストール) — リポジトリをクローンして、仮想環境に入れる
+2. [サンプルを動かす](#サンプルを動かす) — 図書館の問い合わせ対応を、CLI・対話・Web API で動かす
+3. [自分のアプリにする](#自分のアプリにする) — `examples/library/` を写して、設定と実装を入れ替える
+
+サンプルには、実際のアプリで要るものが一通り入っています。
+
+| 入っているもの | 場所（`examples/` の下） |
+|---|---|
+| エージェント・ツール・ナレッジの定義（YAML） | `library/config/` |
+| 書ける項目を全部埋めた見本（エージェントとツールを足すときのコピー元） | `library/config/agents.yaml` の `sample_agent`、`library/config/tools.yaml` の `sample_tool` |
+| 長い文章（人格定義、結果の読み方、用語辞書） | `library/prompts/`、`library/knowledge/` |
+| ツールの実装と、設定との対応づけ | `library/tools.py`、`library/network.py` |
+| 実行前の判定（審査役のエージェントを含む） | `library/observers.py` の `Guard`、`library/guard/` |
+| 進捗・記憶の変化・トークンと概算コストの表示、生成失敗時の再試行 | `library/observers.py` |
+| ターンの区切りと、次のターンへの記憶の引き継ぎ | `library/session.py`、`library/carry_over.py` |
+| APIキーの読み込み（環境変数 → `.env` → 入力欄） | `library/api_key.py` |
+| 入口（1問で終わる CLI / 対話 / Web API） | `cli.py`、`chat.py`、`api.py` |
+
+設定ファイルとコードには、なぜそう書いたかのコメントが付いています。何がどう動いているかは [docs/sampleの読み方.md](docs/sampleの読み方.md) にあります。
+
+### インストール
 
 Python 3.11 以上が必要です。仮想環境（`.venv`）を作ってから入れてください。システムのPythonへ直接入れると、他のプロジェクトと衝突します。
 
-### 使うだけなら
-
-クローンせずに、GitHubから直接入れられます。
+サンプルを動かすので、リポジトリをクローンして編集可能インストールにします。
 
 ```bash
-pip install "statecraft[gemini] @ git+https://github.com/masakiohta-1176/statecraft.git"
-```
-
-`[gemini]` の部分は使うプロバイダに合わせて `[openai]` `[claude]` `[all]` へ変えてください。
-
-### 手元で書き換えながら使うなら
-
-リポジトリをクローンして、編集可能インストールにします。サンプルを動かす場合もこちらです。
-
-```bash
-git clone https://github.com/masakiohta-1176/statecraft.git
+git clone https://github.com/mo-1176/statecraft.git
 cd statecraft
 ```
 
@@ -70,10 +87,10 @@ pip install -e ".[gemini]"
 
 `-e` は編集可能インストールです。手元で書き換えながら動かせます。`src/` レイアウトなので、インストールしないと `import statecraft` は通りません。
 
-使うプロバイダのSDKは別に入れます。全部は要りません。
+`[gemini]` の部分は、使うプロバイダのSDKです。全部は要りません。
 
 ```bash
-pip install -e ".[gemini]"    # Gemini
+pip install -e ".[gemini]"    # Gemini（サンプルはこれで動く）
 pip install -e ".[openai]"    # OpenAI
 pip install -e ".[claude]"    # Claude
 pip install -e ".[gemini,claude]"   # 複数でもよい
@@ -81,13 +98,13 @@ pip install -e ".[gemini,claude]"   # 複数でもよい
 
 入れていないプロバイダがあっても他は動きます。足りない場合は、何を入れればよいかを伝えて落ちます。
 
----
+### サンプルを動かす
 
-## サンプルを動かす
+図書館の問い合わせ対応を題材に、3体のエージェントと5つのツールが動きます。受付（`front`）が依頼を整理して司書（`librarian`）へ渡し、司書が規程と蔵書を調べ、取り消せない操作の手前で審査役（`compliance`）が可否を返します。
 
-図書館の問い合わせ対応を題材に、3体のエージェントと5つのツールが動きます。エージェントとツールの定義は設定のディレクトリ（`examples/library/` の YAML と Markdown）にあり、そのまま写せば自分のアプリの雛形になります。読み方は [docs/sampleの読み方.md](docs/sampleの読み方.md) にあります。
+設定には、書ける項目の見本として `sample_agent` と `sample_tool` も入っています。どのエージェントからも呼ばれないので動きませんが、Network には入るため、`cli.py` のトークンの内訳には `sample_agent: (0, 0)` と出ます。
 
-### 1. APIキーを置く
+#### 1. APIキーを置く
 
 リポジトリ直下の `.env.example` をコピーして `.env` を作り、キーを書き込みます。`.env` は `.gitignore` に入っているため、git には上がりません。
 
@@ -115,7 +132,7 @@ GEMINI_API_KEY=ここに貼る
 
 シェルに `GEMINI_API_KEY="..."` と打つ方法は勧めません。多くのシェルがコマンド行を履歴ファイルへ平文で残すためです。
 
-### 2. 実行する
+#### 2. 実行する
 
 サンプルは `examples/` の中から実行します。入口は3つです。
 
@@ -154,116 +171,423 @@ python api.py
 
 **API利用料がかかります。** 1往復あたりの目安は数円未満ですが、実行ごとに画面へ内訳（phaseごとのトークンと概算額）が出るので、そこで確認してください。
 
----
+試せる質問の一覧は [sampleの読み方.md](docs/sampleの読み方.md#試せる質問) にあります。
 
-## クイックスタート
+### 自分のアプリにする
+
+自分のリポジトリを作り、statecraft を依存として入れてから、サンプルを写します。
+
+```bash
+pip install "statecraft[gemini] @ git+https://github.com/mo-1176/statecraft.git"
+```
+
+`pyproject.toml` で依存を管理しているなら、`dependencies` に同じものを書きます。
+
+```toml
+[project]
+dependencies = [
+    "statecraft[gemini] @ git+https://github.com/mo-1176/statecraft.git",
+]
+```
+
+#### 1. 写す
+
+`examples/` の下を、そのまま自分のリポジトリへ写します。
+
+```
+my-app/
+  library/          ← examples/library/（設定・プロンプト・実装の一式）
+  cli.py            ← examples/cli.py（入口は使うものだけでよい）
+  chat.py           ← examples/chat.py
+  api.py            ← examples/api.py（fastapi と uvicorn が要る）
+  .env.example      ← リポジトリ直下の .env.example
+```
+
+`library` という名前は変えて構いません。変えたら、入口の `from library.… import …` も合わせて直します。
+
+`.env` は自分のリポジトリでも `.gitignore` に入れてください。キーを git へ上げないためです。
+
+#### 2. 入れ替える
+
+上から順に入れ替えると、途中でも動かして確かめられます。
+
+| 順 | 入れ替えるもの | 中身 |
+|---|---|---|
+| 1 | `config/agents.yaml` | エージェントと、そのつながり（`tools` / `sub_agents` / `knowledge`） |
+| 2 | `config/tools.yaml` | ツールの説明と引数のスキーマ。`type` はツールの実装の名前 |
+| 3 | `tools.py` | ツールの実装。ただの関数で、`{"value": ...}` の辞書を返す |
+| 4 | `network.py` の `TOOL_FACTORIES` | `type` → ツールの関数を返すもの |
+| 5 | `prompts/`、`knowledge/`、`config/knowledges.yaml` | 長い文章。`prompts/<agents か tools>/<名前>/<項目>.md` に置けば、YAML から指さなくても読まれる |
+| 6 | `observers.py` の `Guard` と `guard/` | 実行前の判定。図書館の規則なので、自分の題材の規則に書き換えるか、消す |
+
+エージェントとツールを足すときは、`config/agents.yaml` の末尾の `sample_agent`、`config/tools.yaml` の末尾の `sample_tool` をコピーします。書ける項目が全部埋めてあるので、要らない項目を消して中身を書き換えるだけで済み、項目名の綴りも間違えません。見本も毎回読み込まれて検証されているので、見本の項目名が古くなっていれば起動時にエラーになります。
+
+見本は残しておいて構いません（誰からも呼ばれません）。消すなら、`tools.py` の `make_sample_tool` と、`network.py` の `TOOL_FACTORIES` の `sample_tool` の行も消します。
+
+書き方は [設定ファイルから組み立てる](#設定ファイルから組み立てる) にあります。設定を書き間違えると、組み立ての時点で、何がどこで違うかをまとめてエラーにします。
+
+審査役を使わないなら、`guard/`、`network.py` の `build_compliance`、`observers.py` の `Guard` とその登録（`build_interceptor` の中）を消します。`Interceptor()` に何も登録しなくても動きます。
+
+#### 3. 名前を合わせる
+
+コードの中で、図書館のエージェントやモデルを名前で指している箇所があります。設定で名前を変えたら、ここも合わせます。
+
+| ファイル | 名前で指しているもの |
+|---|---|
+| `session.py` | 利用者の窓口になるエージェント（`net["front"]`）と、その回答の形（`Reply`。`front` の `output_schema` の `message` / `awaiting_reply`） |
+| `cli.py` | 個別記憶を表示するエージェント（`dump_memory` の `net["librarian"]`） |
+| `observers.py` | `Guard` が止めるツール名と、審査する委譲先（`NEEDS_REQUEST_AUDIT` の `librarian`）。枠切れ時の逃がし先（`FALLBACK_MODEL`）と、概算コストの単価表（`CostMeter.PRICING`）のモデル名 |
+
+`Reply` は、`front` の回答が形を守らなかった場合、本文をそのまま `message` として扱います。窓口の `output_schema` を外しても動きます。
+
+それ以外（`session.py` の会話の持ち越し、`carry_over.py`、`api_key.py`、`api.py` のセッション管理）は題材に依存しないので、そのまま使えます。
+
+### 最小の形
+
+サンプルのうち、動かすのに必須なのは設定、ツールの実装、組み立ての3つだけです。エージェント1体・ツール1つなら、これで動きます。
+
+```
+my_app/
+  __init__.py
+  config/
+    agents.yaml
+    tools.yaml
+  prompts/
+    agents/assistant/system_instruction.md
+  tools.py
+  network.py
+main.py
+```
+
+```yaml
+# my_app/config/agents.yaml
+- name: assistant
+  summary: 社内規程を調べて答える
+  provider: gemini
+  model: gemini-3.5-flash-lite
+  tools: [search_rules]
+```
+
+```yaml
+# my_app/config/tools.yaml
+- name: search_rules
+  type: search_rules          # network.py の TOOL_FACTORIES のキー
+  summary: 社内規程を検索する
+  parameters:
+    type: object
+    properties:
+      topic: {type: string, description: 何について調べるか}
+    required: [topic]
+```
+
+```markdown
+<!-- my_app/prompts/agents/assistant/system_instruction.md -->
+あなたは総務の担当者です。社内規程を調べ、根拠を示して答えてください。
+```
 
 ```python
-import os
+# my_app/tools.py
+def search_rules(topic: str) -> dict:
+    return {"value": "【有給休暇】申請は取得日の3営業日前までに行う。..."}
+```
 
-from statecraft import Agent, GeminiLLM, Network, Tool
+```python
+# my_app/network.py
+from pathlib import Path
+
+from statecraft import Network, NetworkBuilder
+
+from . import tools
+
+ROOT = Path(__file__).resolve().parent
 
 
-def search_docs(keyword: str) -> dict:
-    """社内ドキュメントを検索する"""
-    return {"value": "..."}
+class MyBuilder(NetworkBuilder):
+    TOOL_FACTORIES = {"search_rules": lambda: tools.search_rules}
 
 
-llm = GeminiLLM(api_key=os.environ["GEMINI_API_KEY"])
+def build_network() -> Network:
+    return MyBuilder.from_dir(ROOT).build()
+```
 
-worker = Agent(
-    name="worker",
-    summary="ドキュメントを調べて判断材料を揃える",
-    llm=llm,
-    model="gemini-3.5-flash",
-    system_instruction="あなたは調査担当です。...",
-    tools=[Tool(func=search_docs, summary="社内ドキュメントを検索する")],
-)
+```python
+# main.py
+from my_app.network import build_network
 
-front = Agent(
-    name="front",
-    summary="利用者との窓口",
-    llm=llm,
-    model="gemini-3.5-flash",
-    system_instruction="あなたは受付です。...",
-    sub_agent_names=["worker"],
-)
-
-net = Network(agents=[front, worker])
-response = front.respond(message="就業規則の有給の項目を教えて")
+net = build_network()
+response = net["assistant"].respond(message="有給の申請はいつまでに出せばいい？")
 
 print(response.text)
 print(net.total_tokens())  # (入力, 出力)
 ```
 
-同じことを設定ファイル（YAML と Markdown）で書くこともできます（→ [設定ファイルから組み立てる](#設定ファイルから組み立てる)）。
+APIキーは、Gemini のSDKが環境変数 `GEMINI_API_KEY` から読みます。`.env` から読み込みたい場合は、サンプルの `api_key.py` を写して、`build_network()` の前に `ApiKey().ensure()` を呼びます。
 
-動くサンプルは `examples/` にあります。図書館の問い合わせに答える構成で、受付役と司書役の2体が動きます。定義は設定のディレクトリ（`examples/library/`）に書いてあります。
+ここから、必要になったものをサンプルから足していきます。
 
-```bash
-cd examples
-python cli.py "貸出は何冊まで？"
-python cli.py "貸出は何冊まで？" --fresh    # 前回の記憶を引き継がない
-python chat.py                              # 対話モード
+| 足したいもの | サンプルのどこを見るか |
+|---|---|
+| 会話の窓口と、調べる役を分ける | `config/agents.yaml` の `front`（`type: reflex`、`sub_agents`、`input_schema`） |
+| 複数のエージェントで使い回す文書 | `config/knowledges.yaml`、`knowledge/` |
+| 結果の読み方をツールごとに持たせる | `prompts/tools/<名前>/evaluation.md` |
+| 実行前に止める | `observers.py` の `Guard` |
+| 進捗・記憶の変化・コストを見る | `observers.py` の `build_interceptor` |
+| 会話を続ける、記憶を次のターンへ引き継ぐ | `session.py`、`carry_over.py` |
+| Web API にする | `api.py` |
+
+---
+
+## 設定ファイルから組み立てる
+
+エージェントとツールの定義（プロンプト、説明文、モデル、スキーマ、つながり）を、コードの外の YAML と Markdown に書きます。プロンプトの調整にコードの書き換えが要らなくなり、どのエージェントが何とつながっているかも、設定を読めば分かります。
+
+コードに残るのは、ツールの実装と、`type` とその実装の対応だけです。
+
+例はサンプル（`examples/library/`）から抜き出しています。全体と、項目ごとのコメントはサンプルの側にあります。
+
+### フォルダ構成
+
+```
+<root>/
+  config/
+    agents.yaml        # エージェント（必須）
+    tools.yaml         # ツール
+    knowledges.yaml    # ナレッジの名前とファイル
+  prompts/
+    agents/<エージェント名>/<項目>.md
+    tools/<ツール名>/<項目>.md
+  knowledge/
+    <名前>.md
 ```
 
-何がどう動いているかは [sampleの読み方.md](docs/sampleの読み方.md) にあります。試せる質問も載せてあります。
+tools.yaml と knowledges.yaml は、使わなければ置かなくて構いません。
+
+### agents.yaml
+
+サンプルの受付（`front`）と司書（`librarian`）です。`input_schema` は一部の項目だけを残し、`output_schema` は省いています。書ける項目を全部並べた見本は、サンプルの agents.yaml の末尾の `sample_agent` にあります。
+
+```yaml
+- name: front
+  type: reflex                  # 記憶を持たない ReflexAgent
+  summary: 利用者との窓口
+  provider: gemini
+  model: gemini-3.7-flash
+  thought_level: low
+  max_steps: 3
+  sub_agents: [librarian]       # 委譲できるエージェント
+  knowledge: [terms]            # knowledges.yaml の名前
+
+- name: librarian
+  summary: 図書館の規程と蔵書を調べ、判断材料を揃える
+  execution_message: 司書が調べています...
+  provider: gemini
+  model: gemini-3.5-flash-lite
+  thought_level: low
+  max_steps: 6
+  phase_overrides:
+    initial_memory: {model: gemini-3.7-flash}
+    memory_update: {model: gemini-3.7-flash}
+  tools: [search_rules, check_stock, issue_reservation, send_overdue_notice]
+  initial_tools: [search_rules, fetch_member_status]
+  knowledge: [terms]
+  input_schema:
+    type: object
+    properties:
+      topic: {type: string, description: 何についての相談かを指す短い名詞句}
+      request: {type: string, description: 今回の要求と、その要求が成立した経緯}
+      member_id: {type: string, description: 利用者の会員番号。明示されていなければ空文字}
+    required: [topic, request]
+```
+
+人格定義（`system_instruction`）は YAML に書かず、`prompts/agents/<名前>/system_instruction.md` に置いています（→ [長い文章は Markdown に置く](#長い文章は-markdown-に置く)）。
+
+項目は Agent の同名の引数にあたり、書かなかった項目は Agent の既定値になります。Agent の引数と違うのは次の項目です。
+
+| 項目 | 中身 |
+|---|---|
+| `type` | `agent`（既定）か `reflex`。設定の形は同じで、クラスだけが変わります |
+| `provider` | LLM の提供元の名前。実体は `LLM_FACTORIES` で作ります（[組み立てる](#組み立てる)） |
+| `thought_level` | `none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`。どの段階を受け付けるかはモデルごとに違い、受け付けない段階は API がエラーを返します |
+| `phase_overrides` | キーは phase の小文字（`initial_memory` / `memory_update` など）。中身は `model` / `provider` / `temperature` / `max_tokens` / `thought_level` |
+| `tools` / `initial_tools` | tools.yaml のツール名 |
+| `sub_agents` | 委譲できるエージェント名（Agent の `sub_agent_names`） |
+| `knowledge` / `initial_knowledge` | knowledges.yaml のナレッジ名。書いた順につなげて渡します |
+
+Agent の引数のうち、`disabled` と `describe_execution` は設定ファイルでは書けません。`initial_tools` に置けるのも tools.yaml のツールだけです（エージェントは置けません）。これらが要る場合は、コードで組みます（→ [設定ファイルを使わずに組む](#設定ファイルを使わずに組む)）。
+
+つながりは、使う側のエージェントにだけ書きます。tools.yaml や knowledges.yaml には、どのエージェントが使うかを書きません。同じ関係を2か所に書くと、片方だけ直したときに食い違うためです。
+
+### tools.yaml
+
+書ける項目を全部並べた見本は、サンプルの tools.yaml の末尾の `sample_tool` にあります。
+
+```yaml
+- name: check_stock
+  type: check_stock             # 実装の種類。network.py の TOOL_FACTORIES のキー
+  summary: 書名から所在と貸出状況を調べる
+  execution_message: 『{title}』の所蔵状況を照会しています...
+  parameters:
+    type: object
+    properties:
+      title: {type: string, description: 調べたい書名（正確な書名）}
+    required: [title]
+```
+
+| 項目 | 中身 |
+|---|---|
+| `name` | LLM に見せるツール名 |
+| `type` | 実装の種類。`TOOL_FACTORIES` のキー |
+| `settings` | 実装に渡す値。文章の差し込み口にも使います |
+| `parameters` | 引数の JSON Schema。型ヒントからは作らず、書いたものをそのまま使います |
+| `summary` / `usage` / `evaluation` / `execution_message` | Tool の同名の項目（→ [summary / usage / evaluation](#summary--usage--evaluation)） |
+
+#### settings — 同じ実装から別のツールを作る
+
+`name` と `type` が分かれているので、同じ実装から `settings` だけ違うツールを何本でも作れます。サンプルでは見本の `sample_tool` だけが `settings` を使っています。
+
+```yaml
+- name: sample_tool
+  type: sample_tool
+  settings:
+    max_results: 3
+  summary: 見本のツール。最大{max_results}件を返す
+  execution_message: 「{topic}」を調べています...
+  parameters:
+    type: object
+    properties:
+      topic:
+        type: string
+        description: 何について調べるか。結果は最大{max_results}件
+    required: [topic]
+```
+
+`summary` / `usage` / `evaluation` とスキーマの `description` にある `{名前}` は、`settings` の同じ名前の値で埋まります。数字を `settings` の1か所に書けば、説明文と実装の上限が食い違いません。波かっこをそのまま書くときは `{{ }}` にしてください。`execution_message` の `{名前}` は埋めずに残し、実行時にツールの引数で埋まります（[進捗メッセージ](#進捗メッセージ)）。
+
+`{名前}` を含む文は、`{type: string, description: ...}` のような1行の形（YAML のフロー形式）に入れないでください。波かっこが YAML の文法として読まれ、読み込みの時点でエラーになります。上の `topic` のように1行に1項目で書きます。
+
+`settings` は、実装を作る関数へキーワード引数で渡ります（→ [組み立てる](#組み立てる)）。
+
+### 長い文章は Markdown に置く
+
+`system_instruction`（エージェントだけ）、`usage`、`evaluation`、`execution_message` は、YAML に直接書く代わりに `prompts/<agents か tools>/<名前>/<項目>.md` に置けます。置き場所が決まっているので、YAML からファイルを指す必要はありません。同じ項目が YAML と md の両方にあるとエラーになります。
+
+サンプルでは、人格定義と結果の読み方を md に置いています。
+
+```
+prompts/
+  agents/front/system_instruction.md
+  agents/librarian/system_instruction.md
+  agents/librarian/evaluation.md       # 委譲の結果が返ってきた時の読み方
+  tools/search_rules/evaluation.md     # 規程が返ってきた時の読み方
+  tools/check_stock/evaluation.md
+```
+
+### knowledges.yaml
+
+複数のエージェントで使い回す文書は、名前を付けて登録します。
+
+```yaml
+- name: terms
+  file: knowledge/terms.md      # root からのパス
+```
+
+サンプルは用語辞書（`terms`）を、`front` と `librarian` の両方へ `knowledge: [terms]` で渡しています。
+
+### 組み立てる
+
+ツールの関数は、`NetworkBuilder` の子クラスで `type` と対応させます。サンプルの `network.py` です。
+
+```python
+from pathlib import Path
+
+from statecraft import Interceptor, Network, NetworkBuilder
+
+from . import tools
+
+ROOT = Path(__file__).resolve().parent
+
+
+class LibraryBuilder(NetworkBuilder):
+    # type → ツールの関数を返すもの
+    TOOL_FACTORIES = {
+        "search_rules": lambda: tools.search_rules,
+        "fetch_member_status": lambda: tools.fetch_member_status,
+        "check_stock": lambda: tools.check_stock,
+        "issue_reservation": lambda: tools.issue_reservation,
+        "send_overdue_notice": lambda: tools.send_overdue_notice,
+        "sample_tool": tools.make_sample_tool,   # settings を受け取るもの
+    }
+
+
+def build_network(interceptor: Interceptor) -> Network:
+    return LibraryBuilder.from_dir(ROOT, interceptor).build()
+
+
+net = build_network(interceptor)
+response = net["front"].respond(message="...")
+```
+
+`TOOL_FACTORIES` の値は「ツールの関数を返すもの」です。`settings` を持たないツールは、関数をそのまま返す `lambda` で足ります。`settings` を持つツールは、キーワード引数で受け取って関数を返します（サンプルの `tools.py` の `make_sample_tool`）。
+
+```python
+def make_sample_tool(*, max_results: int) -> Callable[[str], dict]:
+    def sample_tool(topic: str) -> dict:
+        return {"value": f"「{topic}」についての見本の結果（最大{max_results}件）"}
+
+    return sample_tool
+```
+
+`from_dir` は呼ぶたびに設定を読み直します。サンプルはリクエストごとに組み立てるので、`config/` や `prompts/` を直すと、次のリクエストから効きます。
+
+YAML に関数の場所（モジュール名）を書く形にしていないのは、設定を書き換えられる人が、登録されていない関数を組み立て時に呼べないようにするためです。
+
+`provider` の `gemini` / `openai` / `claude` は最初から登録されています。API キーは YAML に書かず、環境変数（`GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`）に置いてください。各 SDK がそこから読みます。それ以外の provider を使う場合は、既定の対応表に足します。
+
+```python
+class LibraryBuilder(NetworkBuilder):
+    TOOL_FACTORIES = {...}   # 上と同じ
+    LLM_FACTORIES = {**NetworkBuilder.LLM_FACTORIES, "azure_openai": make_azure_llm}
+```
+
+LLM は provider ごとに1つ作り、同じ provider のエージェントで共有します。
+
+### 読み込み時の検証
+
+YAML は書き間違えても読めてしまうので、次のものは読み込みか組み立ての時点でエラーにします。名前の食い違いは、1つずつではなくまとめて出ます。
+
+- 知らない項目名（綴り違い）
+- 同じ名前のエージェント・ツール・ナレッジが2つ以上ある
+- `tools` / `sub_agents` / `knowledge` などに書いた名前が、指す先のファイルに無い
+- 同じ文章が YAML と md の両方にある
+- `{名前}` に入れる値が `settings` に無い
+- ナレッジの `file` が無い
+- `type` / `provider` が対応表に無い、`settings` が実装の引数と合わない
 
 ---
 
 ## Tool
 
-StateCraftでは、**Python関数をエージェントが実行できる「tool」として定義します。** 関数をそのまま渡すだけで、**引数のJSON Schemaは型ヒントから自動生成されます。**
+StateCraftでは、**Python関数をエージェントが実行できる「tool」として定義します。** 書くものは2つに分かれます。
+
+| | 書く場所 | 中身 |
+|---|---|---|
+| 実装 | `tools.py` などの Python 関数 | 実際に動く処理。決まった形の辞書を返す |
+| LLM に見せる定義 | `config/tools.yaml` と `prompts/tools/` | 何をするものか、使い方、結果の読み方、引数のスキーマ |
+
+実装は、ただの関数です（サンプルの `tools.py`）。
 
 ```python
-def issue_ticket(title: str, member_id: str, tags: list[str], due: str | None = None) -> dict:
-    """チケットを発行する"""
-    return {"value": "TKT-00123 を発行しました"}
-
-
-Tool(
-    func=issue_ticket,
-    summary="チケットを発行する",
-    param_descriptions={
-        "title": "件名",
-        "member_id": "会員番号（M-で始まる）",
-        "tags": "分類タグ。空でよい",
-    },
-)
+def check_stock(title: str) -> dict:
+    """指定した書名の所在と貸出状況を調べる"""
+    found = STOCK.get(title)
+    if not found:
+        return {"value": f"『{title}』は当館の蔵書に見つかりませんでした。"}
+    return {"value": f"『{title}』 所在={found['所在']} 状態={found['状態']}"}
 ```
 
-これが、LLMへ渡るスキーマになります。
+LLM に見せる定義は tools.yaml に書きます（→ [tools.yaml](#toolsyaml)）。`parameters` に書いたスキーマがそのまま LLM へ渡り、LLM が埋めた引数がキーワード引数として関数へ渡ります。
 
-```json
-{
-  "type": "object",
-  "properties": {
-    "title": { "type": "string", "description": "件名" },
-    "member_id": { "type": "string", "description": "会員番号（M-で始まる）" },
-    "tags": {
-      "type": "array",
-      "items": { "type": "string" },
-      "description": "分類タグ。空でよい"
-    },
-    "due": { "type": "string" }
-  },
-  "required": ["title", "member_id", "tags"]
-}
-```
-
-読み取られるのは3つです。
-
-| 書いたもの | スキーマ |
-|---|---|
-| 型ヒント `list[str]` | `{"type": "array", "items": {"type": "string"}}` |
-| `param_descriptions` のキー | 同じ名前の引数の `description` |
-| **既定値のある引数** | `required` から外れる（`due` が入っていない） |
-
-`param_descriptions` に書かなかった引数（`due`）には `description` が付きません。単位、書式、想定される値の範囲など、**型に現れないもの**を書く欄です。
-
-**必須ではありません。** 引数名がそれ自体で分かる形になっていて（`member_id` / `due_date` のように）、制約を `usage` に書いてあるなら、設定しなくて構いません。
-
-`str | None` は `{"type": "string"}` になります（`null` は許容されません。省略させたい場合は既定値を付けて `required` から外します）。
+設定ファイルを使わずにコードで組む場合は、スキーマを関数の型ヒントから自動で作れます（→ [型ヒントからスキーマを作る](#型ヒントからスキーマを作る)）。
 
 ### 戻り値
 
@@ -287,7 +611,9 @@ return {"value": "ok", "blob": [...]}  # ✗ キーの綴り違い（blobs のs�
 
 ### フィールド
 
-`Agent` と同じ3つに分かれます。
+`Tool` の引数で並べています。`Agent` と同じ3つに分かれます。
+
+tools.yaml では、`summary` / `usage` / `evaluation` / `execution_message` を同じ名前で書きます。`func` は `type`（と `settings`）から作られ、`param_descriptions` の代わりに `parameters` の各 `description` を書きます。`expose_error_details` / `disabled` / `describe_execution` は設定ファイルでは書けません。
 
 **① このツール自身の振る舞い**
 
@@ -302,7 +628,7 @@ return {"value": "ok", "blob": [...]}  # ✗ キーの綴り違い（blobs のs�
 | | 型 | 説明 |
 |---|---|---|
 | `summary` | `str` | **必須。** 何をするものか（1行） |
-| `param_descriptions` | `dict[str, str]` | 引数ごとの説明。スキーマの `description` に入る。引数名と `usage` で足りるなら不要（上の例を参照） |
+| `param_descriptions` | `dict[str, str]` | 引数ごとの説明。スキーマの `description` に入る。引数名と `usage` で足りるなら不要（→ [型ヒントからスキーマを作る](#型ヒントからスキーマを作る)） |
 | `usage` | `str` | 使い方。スキーマで表現できない制約 |
 | `evaluation` | `str` | 結果の読み方 |
 
@@ -348,7 +674,7 @@ front（librarian へ依頼を送る側）が見るもの
     【この結果の解釈】条文をそのまま採用せず、問われている条件に該当するかを確かめること。
 ```
 
-各ツールの結果の見方を人格定義へ書くと、ツール数に比例してプロンプトが伸び、ツールを足すたびにオーケストレーター側を書き換えることになります。**`evaluation` はそのツールの定義に置いてください。**
+各ツールの結果の見方を人格定義へ書くと、ツール数に比例してプロンプトが伸び、ツールを足すたびにオーケストレーター側を書き換えることになります。**`evaluation` はそのツールの定義に置いてください。** 設定ファイルなら `prompts/tools/<名前>/evaluation.md` です（サンプルの `search_rules` と `check_stock`）。
 
 `Agent` も同じ3つを持ちます。関係は同じで、**`usage` はそのAgentへ依頼を送る側に渡り、その上の階層からは見えません。** `evaluation` は回答を受け取った側に渡ります。
 
@@ -408,11 +734,13 @@ def fetch_page(doc_id: str, page: int) -> dict:
 
 ReActループを回します。`tools` と `sub_agent_names` を持ち、記憶へ判断を積み上げながら進みます。
 
-**2種類あります。** 記憶を持つ `Agent` と、持たない `ReflexAgent` です。まずは `Agent` を読み、違いは [どちらを使うか](#どちらを使うか) にまとめてあります。
+**2種類あります。** 記憶を持つ `Agent` と、持たない `ReflexAgent` です。agents.yaml では `type: agent`（既定）と `type: reflex` で選びます。まずは `Agent` を読み、違いは [どちらを使うか](#どちらを使うか) にまとめてあります。
 
 ### フィールド
 
-プロパティは4つに分かれます。
+`Agent` の引数で並べています。プロパティは4つに分かれます。
+
+agents.yaml では、ほとんどを同じ名前で書きます。違うのは `llm`（→ `provider`）、`sub_agent_names`（→ `sub_agents`）、ツールやナレッジを名前で書く項目で、一覧は [agents.yaml](#agentsyaml) の表にあります。`disabled` と `describe_execution` は設定ファイルでは書けません。④は `Network` が入れるので、どちらの書き方でも指定しません。
 
 **① このAgent自身の振る舞い** — 何をどう動かすかの設定です。
 
@@ -431,7 +759,7 @@ ReActループを回します。`tools` と `sub_agent_names` を持ち、記憶
 | `max_memory_retries` | `int` | 記憶の差分が不正だった時の再生成回数（既定 3） |
 | `max_stalled_steps` | `int` | 同じ実行が何回続いたら打ち切るか（既定 2） |
 | `temperature` | `float \| None` | 既定 `None`（パラメータ自体を送らず、モデルの既定に任せる）。サンプリング指定を受け付けないモデル（OpenAIの推論モデル、Claudeの現行モデル）では指定しない |
-| `max_tokens` | `int` | 既定 8192 |
+| `max_tokens` | `int` | 既定 65535 |
 | `thought_level` | `ThoughtLevel \| None` | `None` ならモデルの動的思考（既定） |
 | `phase_overrides` | `dict[Phase, GenerationConfig]` | phaseごとの生成設定の上書き |
 | `disabled` | `bool` | `True` の間は選択肢として提示されない |
@@ -484,26 +812,26 @@ ReActループを回します。`tools` と `sub_agent_names` を持ち、記憶
 
 「呼ぶかどうか」も「何を呼ぶか」も決まっている手順は、LLMに選ばせません。
 
-```python
-search_docs_tool = Tool(func=search_docs, summary="社内文書を検索する")
+サンプルの `librarian` は、規程の検索と会員区分の照会を、毎回ループの前に済ませています。
 
-Agent(
-    initial_tools=[search_docs_tool],
-    input_schema={
-        "type": "object",
-        "properties": {"keyword": {"type": "string"}},  # ツールの引数名と一致させる
-        "required": ["keyword"],
-    },
-    ...
-)
+```yaml
+# config/agents.yaml（抜粋）
+- name: librarian
+  initial_tools: [search_rules, fetch_member_status]
+  input_schema:
+    type: object
+    properties:
+      topic: {type: string}       # search_rules(topic) へ渡る
+      member_id: {type: string}   # fetch_member_status(member_id) へ渡る
+    required: [topic]
 ```
 
 ループ前にシステムが実行し、その結果を材料に初期記憶を作ります。**生成1回とその失敗可能性が消えます。** 引数は `input_schema` の同名プロパティから自動で渡されます（名前が一致しないと `Network` 構築時に落ちます）。
 
 #### 複数指定できます
 
-```python
-initial_tools=[fetch_profile_tool, search_docs_tool]   # 2つとも走る
+```yaml
+initial_tools: [search_rules, fetch_member_status]   # 2つとも走る
 ```
 
 **ここに置いたものは、それぞれ別のコンテキストで動きます。** 互いの存在も結果も知りません。
@@ -526,10 +854,12 @@ Agentを置いた場合も、その Agent からは他の初期ステップの�
 
 | 書き方 | LLMから見えるか | 2回目を呼べるか |
 |---|---|---|
-| `initial_tools=[t]` だけ | **見えない**（カタログにも候補にも出ない） | 呼べない |
-| `initial_tools=[t], tools=[t, ...]` | 見える | 呼べる |
+| `initial_tools: [t]` だけ | **見えない**（カタログにも候補にも出ない） | 呼べない |
+| `initial_tools: [t]` と `tools: [t, ...]` | 見える | 呼べる |
 
 登録しなければ「システムだけが実行する準備ステップ」になります。登録すれば、最初の1回はシステムが走らせたうえで、**別の引数で呼び直す**ことができます。
+
+サンプルでは、`search_rules` を両方に入れています（別の主題の規程も読みたくなるため）。`fetch_member_status` は `initial_tools` だけです（区分は会員番号だけで決まり、呼び直しても同じ結果しか返らないため）。
 
 登録する場合、同じ引数での再実行は拒否されるので、LLMが直後に同じ呼び出しをしても二重には実行されません。その場合 `usage` に「必ず最初に実行する」とは書かず、**呼び直したくなる条件**を書いてください。
 
@@ -538,6 +868,7 @@ Agentを置いた場合も、その Agent からは他の初期ステップの�
 ツールの代わりにエージェントを置くこともできますが、あまり推奨しません。。。
 もちろん、ツールとエージェントを混ぜてもかまいません。
 
+設定ファイルの `initial_tools` に書けるのは tools.yaml のツールだけなので、エージェントを置く場合はコードで組みます（→ [設定ファイルを使わずに組む](#設定ファイルを使わずに組む)）。
 
 ```python
 Agent(
@@ -575,23 +906,30 @@ Agent(
 
 `initial_knowledge` は、**初期記憶を作る生成にだけ**渡されます。主な用途は**タスク判断の例**（few-shot）など。「この依頼は何が揃えば答えられるか」「どの順なら確かめられるか」を数件見せると、tasks の立て方が安定します。
 
-```python
-Agent(
-    initial_knowledge='''
-    【タスクの組み立て方の例】
-    ・規程や仕様そのものを問われている依頼
-      → まず該当箇所を取得する。個別の情報が必要かは取得した内容を
-        読んでから決まるので、そちらは conditional にして、
-        何が分かれば実行するのかを text へ書く。
-    ・複数の値を突き合わせて初めて答えが出る依頼
-      → 値ごとに取得を分ける。算出は全部が揃ってからの conditional にする。
-    ・実行の前に前提の確認が必要な依頼
-      → 確認を next、実行を conditional にする。
-    ''',
-    ...
-)
+設定ファイルでは、ナレッジとして登録して名前で指します（サンプルでは使っていません）。
+
+```yaml
+# config/knowledges.yaml
+- name: task_examples
+  file: knowledge/task_examples.md
+
+# config/agents.yaml
+- name: librarian
+  initial_knowledge: [task_examples]
 ```
 
+```
+<!-- knowledge/task_examples.md -->
+【タスクの組み立て方の例】
+・規程や仕様そのものを問われている依頼
+  → まず該当箇所を取得する。個別の情報が必要かは取得した内容を
+    読んでから決まるので、そちらは conditional にして、
+    何が分かれば実行するのかを text へ書く。
+・複数の値を突き合わせて初めて答えが出る依頼
+  → 値ごとに取得を分ける。算出は全部が揃ってからの conditional にする。
+・実行の前に前提の確認が必要な依頼
+  → 確認を next、実行を conditional にする。
+```
 
 `knowledge` との違いは**載る回数**です。`knowledge` は全phase・全ステップに載るので、ループが回った分だけ入力トークンを払います。初期記憶を作る時にしか読まないものをそちらへ置くと、読まれない場所で払い続けることになります。
 
@@ -670,11 +1008,15 @@ Agentごとに別の実体を持ちます。共有されません。
 
 末端を複数の親で共有する構成（専門役が何体もいて、全員が同じ「エクセルを作るエージェント」へ依頼する、など）はそのまま書けます。共有された側は依頼を1件ずつ処理するため、依頼と回答が入れ替わることはありません。
 
-```python
-excel = Agent(name="excel", summary="エクセルを作る", ...)
+```yaml
+- name: excel
+  summary: エクセルを作る
 
-specialist_a = Agent(name="a", sub_agent_names=["excel"], ...)
-specialist_b = Agent(name="b", sub_agent_names=["excel"], ...)
+- name: specialist_a
+  sub_agents: [excel]
+
+- name: specialist_b
+  sub_agents: [excel]
 ```
 
 エージェントは依頼ごとに自分の状態（受け取った依頼・実行履歴・タスク）を持つため、同時に2件を走らせることができません。そのため共有された側は順番待ちになります。**そこを本当に並列で動かしたい場合は、専門役ごとに別の実体（別の名前）を持たせてください。**
@@ -683,7 +1025,7 @@ specialist_b = Agent(name="b", sub_agent_names=["excel"], ...)
 
 #### 引き継ぎ
 
-`Network` は1リクエストで破棄されるので、次のターンへ渡すものは利用側で保存します。
+共有記憶を次のターンへどこまで持ち越すかは、利用側が決めます。`Network` を作り直すか `reset()` すると共有記憶は空になるので、残したいものは保存しておいて入れ直します。サンプルでは `carry_over.py` の `CarryOver` が、この保存と復元を行っています。
 
 ```python
 # 保存
@@ -692,7 +1034,7 @@ saved = {
     for f in ("ontology", "vars")
 }
 
-# 復元（Network構築後に代入する）
+# 復元（Network を作った後、または reset() の後に代入する）
 net.shared_memory.ontology = [MemoryEntry(**r) for r in saved["ontology"]]
 ```
 
@@ -723,24 +1065,33 @@ net.shared_memory.ontology = [MemoryEntry(**r) for r in saved["ontology"]]
 
 `ReflexAgent` は `INITIAL_MEMORY` と `MEMORY_UPDATE` を通りません。
 
+設定ファイルでは、phase の名前を小文字で書きます（`initial_memory` / `memory_update` など）。
+
 #### phaseごとに変える
 
 **まず、既定では使わなくて構いません。** 全phaseを1つのモデルで動かし、困ってから考えてください。
 
+```yaml
+- name: librarian
+  model: gemini-3.5-flash-lite        # 既定は軽い方
+  phase_overrides:
+    # 結果を評価して記憶へ統合するphaseだけ上げる
+    memory_update: {model: gemini-3.7-flash}
+```
+
+phaseごとに書けるのは `model` / `provider` / `temperature` / `max_tokens` / `thought_level` です（すべて任意で、書かなかった項目はエージェント本体の設定のまま）。コードで組む場合は `GenerationConfig` で渡し、`provider` の代わりに `llm` を指定します。
+
 ```python
 from statecraft import GenerationConfig, Phase
 
-worker = Agent(
-    model="gemini-3.5-flash-lite",  # 既定は軽い方
-    phase_overrides={
-        # 結果を評価して記憶へ統合するphaseだけ上げる
-        Phase.MEMORY_UPDATE: GenerationConfig(model="gemini-3.5-flash"),
-    },
+Agent(
+    model="gemini-3.5-flash-lite",
+    phase_overrides={Phase.MEMORY_UPDATE: GenerationConfig(model="gemini-3.7-flash")},
     ...
 )
 ```
 
-`GenerationConfig` は `model` / `llm` / `temperature` / `max_tokens` / `thought_level` を持ちます（すべて任意です）。
+サンプルの `librarian` は、`initial_memory` と `memory_update` の2つを上げています（→ [sampleの読み方.md](docs/sampleの読み方.md#誰がどのモデルで動くか)）。
 
 | phase | 割り当ての目安 |
 |---|---|
@@ -751,7 +1102,7 @@ worker = Agent(
 
 どのphaseが重いかは構成で変わるので、`generated` イベントで実測してから決めてください。
 
-**接続（`llm`）は1つ作って、全Agentで共有できます。** モデル名は `model` 側で指定します。プロバイダを混在させる場合だけ、インスタンスを分けてください。
+**接続（`llm`）は1つ作って、全Agentで共有できます。** モデル名は `model` 側で指定します。設定ファイルでは `provider` ごとに1つ作られ、同じ `provider` のエージェントで共有されます。コードで組む場合も、プロバイダを混在させる時だけインスタンスを分けてください。
 
 
 **`ReflexAgent` では `ANSWER` / `INITIAL_MEMORY` / `MEMORY_UPDATE` を指定できません**（通らないphaseなので、構築時にエラーになります）。回答文のモデルを変えたい場合は `model` を指定してください。
@@ -781,8 +1132,10 @@ OpenAI の strict は、ルートがオブジェクトで、全項目が必須�
 | | |
 |---|---|
 | 指定しない（既定） | パラメータを送らず、モデルの動的思考に任せる |
-| `MINIMAL` / `LOW` / `MEDIUM` / `HIGH` | その段階を要求する |
+| `MINIMAL` / `LOW` / `MEDIUM` / `HIGH` / `XHIGH` / `MAX` | その段階を要求する |
 | `NONE` | 思考させない |
+
+設定ファイルでは小文字で書きます（`thought_level: low`）。
 
 **指定した段階は、そのまま送られます。** モデルによって受け取れる段階が違う（`gemini-3.1-flash-lite` は `minimal` / `low` / `medium` で `HIGH` が無い等）ため、対応しない段階を送るとAPIがエラーを返します。
 
@@ -804,10 +1157,13 @@ Claude と、GPT-5.6 以降の OpenAI は、**区切りまでが丸ごと一致�
 
 ## Network
 
-1リクエストにつき1インスタンスです。共有記憶はここで作られ、全Agentが同じものを読み書きします。
+共有記憶と配線をまとめる単位です。共有記憶はここで1つ作られ、全Agentが同じものを読み書きします。リクエストごとに作り直すか、`reset()` して使い回すかは利用側が決めます（→ [Agentを使い回す](#agentを使い回す--reset)）。
+
+設定ファイルからは `NetworkBuilder` の `build()` で作られます。コードで組む場合は、`Agent` を並べて直接作ります。
 
 ```python
-net = Network(agents=[front, worker, planner])
+net = LibraryBuilder.from_dir(ROOT, interceptor).build()   # 設定ファイルから
+net = Network(agents=[front, librarian], interceptor=ic)   # コードで組む場合
 
 net.get("front")  # net["front"] でも同じ
 net.total_tokens()  # (入力, 出力)
@@ -820,7 +1176,7 @@ net.shared_memory  # 全Agentが共有する記憶の実体
 - 委譲先の名前が解決できない
 - 循環参照がある
 - `initial_tools` の引数名が `input_schema` と一致しない、同じ対象が重複している、または置いたagentが `agents` に無い
-- `phase_overrides` で `llm` だけを上書きして `model` を書き忘れている
+- `phase_overrides` で `llm`（設定ファイルでは `provider`）だけを上書きして `model` を書き忘れている
 
 ### Agentを使い回す — reset()
 
@@ -850,11 +1206,15 @@ net.shared_memory.ontology = carried   # 前のターンから引き継ぐもの
 
 自動では走りません。**リクエストの区切りで自分で呼んでください。** リクエストごとにAgentから作り直す構成では呼ぶ必要はありません。
 
+サンプルは作り直す側です。`session.py` がターンごとに `build_network()` を呼び、持ち越すのは会話履歴と `CarryOver` だけにしています。設定も毎回読み直されるので、プロンプトを直すと次のターンから効きます。
+
 Agent単体で使っている場合は `agent.reset()` があります（そのAgent1体分だけを戻します。共有記憶は触りません）。
 
 ### 渡すと共有記憶が入る
 
 `agents` に渡したAgentには、**共有記憶が注入されます**。逆に、共有記憶を持たせたくないAgentは渡しません（→ [プロンプト攻撃を別のAgentに見張らせる](#プロンプト攻撃を別のagentに見張らせる)）。
+
+設定ファイルでは、1つの agents.yaml に書いたエージェントが全員同じ `Network` に入ります。共有記憶を分けたいエージェントは、別のディレクトリに設定を置いて別の `Network` として組み立てます（サンプルの審査役は `guard/` にあります）。
 
 構築時に落ちるのは、`sub_agents` へ**実体を直接指定したのに、その実体が `agents` に含まれていない**場合です。そのまま動かすと共有記憶が繋がりません。
 
@@ -885,160 +1245,7 @@ Orchestrator（統括）    記憶を持ち、知識の取得と全体の判断�
 
 専門家へ委譲してよいのは「作業」であり、「質問」ではありません。**仕様やルールを専門家に尋ねてはいけません。** 知識は統括の側に置き、専門家は渡された材料で作業だけを行います。
 
----
-
-## 設定ファイルから組み立てる
-
-エージェントとツールの定義（プロンプト、説明文、モデル、スキーマ、つながり）を、コードの外の YAML と Markdown に書けます。プロンプトの調整にコードの書き換えが要らなくなり、どのエージェントが何とつながっているかも、設定を読めば分かります。
-
-動く雛形が `examples/library/` にあります。写して中身を入れ替える手順は [sampleの読み方.md](docs/sampleの読み方.md#自分のアプリに写す) にあります。
-
-### フォルダ構成
-
-```
-<root>/
-  config/
-    agents.yaml        # エージェント（必須）
-    tools.yaml         # ツール
-    knowledges.yaml    # ナレッジの名前とファイル
-  prompts/
-    agents/<エージェント名>/<項目>.md
-    tools/<ツール名>/<項目>.md
-  knowledge/
-    <名前>.md
-```
-
-tools.yaml と knowledges.yaml は、使わなければ置かなくて構いません。
-
-### agents.yaml
-
-```yaml
-- name: front
-  summary: ユーザーとの対話を担当します。
-  provider: gemini
-  model: gemini-3.1-flash-lite
-  sub_agents: [scout]
-
-- name: scout
-  summary: 情報収集を担当します。
-  provider: gemini
-  model: gemini-3.1-flash-lite
-  max_steps: 10
-  tools: [web_search]
-  knowledge: [basics]
-  phase_overrides:
-    initial_memory:
-      thought_level: low
-  input_schema:
-    type: object
-    properties:
-      purpose: {type: string, description: 依頼者がその先で達成したいこと}
-    required: [purpose]
-```
-
-項目は Agent の同名の引数にあたり、書かなかった項目は Agent の既定値になります。Agent の引数と違うのは次の項目です。
-
-| 項目 | 中身 |
-|---|---|
-| `type` | `agent`（既定）か `reflex`。設定の形は同じで、クラスだけが変わります |
-| `provider` | LLM の提供元の名前。実体は `LLM_FACTORIES` で作ります（[組み立てる](#組み立てる)） |
-| `thought_level` | `none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`。どの段階を受け付けるかはモデルごとに違い、受け付けない段階は API がエラーを返します |
-| `tools` / `initial_tools` | tools.yaml のツール名 |
-| `sub_agents` | 委譲できるエージェント名（Agent の `sub_agent_names`） |
-| `knowledge` / `initial_knowledge` | knowledges.yaml のナレッジ名。書いた順につなげて渡します |
-
-つながりは、使う側のエージェントにだけ書きます。tools.yaml や knowledges.yaml には、どのエージェントが使うかを書きません。同じ関係を2か所に書くと、片方だけ直したときに食い違うためです。
-
-### tools.yaml
-
-```yaml
-- name: web_search
-  type: web_search
-  summary: Webを検索し、問いごとに結果を返します。
-  settings:
-    max_searches: 4
-  parameters:
-    type: object
-    properties:
-      searches:
-        type: array
-        description: 検索の一覧。最大{max_searches}件
-    required: [searches]
-```
-
-| 項目 | 中身 |
-|---|---|
-| `name` | LLM に見せるツール名 |
-| `type` | 実装の種類。`TOOL_FACTORIES` のキー |
-| `settings` | 実装に渡す値。文章の差し込み口にも使います |
-| `parameters` | 引数の JSON Schema。型ヒントからは作らず、書いたものをそのまま使います |
-| `summary` / `usage` / `evaluation` / `execution_message` | Tool の同名の項目 |
-
-`name` と `type` が分かれているので、同じ実装から `settings` だけ違うツールを何本でも作れます。
-
-`summary` / `usage` / `evaluation` とスキーマの `description` にある `{名前}` は、`settings` の同じ名前の値で埋まります。数字を `settings` の1か所に書けば、説明文と実装の上限が食い違いません。波かっこをそのまま書くときは `{{ }}` にしてください。`execution_message` の `{名前}` は埋めずに残し、実行時にツールの引数で埋まります（[進捗メッセージ](#進捗メッセージ)）。
-
-### 長い文章は Markdown に置く
-
-`system_instruction`、`usage`、`evaluation`、`execution_message` は、YAML に直接書く代わりに `prompts/<agents か tools>/<名前>/<項目>.md` に置けます。置き場所が決まっているので、YAML からファイルを指す必要はありません。同じ項目が YAML と md の両方にあるとエラーになります。
-
-### knowledges.yaml
-
-複数のエージェントで使い回す文書は、名前を付けて登録します。
-
-```yaml
-- name: basics
-  file: knowledge/basics.md     # root からのパス
-```
-
-### 組み立てる
-
-ツールの関数は、`NetworkBuilder` の子クラスで `type` と対応させます。
-
-```python
-from statecraft import NetworkBuilder
-
-
-def make_search(*, max_searches: int):
-    """settings を受け取り、ツールの関数を返す。"""
-
-    def web_search(searches: list) -> dict:
-        ...
-
-    return web_search
-
-
-class MyBuilder(NetworkBuilder):
-    TOOL_FACTORIES = {"web_search": make_search}
-
-
-net = MyBuilder.from_dir("path/to/root", interceptor).build()
-response = net["front"].respond(message="...")
-```
-
-YAML に関数の場所（モジュール名）を書く形にしていないのは、設定を書き換えられる人が、登録されていない関数を組み立て時に呼べないようにするためです。
-
-`provider` の `gemini` / `openai` / `claude` は最初から登録されています。API キーは YAML に書かず、環境変数（`GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`）に置いてください。各 SDK がそこから読みます。それ以外の provider を使う場合は、既定の対応表に足します。
-
-```python
-class MyBuilder(NetworkBuilder):
-    TOOL_FACTORIES = {"web_search": make_search}
-    LLM_FACTORIES = {**NetworkBuilder.LLM_FACTORIES, "azure_openai": make_azure_llm}
-```
-
-LLM は provider ごとに1つ作り、同じ provider のエージェントで共有します。
-
-### 読み込み時の検証
-
-YAML は書き間違えても読めてしまうので、次のものは読み込みか組み立ての時点でエラーにします。名前の食い違いは、1つずつではなくまとめて出ます。
-
-- 知らない項目名（綴り違い）
-- 同じ名前のエージェント・ツール・ナレッジが2つ以上ある
-- `tools` / `sub_agents` / `knowledge` などに書いた名前が、指す先のファイルに無い
-- 同じ文章が YAML と md の両方にある
-- `{名前}` に入れる値が `settings` に無い
-- ナレッジの `file` が無い
-- `type` / `provider` が対応表に無い、`settings` が実装の引数と合わない
+サンプルは窓口（`front`）と統括（`librarian`）の2層です。専門家を足すなら、agents.yaml にエージェントを足して、`librarian` の `sub_agents` に書きます。
 
 ---
 
@@ -1064,7 +1271,7 @@ ic = Interceptor()
 ic.on.execute_start(lambda message: print(message))
 ic.on.before_execute(guard)
 
-net = Network(agents=[...], interceptor=ic)
+net = MyBuilder.from_dir(ROOT, ic).build()   # コードで組む場合は Network(agents=[...], interceptor=ic)
 ```
 
 ### イベント一覧
@@ -1237,6 +1444,13 @@ def guard(*, name: str, kwargs: dict) -> bool | str:
 | `interceptor` が入る | 審査の実行が再び審査を呼び、止まらなくなる |
 
 `shared_memory=SharedMemory()` を自分で渡し、`interceptor` は渡さない。これで**審査役は、渡された名前と引数だけを見て判断します。**
+
+設定ファイルで組む場合は、審査役の設定を別のディレクトリに置き、interceptor を渡さずに別の `Network` として組み立てます。サンプルの `guard/` と、`network.py` の `build_compliance` がこの形です。
+
+```python
+def build_compliance() -> Agent:
+    return NetworkBuilder.from_dir(GUARD_ROOT).build()["compliance"]
+```
 
 `Network` に渡さないAgentがあっても検証には引っかかりません（誰からも呼ばれないAgentがあること自体は、エラーにしていません）。
 
@@ -1506,6 +1720,109 @@ ic.on.execute_start(lambda message: send_to_frontend(message))
 
 ---
 
+## 設定ファイルを使わずに組む
+
+`Agent` / `Tool` / `Network` は、設定ファイルを通さずにコードから直接作れます。`NetworkBuilder` が設定から作っているのも、これと同じものです。テストの中で組み立てる場合や、設定ファイルでは書けない項目（`disabled`、`describe_execution`、`initial_tools` に置くエージェント）を使う場合に向きます。
+
+```python
+import os
+
+from statecraft import Agent, GeminiLLM, Network, Tool
+
+
+def search_docs(keyword: str) -> dict:
+    """社内ドキュメントを検索する"""
+    return {"value": "..."}
+
+
+llm = GeminiLLM(api_key=os.environ["GEMINI_API_KEY"])
+
+worker = Agent(
+    name="worker",
+    summary="ドキュメントを調べて判断材料を揃える",
+    llm=llm,
+    model="gemini-3.5-flash-lite",
+    system_instruction="あなたは調査担当です。...",
+    tools=[Tool(func=search_docs, summary="社内ドキュメントを検索する")],
+)
+
+front = Agent(
+    name="front",
+    summary="利用者との窓口",
+    llm=llm,
+    model="gemini-3.5-flash-lite",
+    system_instruction="あなたは受付です。...",
+    sub_agent_names=["worker"],
+)
+
+net = Network(agents=[front, worker])
+response = front.respond(message="就業規則の有給の項目を教えて")
+
+print(response.text)
+print(net.total_tokens())  # (入力, 出力)
+```
+
+設定ファイルとの違いは2つです。
+
+- 接続（`llm`）を自分で作って渡します。設定ファイルの `provider` の代わりです。1つ作って全Agentで共有でき、モデル名は `model` 側で指定します
+- ツールの引数のスキーマを、関数の型ヒントから自動で作ります（下を参照）
+
+### 型ヒントからスキーマを作る
+
+関数をそのまま `Tool` に渡すだけで、**引数のJSON Schemaは型ヒントから自動生成されます。**
+
+```python
+def issue_ticket(title: str, member_id: str, tags: list[str], due: str | None = None) -> dict:
+    """チケットを発行する"""
+    return {"value": "TKT-00123 を発行しました"}
+
+
+Tool(
+    func=issue_ticket,
+    summary="チケットを発行する",
+    param_descriptions={
+        "title": "件名",
+        "member_id": "会員番号（M-で始まる）",
+        "tags": "分類タグ。空でよい",
+    },
+)
+```
+
+これが、LLMへ渡るスキーマになります。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "title": { "type": "string", "description": "件名" },
+    "member_id": { "type": "string", "description": "会員番号（M-で始まる）" },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "分類タグ。空でよい"
+    },
+    "due": { "type": "string" }
+  },
+  "required": ["title", "member_id", "tags"]
+}
+```
+
+読み取られるのは3つです。
+
+| 書いたもの | スキーマ |
+|---|---|
+| 型ヒント `list[str]` | `{"type": "array", "items": {"type": "string"}}` |
+| `param_descriptions` のキー | 同じ名前の引数の `description` |
+| **既定値のある引数** | `required` から外れる（`due` が入っていない） |
+
+`param_descriptions` に書かなかった引数（`due`）には `description` が付きません。単位、書式、想定される値の範囲など、**型に現れないもの**を書く欄です。
+
+**必須ではありません。** 引数名がそれ自体で分かる形になっていて（`member_id` / `due_date` のように）、制約を `usage` に書いてあるなら、設定しなくて構いません。
+
+`str | None` は `{"type": "string"}` になります（`null` は許容されません。省略させたい場合は既定値を付けて `required` から外します）。
+
+---
+
 ## テスト
 
 `tests/` にあります。**LLMのAPIは一切呼びません**（応答は偽のLLMへ台本として渡します）。
@@ -1557,7 +1874,8 @@ OpenAI / Claude のプロバイダ実装、記憶の引き継ぎ、結果を見�
 
 | | 内容 |
 |---|---|
-| [sampleの読み方.md](docs/sampleの読み方.md) | サンプル（`examples/`）の全体像、試せる質問集、自分のアプリに写す手順 |
+| [examples/library/](examples/library/) | 写して使う雛形。設定ファイルとコードに、なぜそう書いたかのコメントが付いている |
+| [sampleの読み方.md](docs/sampleの読み方.md) | サンプル（`examples/`）の全体像、1往復の流れ、試せる質問集、設計判断の理由 |
 
 
 

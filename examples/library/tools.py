@@ -6,6 +6,7 @@ LLMに見せる説明（summary / usage / evaluation）と引数のスキーマ�
 """
 
 import time
+from collections.abc import Callable
 
 RULES = """
 【貸出】
@@ -107,3 +108,17 @@ def send_overdue_notice(member_id: str) -> dict:
 def is_open_hours() -> bool:
     """開館時間内か。実行の可否を外部の状態で判断する例（Guardの③）。"""
     return 9 <= time.localtime().tm_hour < 20
+
+
+def make_sample_tool(*, max_results: int) -> Callable[[str], dict]:
+    """
+    config/tools.yaml の sample_tool（全項目の見本）の実装。
+
+    settings を持つツールは、settings をキーワード引数で受け取り、ツールの関数を
+    返す形で書く。図書館のツールは settings を持たないので、この形はここにしか無い。
+    """
+
+    def sample_tool(topic: str) -> dict:
+        return {"value": f"「{topic}」についての見本の結果（最大{max_results}件）"}
+
+    return sample_tool

@@ -1,6 +1,7 @@
 # ツールの定義。どのエージェントに持たせるかは agents.yaml に書く。
 # type はツールの実装（library/network.py の TOOL_FACTORIES）を指す。
 # 長い evaluation は prompts/tools/<名前>/evaluation.md に置いている。
+# 書ける項目を全部埋めた見本（sample_tool）が末尾にある。ツールを足すときはそこからコピーする。
 
 - name: search_rules
   type: search_rules
@@ -68,3 +69,30 @@
     properties:
       member_id: {type: string, description: 督促対象の会員番号}
     required: [member_id]
+
+# ---- 設定できる全項目の見本 ----
+# ツールを足すときは、ここをコピーして、要らない項目を消してから中身を書き換える。
+#
+# この見本も読み込まれる（知らない項目名は読み込みの時点でエラーになる）。
+# 実装は tools.py の make_sample_tool。agents.yaml の sample_agent だけが使う。
+#
+# 長い文章（usage / evaluation / execution_message）は、YAML に書く代わりに
+# prompts/tools/<名前>/<項目>.md に置ける（両方に書くとエラー）。
+- name: sample_tool             # LLM に見せる名前
+  type: sample_tool             # 実装の種類。network.py の TOOL_FACTORIES のキー
+  settings:                     # 実装を作る関数へキーワード引数で渡る。下の文章の {名前} にも入る
+    max_results: 3
+  summary: 見本のツール。最大{max_results}件を返す        # 使える全員に常時見える1行
+  usage: このツールを持つエージェントにだけ見える使い方
+  evaluation: 結果が返ってきた時に1回だけ添える、結果の読み方
+  # ここの {名前} だけは settings ではなく、実行時の引数で埋まる
+  execution_message: 「{topic}」を調べています...
+  parameters:                   # 引数の JSON Schema。書いたものがそのまま LLM へ渡る
+    type: object
+    properties:
+      # {名前} を含む文は {type: ..., description: ...} の1行の形に入れない
+      # （波かっこが YAML の文法として読まれる）。このように1行に1項目で書く
+      topic:
+        type: string
+        description: 何について調べるか。結果は最大{max_results}件
+    required: [topic]

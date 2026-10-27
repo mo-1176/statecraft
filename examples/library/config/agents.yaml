@@ -10,6 +10,8 @@
 #
 # 長い文章は prompts/agents/<名前>/<項目>.md に置いている。
 #
+# 書ける項目を全部埋めた見本（sample_agent）が末尾にある。エージェントを足すときはそこからコピーする。
+#
 # 改行を含めたくない長い説明は、"..." で囲み、行末の \ で折り返している
 # （\ で折り返すと、改行も空白も入らずにつながる）。改行を含めたいものは |- で書く。
 
@@ -164,3 +166,65 @@
           NOT_PERMITTED は、規程上できないと確認できた状態。\
           INTERNAL_ERROR は、内部の失敗により正常に処理できなかった状態"
     required: [status, blocking_reason]
+
+# ---- 設定できる全項目の見本 ----
+# エージェントを足すときは、ここをコピーして、要らない項目を消してから中身を書き換える。
+#
+# この見本も読み込まれる。知らない項目名は読み込みの時点でエラーになるので、
+# ここに並んでいる項目名は毎回検証されている（コピーすれば綴りを間違えない）。
+# 誰の sub_agents にも書いていないので、どのエージェントからも見えず、呼ばれない。
+# 値は見本のための仮のもの。数値は Agent の既定値と同じにしてある。
+#
+# 長い文章（system_instruction / usage / evaluation / execution_message）は、
+# YAML に書く代わりに prompts/agents/<名前>/<項目>.md に置ける（両方に書くとエラー）。
+- name: sample_agent
+  type: agent                   # agent（既定。記憶を持つ）か reflex（記憶を持たない）
+
+  # 他のエージェントが読むもの
+  summary: 見本のエージェント（何をするものかを1行で。委譲できる全員に常時見える）
+  usage: 委譲する側にだけ見える使い方。スキーマで表せない制約を書く
+  evaluation: 回答が返ってきた時に、受け取った側へ1回だけ添える読み方
+  input_schema:                 # 委譲する側に埋めさせる引数（JSON Schema）。省くと message だけ
+    type: object
+    properties:
+      topic: {type: string, description: 何について調べるか}
+    required: [topic]
+
+  # このエージェント自身の振る舞い
+  system_instruction: |-
+    あなたは見本のエージェントです。
+  provider: gemini              # LLM_FACTORIES のキー（gemini / openai / claude）
+  model: gemini-3.5-flash-lite
+  temperature: 0.2              # 既定は書かない（送らず、モデルの既定に任せる）。受け付けないモデルもある
+  max_tokens: 65535
+  thought_level: low            # none / minimal / low / medium / high / xhigh / max。書かなければモデル任せ
+  max_steps: 10
+  max_memory_retries: 3
+  max_stalled_steps: 2
+  phase_overrides:              # phase ごとの上書き。書かなかった項目はエージェント本体の設定のまま
+    initial_memory: {model: gemini-3.7-flash}
+    function_call: {model: gemini-3.5-flash-lite}
+    memory_update:              # 書ける項目は5つ
+      provider: gemini
+      model: gemini-3.7-flash
+      temperature: 0.2
+      max_tokens: 65535
+      thought_level: low
+    answer: {model: gemini-3.5-flash-lite}
+    cutoff_answer: {model: gemini-3.5-flash-lite}    # max_steps を使い切った時の回答
+    stalled_answer: {model: gemini-3.5-flash-lite}   # 停滞して打ち切った時の回答
+  output_schema:                # 自分の最終回答の形（JSON Schema）
+    type: object
+    properties:
+      status: {type: string, enum: [COMPLETE, PARTIAL]}
+    required: [status]
+
+  # つながり（名前で書く）
+  tools: [sample_tool]          # tools.yaml の名前
+  initial_tools: [sample_tool]  # ループ前にシステムが実行する。引数は input_schema の同名プロパティから渡る
+  sub_agents: [librarian]       # 委譲できるエージェント
+  knowledge: [terms]            # knowledges.yaml の名前。全phaseに載る
+  initial_knowledge: [terms]    # 初期記憶を作る時だけ載る
+
+  # 実行を観測するためのもの
+  execution_message: 見本のエージェントが「{topic}」を調べています...   # {名前} は実行時の引数で埋まる
