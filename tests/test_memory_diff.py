@@ -430,3 +430,26 @@ def test_依頼者への問いは調べる問いと別の置き場に入る(memo
     # 書き方の説明も、読む側の説明も、この欄の分が載る
     assert "■ questions_to_ask" in shared.writing_guide()
     assert "■ questions_to_ask" in shared.reading_guide()
+
+
+def test_依頼者の読みは総括と別の置き場に入る(memories):
+    """state_briefingは毎回追記されるので、依頼者の読みは別に置き、変わった時だけ書き換える。"""
+    shared, private = memories
+    apply_diff(
+        [
+            {"field": "user_back_grounds", "id": "依頼の読み", "text": "上限を知らないと読める"},
+            {"field": "state_briefing", "id": "brief-1", "text": "上限は10件と分かった"},
+        ],
+        shared,
+        private,
+    )
+    apply_diff(
+        [{"field": "user_back_grounds", "id": "依頼の読み", "text": "上限は知っていると分かった"}],
+        shared,
+        private,
+    )
+
+    assert [e.text for e in shared.user_back_grounds] == ["上限は知っていると分かった"]
+    assert [e.id for e in shared.state_briefing] == ["brief-1"]
+    assert "■ user_back_grounds" in shared.writing_guide()
+    assert "■ user_back_grounds" in shared.reading_guide()
