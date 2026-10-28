@@ -11,7 +11,14 @@ from types import SimpleNamespace
 import pytest
 
 from statecraft import llm as llm_module
-from statecraft.llm import OpenAILLM, _drop_absent, _strict_schema
+from statecraft.llm import (
+    CallOutcome,
+    Exchange,
+    OpenAILLM,
+    ThoughtLevel,
+    _drop_absent,
+    _strict_schema,
+)
 from statecraft.memory import PrivateMemory, SharedMemory, build_diff_schema
 
 DIFF_SCHEMA = build_diff_schema(SharedMemory, PrivateMemory)
@@ -292,3 +299,92 @@ def test_toolのstrictを断ったモデルはstrict無しで送り直す(make_l
     assert retry["tools"][0]["strict"] is False
     assert retry["tools"][0]["parameters"] == SEARCH_PARAMS
     assert res.function_calls[0].args == {"q": "x"}
+
+
+# ---- 思考の継承 ----
+def _plain(value):
+    if isinstance(value, SimpleNamespace):
+        return {k: _plain(v) for k, v in vars(value).items() if v is not None}
+    if isinstance(value, list):
+        return [_plain(v) for v in value]
+    return value
+
+
+class OutputItem(SimpleNamespace):
+    """outputのitem。本物（pydantic）と同じく、model_dumpで送り返す形にできる。"""
+
+    def model_dump(self, **_):
+        return _plain(self)
+
+
+REASONING = OutputItem(
+    type="reasoning",
+    id="rs_1",
+    summary=[SimpleNamespace(type="summary_text", text="まず検索する")],
+    encrypted_content="enc",
+)
+CALL = OutputItem(type="function_call", call_id="call_1", name="search", arguments='{"q": "x"}')
+
+
+def answer(text: str):
+    """送り返す形にできる回答（継承する生成は、出力をmodel_dumpで残すため）。"""
+    part = SimpleNamespace(type="output_text", text=text)
+    return _response(OutputItem(type="message", role="assistant", content=[part]))
+
+
+def test_継承する生成は思考の要約を求め出力を丸ごと残す(make_llm):
+    llm, responses = make_llm(_response(REASONING, CALL))
+
+    res = generate(
+        llm, tools=[search_tool(SEARCH_PARAMS)], thought_level=ThoughtLevel.LOW, exchanges=[]
+    )
+
+    sent = responses.requests[0]
+    assert sent["reasoning"] == {"effort": "low", "summary": "auto"}
+    assert sent["include"] == ["reasoning.encrypted_content"]
+    assert res.thoughts == "まず検索する"
+    # 思考と、それに続く呼び出し要求を順に残す
+    assert res.reply == [REASONING.model_dump(), CALL.model_dump()]
+
+
+def test_継承しない生成は要約もencrypted_contentも求めない(make_llm):
+    llm, responses = make_llm(message("回答"))
+
+    res = generate(llm)
+
+    assert "include" not in responses.requests[0]
+    assert "reasoning" not in responses.requests[0]
+    assert res.reply is None
+
+
+def test_過去の生成をinputの並びで送り返し結果を対にする(make_llm):
+    reply = [REASONING.model_dump(), CALL.model_dump()]
+    exchange = Exchange(
+        prompt="[function_call]", reply=reply, outcomes=[CallOutcome(text="実行済み")]
+    )
+    llm, responses = make_llm(answer("差分"))
+
+    generate(llm, exchanges=[exchange])
+
+    developer, *rest = responses.requests[0]["input"]
+    assert developer["role"] == "developer"
+    assert rest == [
+        {"role": "user", "content": "[function_call]"},
+        *reply,
+        {"type": "function_call_output", "call_id": "call_1", "output": "実行済み"},
+        {"role": "user", "content": [{"type": "input_text", "text": "依頼"}]},
+    ]
+
+
+def test_失敗した呼び出しはerrorのキーで包んで返す(make_llm):
+    exchange = Exchange(
+        prompt="[function_call]",
+        reply=[CALL.model_dump()],
+        outcomes=[CallOutcome(text="存在しません", is_error=True)],
+    )
+    llm, responses = make_llm(answer("差分"))
+
+    generate(llm, exchanges=[exchange])
+
+    result = responses.requests[0]["input"][-2]
+    assert json.loads(result["output"]) == {"error": "存在しません"}

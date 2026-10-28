@@ -25,6 +25,7 @@ Agent側には手を入れない。
 【構成】
     ThoughtLevel    どれくらい考えさせたいかの段階（プロバイダ非依存の語彙）
     LLMResponse     応答の共通形
+    Exchange        思考を継承するために送り返す、過去の生成1回分
     BaseLLM         全プロバイダが満たす契約
     GeminiLLM       以下、プロバイダごとの実装
     OpenAILLM
@@ -143,6 +144,14 @@ class LLMResponse:
     # これが無いと「モデルが何も返さなかった」と区別が付かない。
     stop_reason: str = ""
 
+    # 思考を継承する時に送り返す、プロバイダの出力そのもの（思考の署名を含む）。
+    # Agentは中身を見ずに預かり、次の生成へExchange.replyとして渡す。
+    # Noneなら、このプロバイダは継承に対応していない。
+    reply: Any = None
+    # 思考の要約。観測用で、送り返さない（思考そのものは署名から戻る）。
+    # 継承する生成でだけ要求する。
+    thoughts: str = ""
+
     execution_time: float = (
         0.0  # API応答にかかった時間（秒）。with_timingが自動で埋める
     )
@@ -157,6 +166,36 @@ class LLMResponse:
         呼び出し側は「has_callsがFalse かつ textも空」でその状態を判定する。
         """
         return bool(self.function_calls)
+
+
+@dataclass
+class CallOutcome:
+    """
+    過去の呼び出し要求に対にして送り返す結果。
+
+    生の戻り値ではなく、実行したかどうかだけを入れる（Agentが作る）。
+    """
+
+    text: str
+    is_error: bool = False
+
+
+@dataclass
+class Exchange:
+    """
+    思考を継承するために送り返す、過去の生成1回分。
+
+    プロバイダの思考は、取り出して別の場所へ入れることができない。前の出力を
+    思考の署名ごと会話として送り返した時にだけ、元の思考が文脈へ戻る。
+    """
+
+    # その生成で送った発話。Agentが縮めたもので、送った全文ではない。
+    prompt: str
+    # その生成のLLMResponse.reply。中身を解釈するのは、作ったプロバイダだけ。
+    reply: Any
+    # replyに含まれる呼び出し要求と同じ順の結果。直後の発話の先頭で返す
+    # （呼び出し要求に結果を対にしないと、プロバイダが断る）。
+    outcomes: list[CallOutcome] = field(default_factory=list)
 
 
 @dataclass
@@ -515,8 +554,20 @@ class BaseLLM(ABC):
         temperature: float | None,
         max_tokens: int,
         thought_level: ThoughtLevel | None = None,
+        # 思考を継承する時の、過去の生成。promptより前に会話として送り返す。
+        #   None … 継承しない（毎回1問1答）。Agentはこの時、引数自体を渡さない
+        #   []   … 継承するが、送り返すものがまだ無い（応答のreplyは必要）
+        # 対応していないプロバイダは、Noneでなければ例外にする（黙って
+        # 無視すると「継承したつもりで1問1答」になる）。
+        exchanges: list[Exchange] | None = None,
     ) -> LLMResponse:
         pass
+
+
+_CARRY_UNSUPPORTED = (
+    "思考の継承（carry_thoughts）は、今はGeminiLLMとOpenAILLMだけが対応しています。"
+    "{cls}で動くエージェントでは、carry_thoughtsを外してください。"
+)
 
 
 # ---- 2. Gemini 統合クラス（AI Studio / Vertex AI 両対応） ----
@@ -607,6 +658,42 @@ class GeminiLLM(BaseLLM):
                 declarations.append(t)
         return [types.Tool(function_declarations=declarations)]
 
+    def _carried_contents(self, exchanges: list[Exchange]) -> tuple[list[Any], list[Any]]:
+        """
+        過去の生成を、思考の署名つきの会話へ戻す。
+        返り値は（会話、今回のuserターンの先頭に置く呼び出しの結果）。
+
+        replyは前の生成が返したContentそのもの（思考の要約は外し、署名は残してある）。
+        署名を送り返すと、元の思考が全量で文脈へ戻り、入力トークンとして課金される。
+        別のモデルが作った署名は、APIが黙って捨てる（実測。エラーにはならない）。
+
+        呼び出し要求には、直後のuserターンで同じ数の結果を返す。
+        """
+        contents = []
+        pending: list[Any] = []
+        for ex in exchanges:
+            contents.append(
+                types.Content(
+                    role="user", parts=[*pending, types.Part.from_text(text=ex.prompt)]
+                )
+            )
+            contents.append(ex.reply)
+            calls = [p.function_call for p in ex.reply.parts or [] if p.function_call]
+            # 数が合わないのはAgent側の誤り。黙って詰めると、どの呼び出しの
+            # 結果なのかが入れ違ったまま送られる。
+            pending = [
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        id=call.id,
+                        name=call.name,
+                        # Geminiの決まり。成功はoutput、失敗はerrorに入れる。
+                        response={"error" if o.is_error else "output": o.text},
+                    )
+                )
+                for call, o in zip(calls, ex.outcomes, strict=True)
+            ]
+        return contents, pending
+
     @with_timing
     def generate(
         self,
@@ -625,6 +712,7 @@ class GeminiLLM(BaseLLM):
         temperature: float | None,
         max_tokens: int,
         thought_level: ThoughtLevel | None = None,
+        exchanges: list[Exchange] | None = None,
     ) -> LLMResponse:
         # --- ① 会話履歴をGeminiの形へ変換する -------------------------------
         # 共通形式を Content(role=..., parts=[...]) の列へ移す。
@@ -637,6 +725,13 @@ class GeminiLLM(BaseLLM):
             for role, text in _normalize_messages(messages)
         ]
 
+        # 思考を継承する場合は、過去の生成を会話として続ける。直前の生成の
+        # 呼び出し要求に対にする結果は、今回のuserターンの先頭に置く。
+        carried_results: list[Any] = []
+        if exchanges:
+            carried, carried_results = self._carried_contents(exchanges)
+            contents.extend(carried)
+
         # --- ② 今回のターンを1つのuserメッセージとして足す -------------------
         # 添付と本文を同じuserターンにまとめ、履歴の後ろへ足す
         # （promptとmessagesは併用される。片方を捨ててはならない）。
@@ -646,7 +741,7 @@ class GeminiLLM(BaseLLM):
         #
         # inline_dataはリクエスト全体のサイズ上限（20MB程度）に収まる必要が
         # ある。長い音声や動画はFiles API（Part.from_uri）が別途必要。
-        current_parts = []
+        current_parts = list(carried_results)
         for blob in blobs or []:
             current_parts.append(
                 types.Part.from_bytes(data=blob["data"], mime_type=blob["mime_type"])
@@ -658,6 +753,12 @@ class GeminiLLM(BaseLLM):
 
         # --- ③ 思考の強さを、このモデル系列が受け取れる形へ変換する ----------
         thinking_config = self._build_thinking_config(thought_level)
+        if exchanges is not None:
+            # 継承する生成では思考の要約も受け取る。見えない思考が次の判断に
+            # 効くようになるので、せめて何を考えていたかを観測できるようにする。
+            thinking_config = (thinking_config or types.ThinkingConfig()).model_copy(
+                update={"include_thoughts": True}
+            )
 
         # --- ④ ツール定義を変換し、呼び出しを強制するかを決める --------------
         # "any"  … 必ずどれかを呼ばせる（Agentがtasksで対象を絞った時）
@@ -721,12 +822,16 @@ class GeminiLLM(BaseLLM):
         # --- ⑨ テキスト部分だけを取り出す ------------------------------------
         # response.text という近道は、応答に呼び出し要求が含まれていると
         # 警告を出す。テキストのパートだけを拾えば警告なしで同じ結果になる。
+        # 思考の要約（thought=True）も同じtextのパートで届くので、回答へ混ぜない。
         texts = []
+        thoughts = []
         for candidate in response.candidates or []:
             content = getattr(candidate, "content", None)
             for part in getattr(content, "parts", None) or []:
                 if getattr(part, "text", None):
-                    texts.append(part.text)
+                    (thoughts if getattr(part, "thought", False) else texts).append(
+                        part.text
+                    )
 
         # --- ⑩ 終了理由を共通語彙へ移す --------------------------------------
         # 安全側の判断や上限での打ち切りは、例外ではなく「本文の無い応答」
@@ -737,6 +842,13 @@ class GeminiLLM(BaseLLM):
             _GEMINI_STOP_REASONS,
         )
 
+        # --- ⑪ 送り返す形を残す ----------------------------------------------
+        # 思考の要約は外し、署名の付いたパートだけを残す（署名から思考が戻るので、
+        # 要約まで送ると同じ思考を二重に読ませる）。
+        content = getattr(candidates[0], "content", None) if candidates else None
+        kept = [p for p in getattr(content, "parts", None) or [] if not p.thought]
+        reply = types.Content(role="model", parts=kept) if kept else None
+
         return LLMResponse(
             text="".join(texts),
             function_calls=calls,
@@ -744,6 +856,8 @@ class GeminiLLM(BaseLLM):
             output_tokens=output_tokens,
             cached_tokens=cached_tokens,
             stop_reason=stop_reason,
+            reply=reply,
+            thoughts="".join(thoughts),
         )
 
     @with_timing
@@ -985,6 +1099,7 @@ class OpenAILLM(BaseLLM):
         temperature: float | None,
         max_tokens: int,
         thought_level: ThoughtLevel | None = None,
+        exchanges: list[Exchange] | None = None,
     ) -> LLMResponse:
         # 出力の構造は、text.formatのstrictなjson_schemaで強制する。strictは
         # ルートがオブジェクトで全項目が必須のスキーマしか受け付けないため、
@@ -997,11 +1112,13 @@ class OpenAILLM(BaseLLM):
         if response_schema and structured is None:
             blocks = _with_last_block(blocks, _json_only_instruction(response_schema))
 
-        # 過去の履歴 → 今回のターン、の順で組み立てる。
+        # 過去の履歴 → 継承する過去の生成 → 今回のターン、の順で組み立てる。
         conversation = [
             {"role": role, "content": text}
             for role, text in _normalize_messages(messages)
         ]
+        if exchanges:
+            conversation.extend(self._carried_items(exchanges))
 
         if prompt or blobs:
             content = self._format_blobs(blobs or [])
@@ -1037,6 +1154,12 @@ class OpenAILLM(BaseLLM):
         # 対応表は持たない——受け付ける値がモデルごとに違うため。
         if thought_level is not None:
             kwargs["reasoning"] = {"effort": thought_level.name.lower()}
+        if exchanges is not None:
+            # 継承する生成では思考の要約も受け取る（観測用。送り返すのは
+            # encrypted_contentだけ）。store=Falseでもencrypted_contentは既定で
+            # 付くが、includeでも明示しておく（古い仕様のままの互換先に備える）。
+            kwargs["reasoning"] = {**kwargs.get("reasoning", {}), "summary": "auto"}
+            kwargs["include"] = ["reasoning.encrypted_content"]
 
         # strictを断られたら、そのモデルを覚えてstrict無しで送り直す。
         # 出力とtoolの両方を断られる場合に備えて、2回まで落とす。
@@ -1114,6 +1237,22 @@ class OpenAILLM(BaseLLM):
         if structured and text:
             text = _from_strict_text(text, response_schema, wrapped=structured[1])
 
+        # 継承する生成では、outputの全itemを送り返す形で残す。reasoningだけを
+        # 抜き出さないのは、思考と、それに続く回答・呼び出し要求を順に並べて
+        # 返すのが決まりのため。
+        reply = None
+        thoughts = ""
+        if exchanges is not None:
+            reply = [
+                item.model_dump(exclude_none=True, mode="json") for item in response.output
+            ] or None
+            thoughts = "".join(
+                s.text
+                for item in response.output
+                if item.type == "reasoning"
+                for s in item.summary or []
+            )
+
         return LLMResponse(
             text=text,
             function_calls=calls,
@@ -1122,7 +1261,42 @@ class OpenAILLM(BaseLLM):
             cached_tokens=cached_tokens,
             cache_write_tokens=cache_write_tokens,
             stop_reason=stop_reason,
+            reply=reply,
+            thoughts=thoughts,
         )
+
+    @staticmethod
+    def _carried_items(exchanges: list[Exchange]) -> list[dict]:
+        """
+        過去の生成を、inputのitemの並びへ戻す。
+
+        replyは前の生成のoutputそのもの（reasoningのencrypted_contentを含む）。
+        送り返すと元の思考が全量で文脈へ戻り、入力トークンとして課金される
+        （gpt-6-lunaで実測）。前のターンの思考まで戻すのは、reasoning.contextが
+        all_turnsのモデル（GPT-5.6以降など）だけで、それより前のモデルでは
+        APIが戻さない。別の系列のモデルが作った思考も、APIが黙って外す。
+
+        呼び出し要求（function_call）には、同じcall_idの結果を続けて返す。
+        """
+        items: list[dict] = []
+        for ex in exchanges:
+            items.append({"role": "user", "content": ex.prompt})
+            items.extend(ex.reply)
+            calls = [i for i in ex.reply if i.get("type") == "function_call"]
+            # 数が合わないのはAgent側の誤り（GeminiLLMと同じく黙って詰めない）。
+            for call, o in zip(calls, ex.outcomes, strict=True):
+                items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call["call_id"],
+                        # 成功と失敗を分ける欄が無いので、失敗はerrorのキーで包む
+                        # （Geminiのresponse={"error": ...}と同じ形）。
+                        "output": json.dumps({"error": o.text}, ensure_ascii=False)
+                        if o.is_error
+                        else o.text,
+                    }
+                )
+        return items
 
     @with_timing
     def embed(
@@ -1382,7 +1556,13 @@ class ClaudeLLM(BaseLLM):
         temperature: float | None,
         max_tokens: int,
         thought_level: ThoughtLevel | None = None,
+        exchanges: list[Exchange] | None = None,
     ) -> LLMResponse:
+        # 思考の継承はまだ実装していない（thinking blockをsignatureごと送り返す
+        # 形になる。実機で確かめられるまで入れない）。
+        if exchanges is not None:
+            raise NotImplementedError(_CARRY_UNSUPPORTED.format(cls=type(self).__name__))
+
         # 過去の履歴 → 今回のターン、の順で組み立てる。
         # 値がAnyなのは、contentが文字列（履歴）とブロックのリスト
         # （添付を含む今回のターン）の両方を取るため。
