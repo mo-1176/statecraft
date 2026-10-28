@@ -80,8 +80,8 @@ def sent_text(call: dict) -> str:
     return "\n".join(parts)
 
 
-# ---- 既定では何も変えない ----
-def test_既定では過去の生成を送り返さない():
+# ---- オフなら今までと同じ ----
+def test_オフなら過去の生成を送り返さない():
     llm = FakeLLM(one_round_trip())
     agent = build_agent(llm, carry_thoughts=False)
 

@@ -566,7 +566,7 @@ class BaseLLM(ABC):
 
 _CARRY_UNSUPPORTED = (
     "思考の継承（carry_thoughts）は、今はGeminiLLMとOpenAILLMだけが対応しています。"
-    "{cls}で動くエージェントでは、carry_thoughtsを外してください。"
+    "{cls}で動くエージェントでは、carry_thoughtsをFalseにしてください（既定はTrue）。"
 )
 
 

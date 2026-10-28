@@ -100,13 +100,13 @@ def test_設定どおりにエージェントがそろう():
     assert net["front"].sub_agent_names == ["scout"]
 
 
+def test_思考の継承は設定で止められる():
+    net = build(agent("a", carry_thoughts=False), agent("b"))
 
-def test_思考の継承は設定で有効にできる():
-    net = build(agent("a", carry_thoughts=True), agent("b"))
+    assert net["a"].carry_thoughts is False
+    # 書かなければAgentの既定値（継承する）
+    assert net["b"].carry_thoughts is True
 
-    assert net["a"].carry_thoughts is True
-    # 書かなければAgentの既定値（継承しない）
-    assert net["b"].carry_thoughts is False
 
 def test_ツール名は設定のnameになる():
     """同じtypeから、settingsだけ変えた別のツールを作れる。"""
