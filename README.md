@@ -91,7 +91,7 @@ pip install -e ".[gemini]"
 
 ```bash
 pip install -e ".[gemini]"    # Gemini（サンプルはこれで動く）
-pip install -e ".[openai]"    # OpenAI
+pip install -e ".[openai]"    # OpenAI / Azure OpenAI
 pip install -e ".[claude]"    # Claude
 pip install -e ".[gemini,claude]"   # 複数でもよい
 ```
@@ -541,9 +541,26 @@ def make_sample_tool(*, max_results: int) -> Callable[[str], dict]:
 
 YAML に関数の場所（モジュール名）を書く形にしていないのは、設定を書き換えられる人が、登録されていない関数を組み立て時に呼べないようにするためです。
 
-`provider` の `gemini` / `openai` / `claude` は最初から登録されています。API キーは YAML に書かず、環境変数（`GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`）に置いてください。各 SDK がそこから読みます。それ以外の provider を使う場合は、既定の対応表に足します。
+`provider` の `gemini` / `openai` / `claude` / `azure_openai` は最初から登録されています。API キーは YAML に書かず、環境変数（`GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`）に置いてください。各 SDK がそこから読みます。
+
+`azure_openai` は接続先も要るので、`AZURE_OPENAI_ENDPOINT`（`https://<リソース名>.openai.azure.com`）と `AZURE_OPENAI_API_KEY` を置きます。`model` には、モデル名ではなく Azure で付けたデプロイ名を書きます。
+
+それ以外の provider を使う場合や、繋ぎ方を変える場合は、既定の対応表に足します（同じ名前なら上書きです）。次は `azure_openai` を、キーではなく Microsoft Entra ID で認証する例です。`azure-identity` は別に入れてください。
 
 ```python
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+
+from statecraft import AzureOpenAILLM
+
+
+def make_azure_llm() -> AzureOpenAILLM:
+    # トークンには期限があるので、文字列ではなく取得する関数を渡す（リクエストごとに呼ばれる）
+    token_provider = get_bearer_token_provider(
+        DefaultAzureCredential(), "https://ai.azure.com/.default"
+    )
+    return AzureOpenAILLM(token_provider=token_provider)
+
+
 class LibraryBuilder(NetworkBuilder):
     TOOL_FACTORIES = {...}   # 上と同じ
     LLM_FACTORIES = {**NetworkBuilder.LLM_FACTORIES, "azure_openai": make_azure_llm}
@@ -762,6 +779,7 @@ agents.yaml では、ほとんどを同じ名前で書きます。違うのは `
 | `max_tokens` | `int` | 既定 65535 |
 | `thought_level` | `ThoughtLevel \| None` | `None` ならモデルの動的思考（既定） |
 | `phase_overrides` | `dict[Phase, GenerationConfig]` | phaseごとの生成設定の上書き |
+| `carry_thoughts` | `bool` | 前の生成の思考を次の生成へ継承するか（既定 `False`）。`reset()` まで持ち続ける。今は `GeminiLLM` のみ（→ [思考の継承](#思考の継承)） |
 | `disabled` | `bool` | `True` の間は選択肢として提示されない |
 
 **② 他のAIが読むもの** — このAgentを呼ぶ側のLLMのプロンプトへ載り、判断の材料になります。
@@ -1135,6 +1153,41 @@ OpenAI の strict は、ルートがオブジェクトで、全項目が必須�
 **指定した段階は、そのまま送られます。** モデルによって受け取れる段階が違う（`gemini-3.1-flash-lite` は `minimal` / `low` / `medium` で `HIGH` が無い等）ため、対応しない段階を送るとAPIがエラーを返します。
 
 `NONE` は `gemini-2.5` 系向けです。3系には相当する語彙が無いので、最小にしたい場合は `MINIMAL` を使ってください。
+
+#### 思考の継承
+
+`carry_thoughts=True`（設定ファイルでは `carry_thoughts: true`）にすると、**前の生成の思考が次の生成へ引き継がれます。** memory では運びきれない文脈を、思考が運びます。
+
+既定では、生成は phase ごとに独立した1問1答です。思考は、取り出して別の場所へ入れることができません。前の出力を思考の署名ごと会話として送り返した時にだけ、プロバイダ側で元の思考が文脈へ戻ります。そのため、継承する Agent は過去の生成を次の形で積み、毎回の生成の前に置きます。
+
+```
+user       [initial_memory]
+assistant  （思考）+ memory の差分
+user       [function_call]
+assistant  （思考）+ search_rules(topic="貸出")
+user       search_rules → 実行済み
+           [memory_update]
+assistant  （思考）+ memory の差分
+  …
+user       今回の発話（今までと同じ: 現在の memory 全体・実行履歴・今回の実行結果・現在時刻）
+```
+
+- **過去の発話は縮めて積みます。** memory の全体と実行履歴は、今回の発話が最新のものを載せるので、過去の発話には残しません。委譲された起動では、最初の生成にだけ依頼内容を残します（次の起動では今回の発話に載らなくなるため）。
+- **tool の生の戻り値は会話に残りません。** 呼び出し要求に対にする結果は「実行済み」かエラーだけです。戻り値を見せるのは、今までどおり評価する1回の生成（【今回の実行結果】）だけです。
+- **`reset()` まで持ち続けます。** 同じ Network のリクエストの中で同じエージェントが再び呼ばれると、前の起動の思考も受け取ります。
+- **接続やモデルが変わると捨てられます。** `phase_overrides` で別の `llm` を使う phase の出力は、互いに送りません。同じ接続でモデルだけが違う場合は送りますが、読めない思考はプロバイダが黙って捨てます。
+- **戻った思考は、毎回入力トークンとして課金されます。** 生成のたびに、それまでの思考の合計の分だけ入力が伸びます。
+- **思考の要約を `generated` イベントの `thoughts` で見られます。** 継承した思考は次の判断に効くのに中身が見えないので、要約で観測します。
+- **考えなかった生成からは、継承するものがありません。** `thought_level` が低いと、モデルは考えずに答えることがあります（`gemini-3.7-flash` の `low` では、思考が0のまま答えるのを実測しています）。その場合に積まれるのは、縮めた発話と出力だけです。`thoughts` が空のまま続く時は、`thought_level` を見直してください。
+
+対応しているのは `GeminiLLM` と `OpenAILLM` です。`ClaudeLLM` で `carry_thoughts` を有効にすると、最初の生成で `NotImplementedError` になります（黙って1問1答で動かすと、継承したつもりのまま気付けないため）。`AzureOpenAILLM` は `OpenAILLM` と同じ形で送りますが、Azure で受け付けるかは確かめていません。
+
+プロバイダごとの違いは次のとおりです。
+
+| | 前の生成の思考が戻る条件 | 積んだ会話のキャッシュ |
+|---|---|---|
+| Gemini | 同じモデルの生成どうし | 暗黙のキャッシュに乗る（会話が後ろへ伸びるだけなので、先頭が一致する） |
+| OpenAI | `reasoning.context` が `all_turns` のモデル（GPT-5.6 以降。`gpt-6-luna` は既定で `all_turns` なのを実測）。それより前のモデルは、前の生成の思考を戻さない | 乗らない。区切りを打っているのは system の段だけなので、会話の分は毎回キャッシュ無しの入力になる |
 
 ### プロンプトキャッシュ
 
@@ -1675,6 +1728,7 @@ ic.on.executed(lambda e: edges.append(e) if e.callee_run_id else None)
 | `error` | 失敗した試行では例外の内容。成功した試行では空文字 |
 | `run_id` | この生成がどの起動の中で走ったか。`ExecuteEvent.callee_run_id` と一致する |
 | `stop_reason` | なぜ生成が終わったか。`"end"` / `"tool_use"` / `"max_tokens"` / `"refusal"` など。例外で失敗した試行では空文字 |
+| `thoughts` | 思考の要約。`carry_thoughts` の Agent の生成でだけ入る（→ [思考の継承](#思考の継承)） |
 
 ```python
 def measure(event) -> None:
@@ -1861,7 +1915,7 @@ Geminiでの1往復、委譲、初期ツール、入力/出力スキーマ、実
 
 **未検証**
 
-OpenAI / Claude のプロバイダ実装、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）
+OpenAI / Azure OpenAI / Claude のプロバイダ実装（Azure OpenAI は、本物の SDK からローカルの代役サーバーへ送り、接続先・認証・キャッシュの区切りの扱いまで確認済み）、思考の継承（Gemini と OpenAI〔gpt-6-luna〕では、サンプルの図書館を通しで動かし、委譲・tool・記憶の更新・ReflexAgent を含めて API が受け付けることまで確認済み。Azure OpenAI は未確認。回答が良くなるかは未検証）、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）
 
 ---
 

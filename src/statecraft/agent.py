@@ -33,7 +33,14 @@ from uuid import uuid4
 
 from .interceptor import Interceptor
 from .invokable import Invokable
-from .llm import BaseLLM, FunctionCall, LLMResponse, ThoughtLevel
+from .llm import (
+    BaseLLM,
+    CallOutcome,
+    Exchange,
+    FunctionCall,
+    LLMResponse,
+    ThoughtLevel,
+)
 from .memory import (
     DIFF_EXAMPLE,
     DISABLE_FIELD,
@@ -235,6 +242,10 @@ class GenerationEvent:
     # 「同じphaseの生成が何度も並んでいる」理由が内訳から読めない。
     stop_reason: str = ""
 
+    # 思考の要約。carry_thoughtsの時だけ入る（それ以外は要求しないので空）。
+    # 継承した思考は次の判断に効くのに中身が見えないため、ここで観測する。
+    thoughts: str = ""
+
 
 @dataclass
 class ExecuteEvent:
@@ -368,6 +379,18 @@ class ToolHistoryEntry:
         if self.evaluation:
             body += f"\n    【この結果の解釈】{self.evaluation}"
         return body
+
+    def outcome(self) -> CallOutcome:
+        """
+        思考を継承する時、過去の呼び出し要求に対にして送り返す結果。
+
+        生の戻り値は入れず、実行したかどうかだけにする。戻り値は評価する1回の
+        生成にだけ見せ、以降はmemoryと実行履歴が担う。会話に残すと、以降の
+        すべての生成に生データが積もる。エラーは実行履歴と同じく常に見せる。
+        """
+        if not self.result.success:
+            return CallOutcome(text=self.result.error or "", is_error=True)
+        return CallOutcome(text="実行済み")
 
     def _render_schema_note(self) -> str:
         """
@@ -509,6 +532,17 @@ class Agent:
     # phaseごとの生成設定の上書き。指定しなかったphaseは上の既定値を使う。
     #   phase_overrides={Phase.INITIAL_MEMORY: GenerationConfig(llm=flash_lite)}
     phase_overrides: dict[Phase, GenerationConfig] = field(default_factory=dict)
+    # 前の生成の思考を、次の生成へ継承するか。reset()まで持ち続ける。
+    #
+    # 各社のAPIは、前の出力を思考の署名ごと会話として送り返す前提で作られて
+    # いて、memoryでは運びきれない文脈を思考が運ぶ。送り返すのは、縮めた発話・
+    # 出力（memoryの差分や引数つきの呼び出し）・実行したという事実だけで、
+    # toolの生の戻り値は会話に残さない（_keep_exchange / ToolHistoryEntry.outcome）。
+    #
+    # 戻った思考は毎回入力トークンとして課金されるので、生成のたびに伸びる。
+    # 違う接続（phase_overridesのllm）が作った分は送らず、同じ接続でも
+    # モデルが違えばプロバイダ側で捨てられる。対応するのはGeminiLLMとOpenAILLM。
+    carry_thoughts: bool = False
     # ループ開始前に機械的に1回だけ実行するtool / agent（判断させないので生成が
     # 1回分減る）。引数はinput_schemaの同名プロパティから渡される。
     #
@@ -581,6 +615,14 @@ class Agent:
     # toolが返した添付の蓄積。文字起こしする先を持たないReflexAgentが
     # 以降も見せ続けるために使う（記憶を持つAgentは1回渡して終わり）。
     _carried_blobs: list = field(default_factory=list)
+    # carry_thoughtsで送り返す過去の生成。(作った接続, やり取り) の並び。
+    # 起動をまたいでreset()まで持ち続ける。
+    _exchanges: list = field(default_factory=list)
+    # 呼び出し要求を返した生成。実行結果が揃うまで_exchangesへ入れない
+    # （結果を対にしていない呼び出し要求は、送り返すとプロバイダが断る）。
+    _awaiting_outcomes: tuple | None = None
+    # この起動で何回生成したか。最初の生成の発話にだけ依頼内容を残すために使う。
+    _run_generations: int = 0
 
     def get_tool(self, name: str) -> Tool | None:
         """名前からToolを引く。辞書はここで都度、実体（func.__name__）から導出する。"""
@@ -695,6 +737,10 @@ class Agent:
         self._step_no = 1
         self._carried_blobs = []
         self.current_run_id = ""
+        # 継承する思考も、次のリクエストへは持ち込まない。
+        self._exchanges = []
+        self._awaiting_outcomes = None
+        self._run_generations = 0
 
     # ---- 起動の入り口 ----
     def _begin_run(self, run_input: RunInput) -> None:
@@ -704,6 +750,7 @@ class Agent:
 
         tasksを捨てるのは必須。status=nextのまま残ると_select_invokablesが
         拾い、前回の依頼のためのtool実行が起きる。goalsとshared_memoryは残す。
+        継承する思考（carry_thoughts）も残す。
         """
         self.current_input = run_input
         self.tool_history = []
@@ -726,6 +773,10 @@ class Agent:
         self.current_run_id = uuid4().hex[:12]
         # 前回の依頼で取得した添付を持ち越さない。
         self._carried_blobs = []
+        # 前の起動が実行の手前で終わった場合、結果の無い呼び出し要求が残る。
+        # 送り返せない（プロバイダが断る）ので、ここで捨てる。
+        self._awaiting_outcomes = None
+        self._run_generations = 0
 
     def respond(
         self,
@@ -984,6 +1035,8 @@ class Agent:
             # --- 実際に呼ぶ ---
             # 無効化の確認、重複の拒否、実行前判定はこの中で行われる。
             entries = self._execute_calls(response.function_calls)
+            # 結果を評価する生成より前に、呼び出し要求と結果を対にして残す。
+            self._close_exchange(entries)
 
             # 結果を評価して記憶へ書く。同時に「進んでいるか」も判定する。
             # 進んでいないと判断されたらTrueが返り、打ち切る。
@@ -1224,6 +1277,12 @@ class Agent:
         # 実際に使うモデル。再試行で差し替わりうるので、cfgとは別に持つ。
         model = cfg.model
 
+        # 継承しないなら引数自体を渡さない（exchangesを知らない自作のLLMも動く）。
+        # 送るのは同じ接続が作った分だけ。別のプロバイダの出力は読めない。
+        carried = {}
+        if self.carry_thoughts:
+            carried["exchanges"] = [ex for llm, ex in self._exchanges if llm is cfg.llm]
+
         attempt = 0
         while True:
             attempt += 1
@@ -1259,6 +1318,7 @@ class Agent:
                     temperature=cfg.temperature,
                     max_tokens=cfg.max_tokens,
                     thought_level=cfg.thought_level,
+                    **carried,
                 )
             except Exception as e:
                 # 失敗した試行も計測として流す（落とすと再試行に費やした時間が
@@ -1315,9 +1375,52 @@ class Agent:
                 step_no=self._step_no,
                 run_id=self.current_run_id,
                 stop_reason=response.stop_reason,
+                thoughts=response.thoughts,
             )
         )
+        if self.carry_thoughts:
+            self._keep_exchange(phase, cfg.llm, response)
+        self._run_generations += 1
         return response
+
+    def _keep_exchange(self, phase: Phase, llm: BaseLLM, response: LLMResponse) -> None:
+        """
+        この生成を、次の生成へ送り返すやり取りとして残す（carry_thoughts）。
+
+        発話は縮めて残す。memoryの全体・実行履歴・toolの生の戻り値は、毎回の
+        発話が最新のものを載せるので、過去の発話には残さない。思考はそれを
+        読み取った結果を運ぶもので、読み取った元まで積み直す必要は無い。
+
+        依頼内容だけは、委譲された起動の最初の生成に残す。次の起動では今回の
+        発話に載らなくなり、前の起動の思考が何の依頼についてのものか分からなく
+        なるため（利用者からの依頼は、shared_memory.conversationに残り続ける）。
+        """
+        if response.reply is None:
+            return
+        run = self.current_input or RunInput(message="")
+        first = self._run_generations == 0
+        prompt = join_sections(
+            section("依頼内容", run.message if first and not run.from_user else ""),
+            f"[{phase.value}]",
+        )
+        exchange = Exchange(prompt=prompt, reply=response.reply)
+        if response.has_calls:
+            self._awaiting_outcomes = (llm, exchange)
+        else:
+            self._exchanges.append((llm, exchange))
+
+    def _close_exchange(self, entries: list[ToolHistoryEntry]) -> None:
+        """
+        呼び出し要求を返した生成に、呼び出し順の結果を対にして残す。
+
+        _execute_callsは要求1件につき1件の記録を、要求の順に返す。
+        """
+        if self._awaiting_outcomes is None:
+            return
+        llm, exchange = self._awaiting_outcomes
+        self._awaiting_outcomes = None
+        exchange.outcomes = [e.outcome() for e in entries]
+        self._exchanges.append((llm, exchange))
 
     # ---- memoryの更新 ----
     def _writable_memories(self) -> tuple:

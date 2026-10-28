@@ -9,8 +9,9 @@
 
     net = MyBuilder.from_dir("path/to/root").build()
 
-LLMは組み込みのプロバイダ（gemini / openai / claude）を最初から登録してある。
-APIキーは各SDKが環境変数から読む。それ以外のプロバイダを使うときは足す。
+LLMは組み込みのプロバイダ（gemini / openai / claude / azure_openai）を最初から
+登録してある。APIキーは環境変数から読む。それ以外のプロバイダを使うときや、
+繋ぎ方を変えるとき（キーではなくEntra IDで認証する等）は、足すか上書きする。
 
     LLM_FACTORIES = {**NetworkBuilder.LLM_FACTORIES, "azure_openai": make_azure}
 
@@ -25,7 +26,14 @@ from typing import ClassVar, Self, TypeVar
 from .agent import Agent, GenerationConfig, ReflexAgent
 from .config import AgentConfig, GenerationOverride, NetworkConfig, ThoughtLevelName
 from .interceptor import Interceptor
-from .llm import BaseLLM, ClaudeLLM, GeminiLLM, OpenAILLM, ThoughtLevel
+from .llm import (
+    AzureOpenAILLM,
+    BaseLLM,
+    ClaudeLLM,
+    GeminiLLM,
+    OpenAILLM,
+    ThoughtLevel,
+)
 from .network import Network
 from .tools import SchemaTool
 
@@ -35,11 +43,14 @@ T = TypeVar("T")
 class NetworkBuilder:
     TOOL_FACTORIES: ClassVar[dict[str, Callable[..., Callable]]] = {}
     # api_keyを渡さなければ、SDKが環境変数（GEMINI_API_KEY / OPENAI_API_KEY /
-    # ANTHROPIC_API_KEY）から読む。SDKはproviderを使うときに初めて読み込まれる。
+    # ANTHROPIC_API_KEY）から読む。azure_openaiは接続先も要るので、
+    # AzureOpenAILLMがAZURE_OPENAI_ENDPOINTとAZURE_OPENAI_API_KEYから読む。
+    # SDKはproviderを使うときに初めて読み込まれる。
     LLM_FACTORIES: ClassVar[dict[str, Callable[[], BaseLLM]]] = {
         "gemini": GeminiLLM,
         "openai": OpenAILLM,
         "claude": ClaudeLLM,
+        "azure_openai": AzureOpenAILLM,
     }
     AGENT_CLASSES: ClassVar[dict[str, type[Agent]]] = {
         "agent": Agent,

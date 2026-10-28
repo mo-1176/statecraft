@@ -208,6 +208,7 @@ class AgentConfig(ConfigEntry):
     max_steps: int | None = None
     max_memory_retries: int | None = None
     max_stalled_steps: int | None = None
+    carry_thoughts: bool | None = None
     phase_overrides: dict[Phase, GenerationOverride] = {}
     input_schema: dict[str, Any] | None = None
     output_schema: dict[str, Any] | None = None
