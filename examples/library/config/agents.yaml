@@ -201,6 +201,7 @@
   max_steps: 10
   max_memory_retries: 3
   max_stalled_steps: 2
+  carry_thoughts: true          # 前の生成の思考を次の生成へ引き継ぐ。Gemini / OpenAI 以外の接続では false にする
   phase_overrides:              # phase ごとの上書き。書かなかった項目はエージェント本体の設定のまま
     initial_memory: {model: gemini-3.7-flash}
     function_call: {model: gemini-3.5-flash-lite}

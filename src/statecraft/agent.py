@@ -542,7 +542,11 @@ class Agent:
     # 戻った思考は毎回入力トークンとして課金されるので、生成のたびに伸びる。
     # 違う接続（phase_overridesのllm）が作った分は送らず、同じ接続でも
     # モデルが違えばプロバイダ側で捨てられる。対応するのはGeminiLLMとOpenAILLM。
-    carry_thoughts: bool = False
+    #
+    # 既定でオンにしているのは、APIがこの形を前提に作られているため。ClaudeLLMや、
+    # generate()がexchangesを受け取らない自作のLLMで動かす場合はFalseにする
+    # （オンのままだと最初の生成で落ちる）。
+    carry_thoughts: bool = True
     # ループ開始前に機械的に1回だけ実行するtool / agent（判断させないので生成が
     # 1回分減る）。引数はinput_schemaの同名プロパティから渡される。
     #
