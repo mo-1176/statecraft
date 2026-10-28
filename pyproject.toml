@@ -47,12 +47,15 @@ dependencies = [
 
 # 下限は「このフレームワークが実際に呼んでいるAPIが入ったバージョン」。
 #   google-genai 1.51.0 … types.ThinkingConfig(thinking_level=...)
-#   openai       1.58.0 … chat.completions の reasoning_effort
+#   openai       2.45.0 … responses.create の prompt_cache_options（キャッシュの区切り）
+#                         Azure の Entra ID で使う、関数の api_key は 1.106.0 から
 #   anthropic    0.78.0 … messages の thinking={"type": "adaptive"}
 # これより古いSDKでは、生成時にTypeErrorか不正なリクエストになる。
+# Azure OpenAI は openai の SDK で繋ぐ（AzureOpenAILLM）。Entra ID で認証する場合の
+# azure-identity は、トークンを作る利用側が入れる。
 [project.optional-dependencies]
 gemini = ["google-genai>=1.51.0"]
-openai = ["openai>=1.58.0"]
+openai = ["openai>=2.45.0"]
 claude = ["anthropic>=0.78.0"]
 all = [
     "statecraft[gemini,openai,claude]",

@@ -28,13 +28,16 @@ Agent側には手を入れない。
     BaseLLM         全プロバイダが満たす契約
     GeminiLLM       以下、プロバイダごとの実装
     OpenAILLM
+    AzureOpenAILLM  OpenAILLMの接続先と認証だけを差し替えたもの
     ClaudeLLM
 """
 
 import base64
 import json
 import mimetypes
+import os
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
@@ -801,9 +804,17 @@ class OpenAILLM(BaseLLM):
     # 1リクエストで書けるキャッシュは4か所まで（自動の区切りを止めた場合）。
     _MAX_CACHE_BREAKPOINTS = 4
 
-    def __init__(self, *, api_key: str | None = None):
+    def __init__(
+        self,
+        *,
+        # 関数を渡すと、SDKがリクエストごとに呼んで取り直す。期限のある
+        # トークン（AzureのMicrosoft Entra ID）向け。
+        api_key: str | Callable[[], str] | None = None,
+        # Noneなら、SDKの既定（環境変数OPENAI_BASE_URL → api.openai.com）へ繋ぐ。
+        base_url: str | None = None,
+    ):
         openai = _require("openai", "openai")
-        self.client = openai.OpenAI(api_key=api_key)
+        self.client = openai.OpenAI(api_key=api_key, base_url=base_url)
         self._bad_request = openai.BadRequestError
         # キャッシュの区切りを断ったモデル。GPT-5.6より前のモデルは区切りを
         # 受け付けず400になる。対応表は持たず、断られたモデルだけを覚えて、
@@ -1137,6 +1148,76 @@ class OpenAILLM(BaseLLM):
             items=items,
             input_tokens=input_tokens,
         )
+
+
+class AzureOpenAILLM(OpenAILLM):
+    """
+    Azure OpenAI（Microsoft Foundry）のv1 APIで生成する。
+
+    v1 APIはOpenAIと同じ形のリクエストを受け付けるため、生成と埋め込みの変換は
+    OpenAILLMのものをそのまま使い、接続先と認証だけを差し替える。
+    SDKのAzureOpenAIクラスは使わない。日付つきのapi_versionを要求する旧方式の
+    クライアントで、v1 APIでは、OpenAIクライアントへbase_urlを渡す形が案内されている。
+
+    modelには、モデル名ではなくAzure側で付けたデプロイ名を渡す（違うと404になる）。
+
+    認証は次のどちらか1つ。
+        api_key         リソースのキー。渡さなければ環境変数AZURE_OPENAI_API_KEYから読む
+        token_provider  Microsoft Entra IDのトークンを返す関数。azure-identityで作る
+
+            from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+
+            token_provider = get_bearer_token_provider(
+                DefaultAzureCredential(), "https://ai.azure.com/.default"
+            )
+
+    トークンには期限があるので、文字列ではなく関数で受け取る。SDKがリクエスト
+    ごとに呼び、期限が近ければazure-identityが取り直す。
+
+    キャッシュの区切りは、GPT-5.6以降のモデルのStandardデプロイしか受け付けない。
+    それより前のモデルとPTU-Mのデプロイは400で断るので、OpenAILLMと同じく、
+    断られたデプロイを覚えて以降は区切り無しで送る。
+
+    入力がAzureのコンテンツフィルタに掛かると、200の拒否ではなく400
+    （codeがcontent_filter）が返る。例外のまま外へ出す。再試行するかは、
+    他の生成の失敗と同じくgeneration_failedで利用側が決める。
+    """
+
+    def __init__(
+        self,
+        *,
+        # リソースのエンドポイント（https://<リソース名>.openai.azure.com）。
+        # 渡さなければ環境変数AZURE_OPENAI_ENDPOINTから読む。
+        endpoint: str | None = None,
+        api_key: str | None = None,
+        token_provider: Callable[[], str] | None = None,
+    ):
+        # 接続先と鍵は、ここで必ず決めてから渡す。SDKへNoneを渡すと
+        # OPENAI_BASE_URL / OPENAI_API_KEY へ戻り、Azureの鍵がOpenAIへ、
+        # OpenAIの鍵がAzureへ送られてしまう。
+        endpoint = endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT")
+        if not endpoint:
+            raise ValueError(
+                "Azure OpenAIのエンドポイントがありません。endpointを渡すか、"
+                "環境変数AZURE_OPENAI_ENDPOINTを設定してください"
+                "（例: https://<リソース名>.openai.azure.com）。"
+            )
+        if api_key and token_provider:
+            raise ValueError(
+                "api_keyとtoken_providerは、どちらか1つだけを渡してください。"
+            )
+        credential = (
+            token_provider or api_key or os.environ.get("AZURE_OPENAI_API_KEY")
+        )
+        if not credential:
+            raise ValueError(
+                "Azure OpenAIの認証情報がありません。api_keyかtoken_providerを渡すか、"
+                "環境変数AZURE_OPENAI_API_KEYを設定してください。"
+            )
+        # v1 APIは、エンドポイントの下の /openai/v1/ にある。
+        # ポータルからパスごと写した場合も、二重に付けない。
+        base_url = endpoint.rstrip("/").removesuffix("/openai/v1") + "/openai/v1/"
+        super().__init__(api_key=credential, base_url=base_url)
 
 
 # ---- 4. Claude クラス ----

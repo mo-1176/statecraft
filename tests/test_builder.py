@@ -18,6 +18,7 @@ from conftest import FakeLLM
 from statecraft import (
     Agent,
     AgentConfig,
+    AzureOpenAILLM,
     BaseLLM,
     ClaudeLLM,
     GeminiLLM,
@@ -221,6 +222,7 @@ def test_組み込みのproviderは登録しなくても使える():
         "gemini": GeminiLLM,
         "openai": OpenAILLM,
         "claude": ClaudeLLM,
+        "azure_openai": AzureOpenAILLM,
     }
 
 

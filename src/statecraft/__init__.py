@@ -32,7 +32,14 @@ from .config import (
 )
 from .interceptor import CheckResult, Interceptor, RetryDecision
 from .invokable import Invokable
-from .llm import BaseLLM, ClaudeLLM, GeminiLLM, OpenAILLM, ThoughtLevel
+from .llm import (
+    AzureOpenAILLM,
+    BaseLLM,
+    ClaudeLLM,
+    GeminiLLM,
+    OpenAILLM,
+    ThoughtLevel,
+)
 from .memory import MemoryEntry, PrivateMemory, SharedMemory, TaskEntry, TaskStatus
 from .network import Network
 from .prompts import Phase
@@ -49,6 +56,7 @@ __all__ = [
     "Agent",
     "AgentConfig",
     "AgentResponse",
+    "AzureOpenAILLM",
     "BaseLLM",
     "CheckResult",
     "ClaudeLLM",

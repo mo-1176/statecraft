@@ -62,7 +62,7 @@ def make_llm(monkeypatch):
     def make(*outputs):
         responses = FakeResponses(outputs)
         fake_openai = SimpleNamespace(
-            OpenAI=lambda api_key=None: SimpleNamespace(responses=responses),
+            OpenAI=lambda **_: SimpleNamespace(responses=responses),
             BadRequestError=FakeBadRequest,
         )
         monkeypatch.setattr(llm_module, "_require", lambda *_: fake_openai)

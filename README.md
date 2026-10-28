@@ -91,7 +91,7 @@ pip install -e ".[gemini]"
 
 ```bash
 pip install -e ".[gemini]"    # Gemini（サンプルはこれで動く）
-pip install -e ".[openai]"    # OpenAI
+pip install -e ".[openai]"    # OpenAI / Azure OpenAI
 pip install -e ".[claude]"    # Claude
 pip install -e ".[gemini,claude]"   # 複数でもよい
 ```
@@ -541,9 +541,26 @@ def make_sample_tool(*, max_results: int) -> Callable[[str], dict]:
 
 YAML に関数の場所（モジュール名）を書く形にしていないのは、設定を書き換えられる人が、登録されていない関数を組み立て時に呼べないようにするためです。
 
-`provider` の `gemini` / `openai` / `claude` は最初から登録されています。API キーは YAML に書かず、環境変数（`GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`）に置いてください。各 SDK がそこから読みます。それ以外の provider を使う場合は、既定の対応表に足します。
+`provider` の `gemini` / `openai` / `claude` / `azure_openai` は最初から登録されています。API キーは YAML に書かず、環境変数（`GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`）に置いてください。各 SDK がそこから読みます。
+
+`azure_openai` は接続先も要るので、`AZURE_OPENAI_ENDPOINT`（`https://<リソース名>.openai.azure.com`）と `AZURE_OPENAI_API_KEY` を置きます。`model` には、モデル名ではなく Azure で付けたデプロイ名を書きます。
+
+それ以外の provider を使う場合や、繋ぎ方を変える場合は、既定の対応表に足します（同じ名前なら上書きです）。次は `azure_openai` を、キーではなく Microsoft Entra ID で認証する例です。`azure-identity` は別に入れてください。
 
 ```python
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+
+from statecraft import AzureOpenAILLM
+
+
+def make_azure_llm() -> AzureOpenAILLM:
+    # トークンには期限があるので、文字列ではなく取得する関数を渡す（リクエストごとに呼ばれる）
+    token_provider = get_bearer_token_provider(
+        DefaultAzureCredential(), "https://ai.azure.com/.default"
+    )
+    return AzureOpenAILLM(token_provider=token_provider)
+
+
 class LibraryBuilder(NetworkBuilder):
     TOOL_FACTORIES = {...}   # 上と同じ
     LLM_FACTORIES = {**NetworkBuilder.LLM_FACTORIES, "azure_openai": make_azure_llm}
@@ -1861,7 +1878,7 @@ Geminiでの1往復、委譲、初期ツール、入力/出力スキーマ、実
 
 **未検証**
 
-OpenAI / Claude のプロバイダ実装、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）
+OpenAI / Azure OpenAI / Claude のプロバイダ実装（Azure OpenAI は、本物の SDK からローカルの代役サーバーへ送り、接続先・認証・キャッシュの区切りの扱いまで確認済み）、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）
 
 ---
 
