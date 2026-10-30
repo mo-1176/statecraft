@@ -18,9 +18,12 @@ from conftest import (
 
 from statecraft import (
     Agent,
+    ExecuteDecision,
+    GenerateDecision,
     Interceptor,
     Phase,
     ReflexAgent,
+    RetryDecision,
     Tool,
 )
 
@@ -51,7 +54,7 @@ def recording_interceptor() -> tuple[Interceptor, list]:
     """
     events: list = []
     interceptor = Interceptor()
-    interceptor.on.generated(events.append)
+    interceptor.notice.generated(events.append)
     return interceptor, events
 
 
@@ -366,7 +369,7 @@ def test_リトライを使い切っても止まらない():
     """通った分だけを残して進む（欠けた分はerrorイベントで通知される）。"""
     errors = []
     interceptor = Interceptor()
-    interceptor.on.error(errors.append)
+    interceptor.notice.error(errors.append)
 
     llm = FakeLLM(
         [
@@ -380,7 +383,7 @@ def test_リトライを使い切っても止まらない():
     response = agent.respond(message="x")
 
     assert response.text == "回答"
-    assert any("反映されませんでした" in e for e in errors)
+    assert any("反映されませんでした" in e.message for e in errors)
 
 
 def test_配列として読めない応答も差し戻す():
@@ -465,7 +468,7 @@ def test_委譲中の例外は外へ出ずToolResultになる():
     """Invokableの契約。例外で中断すると、そこまでの作業も失われる。"""
     errors = []
     interceptor = Interceptor()
-    interceptor.on.error(errors.append)
+    interceptor.notice.error(errors.append)
 
     llm = FakeLLM([RuntimeError("生成に失敗した")])
     agent = build_agent(llm, interceptor=interceptor)
@@ -474,7 +477,7 @@ def test_委譲中の例外は外へ出ずToolResultになる():
 
     assert not result.success
     # 握りつぶさず観測側へは伝えること
-    assert any("失敗" in e for e in errors)
+    assert any("失敗" in e.message for e in errors)
 
 
 def test_無効化されたagentは委譲を断る():
@@ -489,7 +492,9 @@ def test_無効化されたagentは委譲を断る():
 
 def test_委譲はbefore_executeで止められる():
     interceptor = Interceptor()
-    interceptor.on.before_execute(lambda *, name, kwargs: "この依頼は受けられません")
+    interceptor.guard.before_execute(
+        lambda e: ExecuteDecision(allowed=False, reason="この依頼は受けられません")
+    )
 
     agent = build_agent(FakeLLM())
     result = agent.execute(kwargs={"message": "x"}, interceptor=interceptor)
@@ -689,7 +694,7 @@ def test_before_generateで中止すると例外になる():
     from statecraft import GenerationAborted
 
     interceptor = Interceptor()
-    interceptor.on.before_generate(lambda **kw: False)
+    interceptor.guard.before_generate(lambda e: GenerateDecision(proceed=False))
 
     agent = build_agent(FakeLLM([text_response("x")]), interceptor=interceptor)
 
@@ -700,7 +705,9 @@ def test_before_generateで中止すると例外になる():
 def test_before_generateはモデルを差し替えられる():
     """走行中の状態を見て軽いモデルへ落とす用途。"""
     interceptor = Interceptor()
-    interceptor.on.before_generate(lambda **kw: "flash-lite")
+    interceptor.guard.before_generate(
+        lambda e: GenerateDecision(proceed=True, model="flash-lite")
+    )
 
     llm = FakeLLM([diff_response([]), text_response("ok")])
     agent = build_agent(llm, interceptor=interceptor)
@@ -714,11 +721,11 @@ def test_生成の失敗は再試行できる():
     interceptor = Interceptor()
     attempts = []
 
-    def retry_once(*, agent, phase, model, attempt, error):
-        attempts.append(attempt)
-        return attempt == 1
+    def retry_once(event):
+        attempts.append(event.attempt)
+        return RetryDecision(retry=event.attempt == 1)
 
-    interceptor.on.generation_failed(retry_once)
+    interceptor.recover.generation_failed(retry_once)
 
     llm = FakeLLM(
         [
@@ -748,8 +755,8 @@ def test_生成イベントは失敗した試行でも流れる():
     """落とすと、再試行に費やした時間が計測から消える。"""
     events = []
     interceptor = Interceptor()
-    interceptor.on.generated(events.append)
-    interceptor.on.generation_failed(lambda **kw: kw["attempt"] == 1)
+    interceptor.notice.generated(events.append)
+    interceptor.recover.generation_failed(lambda e: RetryDecision(retry=e.attempt == 1))
 
     llm = FakeLLM([RuntimeError("失敗"), diff_response([]), text_response("ok")])
     agent = build_agent(llm, interceptor=interceptor)
@@ -766,7 +773,7 @@ def test_memory_diffイベントは失敗した回も流れる():
     """検証で見たいのはむしろ失敗した回。"""
     events = []
     interceptor = Interceptor()
-    interceptor.on.memory_diff(events.append)
+    interceptor.notice.memory_diff(events.append)
 
     llm = FakeLLM(
         [
@@ -789,7 +796,7 @@ def test_memory_diffイベントは失敗した回も流れる():
 def test_実行イベントに呼び出し元と呼び出し先が入る(search_tool):
     events = []
     interceptor = Interceptor()
-    interceptor.on.executed(events.append)
+    interceptor.notice.executed(events.append)
 
     llm = FakeLLM(
         [

@@ -216,7 +216,7 @@ def test_共通のinterceptorが配られる():
 
 def test_個別に登録済みのinterceptorは尊重される():
     own = Interceptor()
-    own.on.error(lambda m: None)
+    own.notice.error(lambda e: None)
     a = make_agent("a", interceptor=own)
 
     Network(agents=[a], interceptor=Interceptor())

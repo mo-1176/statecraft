@@ -8,7 +8,7 @@ Tool の検証。
 
 import pytest
 
-from statecraft import Interceptor, SchemaTool, Tool, ToolResult
+from statecraft import ExecuteDecision, Interceptor, SchemaTool, Tool, ToolResult
 from statecraft.tools import parse_tool_return
 
 
@@ -130,7 +130,9 @@ def test_before_executeが拒否すると実行されない():
         return {"value": "ok"}
 
     interceptor = Interceptor()
-    interceptor.on.before_execute(lambda *, name, kwargs: "権限がありません")
+    interceptor.guard.before_execute(
+        lambda e: ExecuteDecision(allowed=False, reason="権限がありません")
+    )
 
     result = Tool(func=spy, summary="x").execute(
         kwargs={"target": "a"}, interceptor=interceptor
@@ -139,6 +141,26 @@ def test_before_executeが拒否すると実行されない():
     assert calls == []
     # 理由がそのままLLMへ返ること
     assert result.error == "権限がありません"
+
+
+def test_拒否された呼び出しは引数と理由を持ってexecute_blockedで流れる():
+    """観測のためにguardへ登録しなくても、止められた呼び出しの引数を見られるように。"""
+
+    def spy(target: str) -> dict:
+        return {"value": "ok"}
+
+    blocked = []
+    interceptor = Interceptor()
+    interceptor.guard.before_execute(
+        lambda e: ExecuteDecision(allowed=False, reason="権限がありません")
+    )
+    interceptor.notice.execute_blocked(blocked.append)
+
+    Tool(func=spy, summary="x").execute(kwargs={"target": "a"}, interceptor=interceptor)
+
+    assert blocked[0].name == "spy"
+    assert blocked[0].kwargs == {"target": "a"}
+    assert blocked[0].reason == "権限がありません"
 
 
 def test_実行時間が記録される():
@@ -161,14 +183,14 @@ def test_通知の失敗は実行を止めない():
 
     errors = []
     interceptor = Interceptor()
-    interceptor.on.error(errors.append)
+    interceptor.notice.error(errors.append)
 
     tool = Tool(func=ok, summary="x", describe_execution=broken_describe)
     result = tool.execute(kwargs={}, interceptor=interceptor)
 
     assert result.value == "本体は動いた"
     # 黙って消さず、観測側へは伝えること
-    assert any("文言" in e or "メッセージ" in e for e in errors)
+    assert any("文言" in e.message or "メッセージ" in e.message for e in errors)
 
 
 # ---- 名前 ----

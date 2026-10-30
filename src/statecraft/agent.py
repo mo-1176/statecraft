@@ -31,6 +31,21 @@ from datetime import datetime
 from typing import Any, ClassVar, Optional
 from uuid import uuid4
 
+from .events import (
+    BeforeExecuteEvent,
+    BeforeGenerateEvent,
+    ErrorEvent,
+    ExecuteBlockedEvent,
+    ExecutedEvent,
+    ExecuteEndEvent,
+    ExecuteStartEvent,
+    GeneratedEvent,
+    GenerationFailedEvent,
+    MemoryDiffEvent,
+    MemoryUpdatedEvent,
+    RespondEndEvent,
+    RespondStartEvent,
+)
 from .interceptor import Interceptor
 from .invokable import Invokable
 from .llm import (
@@ -152,140 +167,6 @@ class AgentResponse:
     # （どのAgentが重いかを個別に測るため）。合計はNetwork.total_tokens()。
     input_tokens: int = 0
     output_tokens: int = 0
-
-
-@dataclass
-class MemoryDiffEvent:
-    """
-    記憶の差分を1回の生成につき1つ、構造のまま観測側へ渡す。
-
-    材料・出力・結果を1つのイベントに揃えてあり、失敗した時も発火する
-    （検証で見たいのはむしろ失敗した回）。各項目の意味はREADMEを参照。
-    """
-
-    agent: str  # どのAgentが出したか
-    phase: Phase | None  # どのphaseの生成か。Noneはtoolの直接書き込み
-    attempt: int  # 何回目の生成か（1始まり。再生成の経過が見える）
-    rows: list  # 差分そのもの。textを含む
-    errors: list  # 適用に失敗した行。差し戻して再生成させる
-
-    # 反映しなかったが差し戻さない行（システム所有プロパティへの書き込み等）。
-    # errorsと違い再生成では直らないため、次のステップで1回だけ伝える。
-    ignored: list = field(default_factory=list)
-    tool_results: str = ""  # この差分を作らせた材料
-    raw_text: str = ""  # 配列として解釈できなかった場合の生出力
-
-    # memoryを返したtoolが直接書き込んだ場合、そのtool名。
-    # LLMが作った差分とtoolが返した値は検証の意味が違うため区別する。
-    source_tool: str = ""
-
-    # ReActループの何周目で起きたか（1始まり）。1周は
-    # 「FUNCTION_CALL → 実行 → MEMORY_UPDATE」で、INITIAL_MEMORYはstep 1に属する。
-    step_no: int = 0
-
-    # 記憶へ何番目に適用されたか（apply_diffがロックの中で採番した番号）。
-    # 通知はロックの外なので、届く順序は適用順ではない。後から再適用するなら
-    # 受け取った順ではなくこの昇順で並べ直す。
-    apply_seq: int = 0
-
-    # この差分が、どの起動（respond / execute 1回）の中で作られたか。
-    # GenerationEvent.run_id と同じ定義（適用の順序はapply_seqが持つ）。
-    run_id: str = ""
-
-    @property
-    def applied(self) -> bool:
-        """全行が反映されたか。errorsの有無から導出する（ToolResult.successと同じ考え方）。"""
-        return not self.errors
-
-
-@dataclass
-class GenerationEvent:
-    """
-    生成1回分の実測値。時間とトークンを構造のまま観測側へ渡す。
-    各項目の意味はREADMEを参照。
-    """
-
-    agent: str  # どのAgentの生成か
-    phase: Phase  # どのphaseの生成か
-    model: str  # 実際に使われたモデル名（phase_overridesの結果が見える）
-    elapsed: float  # この試行にかかった秒数
-    input_tokens: int  # キャッシュから読まれた分を含む合計
-    output_tokens: int
-
-    # input_tokensのうちキャッシュから読まれた分。プロンプトキャッシュが
-    # 実際に効いているかは、ここを見ないと分からない（合計だけでは判断できない）。
-    cached_tokens: int = 0
-    # キャッシュへ書き込んだ分。Claudeのみ報告される。
-    # 毎回これが立つなら、キャッシュが当たっておらず割高になっている。
-    cache_write_tokens: int = 0
-
-    # 何回目の試行か（1始まり）。再試行が起きた場合、同じphaseから
-    # このイベントが複数回流れる。
-    attempt: int = 1
-    # 失敗した試行では例外の内容が入る。成功した試行では空文字。
-    # 失敗した回も流す（落とすと再試行に費やした時間が計測から消える）。
-    # 再試行の待ち時間は含まない（待つのはgeneration_failedのコールバック側）。
-    error: str = ""
-
-    # ReActループの何周目の生成か（1始まり）。MemoryDiffEventと同じ定義。
-    step_no: int = 0
-
-    # この生成が、どの起動（respond / execute 1回）の中で走ったか。
-    # agentは名前なので、同じエージェントが並列に動くと区別が付かない。
-    # ExecuteEvent.callee_run_idと同じ値で結ばれ、呼び出しの木が辿れる。
-    run_id: str = ""
-
-    # なぜ生成が終わったか。"end" / "tool_use" / "max_tokens" / "refusal" 等。
-    # 例外で失敗した試行では空文字（応答自体が無い）。
-    #
-    # max_tokens と refusal はHTTP 200で返るためerrorには現れない。ここを見ないと
-    # 「同じphaseの生成が何度も並んでいる」理由が内訳から読めない。
-    stop_reason: str = ""
-
-    # 思考の要約。carry_thoughtsの時だけ入る（それ以外は要求しないので空）。
-    # 継承した思考は次の判断に効くのに中身が見えないため、ここで観測する。
-    thoughts: str = ""
-
-
-@dataclass
-class ExecuteEvent:
-    """
-    tool / agentの実行1回分。各項目の意味はREADMEを参照。
-
-    発火するのは呼び出した側（_run_plan）。
-    Tool.execute / Agent.executeは呼び出し元も周回数も知らない。
-    """
-
-    caller: str  # 呼び出した側のAgent名
-    callee: str  # 呼ばれたtool / agent名
-    call_type: str  # "tool" | "agent"。解決できなかった名前は空文字
-    kwargs: dict  # 渡した引数
-    step_no: int  # ReActループの何周目か（1始まり）
-
-    # 戻り値そのもの。整形は観測側が決める（MemoryDiffEvent.rowsと同じ扱い）。
-    # 失敗・拒否された場合はNone。
-    value: Any = None
-    # 失敗した理由、または拒否の理由。成功した場合は空文字。
-    # before_executeによる拒否とtool自身の失敗はどちらもここへ入るので、
-    # 拒否だけを見たいならexecute_blockedを使う。
-    error: str = ""
-    # 呼び出しにかかった秒数。before_executeの判定時間も含む
-    # （人の承認を待つ構成では、その待ち時間がここへ乗る）。
-    elapsed: float = 0.0
-    # memoryを返したtoolで、実際に記憶へ書き込めたか。
-    written_to_memory: bool = False
-
-    # 呼び出した側の起動ID（caller の current_run_id）。
-    caller_run_id: str = ""
-    # 呼ばれた側の起動ID。calleeがagentの場合だけ入り、toolでは空文字。
-    # callee（名前）だけでは同じエージェントが並列に呼ばれた時に区別できない。
-    # callee側のGenerationEvent.run_idと一致する。
-    callee_run_id: str = ""
-
-    @property
-    def success(self) -> bool:
-        """成功したか。errorの有無から導出する（ToolResult.successと同じ考え方）。"""
-        return not self.error
 
 
 @dataclass
@@ -608,7 +489,7 @@ class Agent:
     _step_no: int = 1
 
     # この起動（respond / execute 1回）を指すID。_begin_run()で発行する。
-    # publicなのは、ExecuteEvent.callee_run_idを呼び出した側がここから読むため。
+    # publicなのは、ExecutedEvent.callee_run_idを呼び出した側がここから読むため。
     current_run_id: str = ""
 
     # 同じ実体へ同時に入るのを防ぐ錠。execute()だけが取る（respond()の同時
@@ -811,11 +692,19 @@ class Agent:
         # トークンは累計を保持したまま、今回分だけを差分で返す。
         # 累計はNetwork.total_tokens()がセッション全体の集計に使う。
         before_in, before_out = self.total_input_tokens, self.total_output_tokens
-        self.interceptor.notify.respond_start(f"{self.name}が応答を開始しました。")
+        self.interceptor.notify.respond_start(
+            RespondStartEvent(
+                agent=self.name, message=f"{self.name}が応答を開始しました。"
+            )
+        )
 
         text, steps = self._run_react()
 
-        self.interceptor.notify.respond_end(f"{self.name}が応答を完了しました。")
+        self.interceptor.notify.respond_end(
+            RespondEndEvent(
+                agent=self.name, message=f"{self.name}が応答を完了しました。"
+            )
+        )
         return AgentResponse(
             text=text,
             steps=steps,
@@ -877,6 +766,10 @@ class Agent:
             return format_message(self.execution_message, kwargs)
         return f"{self.name}へ委譲しました。"
 
+    def _notify_error(self, message: str) -> None:
+        """errorイベントを流す。異常を見つけたのは常に自分なので、呼ぶ側は文言だけ渡す。"""
+        self.interceptor.notify.error(ErrorEvent(source=self.name, message=message))
+
     @with_timing
     def execute(
         self, *, kwargs: dict, interceptor: Interceptor | None = None
@@ -890,16 +783,30 @@ class Agent:
         if self.disabled:
             # Tool.executeと同じく、呼ばれなかった理由を観測側へ伝える。
             if interceptor:
-                interceptor.notify.execute_blocked(f"{self.name}は無効化されています。")
+                interceptor.notify.execute_blocked(
+                    ExecuteBlockedEvent(
+                        name=self.name,
+                        kwargs=kwargs,
+                        reason="",
+                        message=f"{self.name}は無効化されています。",
+                    )
+                )
             return ToolResult(error="このエージェントは現在無効化されています。")
 
         if interceptor:
-            verdict = interceptor.check.before_execute(name=self.name, kwargs=kwargs)
+            verdict = interceptor.check.before_execute(
+                BeforeExecuteEvent(name=self.name, kwargs=kwargs)
+            )
             if not verdict.allowed:
                 # Tool.executeと同じ扱い。理由があれば依頼元へそのまま返す。
                 detail = f" 理由: {verdict.reason}" if verdict.reason else ""
                 interceptor.notify.execute_blocked(
-                    f"{self.name}への委譲がブロックされました。{detail}"
+                    ExecuteBlockedEvent(
+                        name=self.name,
+                        kwargs=kwargs,
+                        reason=verdict.reason,
+                        message=f"{self.name}への委譲がブロックされました。{detail}",
+                    )
                 )
                 return ToolResult(error=verdict.reason or "委譲がブロックされました。")
 
@@ -927,9 +834,13 @@ class Agent:
             # 通知の失敗で委譲を止めないよう保護する（Tool.executeと同じ）。
             try:
                 describe = self.describe_execution or self._default_describe_execution
-                self.interceptor.notify.execute_start(describe(kwargs))
+                self.interceptor.notify.execute_start(
+                    ExecuteStartEvent(
+                        name=self.name, kwargs=kwargs, message=describe(kwargs)
+                    )
+                )
             except Exception as e:  # noqa: BLE001
-                self.interceptor.notify.error(
+                self._notify_error(
                     f"{self.name}の実行中メッセージの生成に失敗しました: {e}"
                 )
 
@@ -938,9 +849,13 @@ class Agent:
             except Exception as e:  # noqa: BLE001
                 # Invokableの契約として例外を外へ出さない。
                 # ただし握りつぶすと原因が追えなくなるため、観測者へは通知する。
-                self.interceptor.notify.error(f"{self.name}の実行が失敗しました: {e}")
+                self._notify_error(f"{self.name}の実行が失敗しました: {e}")
                 self.interceptor.notify.execute_end(
-                    f"{self.name}の委譲がエラーで終了しました。"
+                    ExecuteEndEvent(
+                        name=self.name,
+                        success=False,
+                        message=f"{self.name}の委譲がエラーで終了しました。",
+                    )
                 )
                 return ToolResult(
                     error=f"{self.name}の実行中にエラーが発生しました: {e}"
@@ -953,7 +868,13 @@ class Agent:
                     text=text,
                 )
             )
-            self.interceptor.notify.execute_end(f"{self.name}の委譲が完了しました。")
+            self.interceptor.notify.execute_end(
+                ExecuteEndEvent(
+                    name=self.name,
+                    success=True,
+                    message=f"{self.name}の委譲が完了しました。",
+                )
+            )
 
             return ToolResult(value=text)
 
@@ -1086,7 +1007,7 @@ class Agent:
         self._last_fingerprint = fingerprint
 
         if self._stalled_count >= self.max_stalled_steps:
-            self.interceptor.notify.error(
+            self._notify_error(
                 f"{self.name}が同じ実行を{self._stalled_count + 1}回繰り返し、"
                 f"進捗しなくなったため打ち切ります。"
             )
@@ -1133,7 +1054,7 @@ class Agent:
         response = self._generate(phase, response_schema=schema, extra_prompt=notice)
 
         if schema and response.text and not self._matches_output_schema(response.text):
-            self.interceptor.notify.error(
+            self._notify_error(
                 f"{self.name}の回答がoutput_schemaに従っていないため、作り直します。"
             )
             response = self._generate(
@@ -1294,11 +1215,13 @@ class Agent:
             # 試行ごとに尋ねる（1回目だけだと再試行で予算を超えても止まらない）。
             # 計測より前に置くのは、判定が待つ場合にその時間を秒数へ混ぜないため。
             gate = self.interceptor.check.before_generate(
-                agent=self.name,
-                phase=phase,
-                model=model,
-                attempt=attempt,
-                step_no=self._step_no,
+                BeforeGenerateEvent(
+                    agent=self.name,
+                    phase=phase,
+                    model=model,
+                    attempt=attempt,
+                    step_no=self._step_no,
+                )
             )
             if not gate.proceed:
                 raise GenerationAborted(
@@ -1328,7 +1251,7 @@ class Agent:
                 # 失敗した試行も計測として流す（落とすと再試行に費やした時間が
                 # 消える）。判定より先に流すのは、待ち時間を秒数へ混ぜないため。
                 self.interceptor.notify.generated(
-                    GenerationEvent(
+                    GeneratedEvent(
                         agent=self.name,
                         phase=phase,
                         model=model,
@@ -1346,11 +1269,13 @@ class Agent:
                 # 試すかは運用の方針で、対話UIとバッチで正解が違う）。
                 # 登録が無ければ再試行せず、例外をそのまま外へ出す。
                 decision = self.interceptor.check.generation_failed(
-                    agent=self.name,
-                    phase=phase,
-                    model=model,
-                    attempt=attempt,
-                    error=e,
+                    GenerationFailedEvent(
+                        agent=self.name,
+                        phase=phase,
+                        model=model,
+                        attempt=attempt,
+                        error=e,
+                    )
                 )
                 if not decision.retry:
                     raise
@@ -1366,7 +1291,7 @@ class Agent:
         self.total_cached_tokens += response.cached_tokens
 
         self.interceptor.notify.generated(
-            GenerationEvent(
+            GeneratedEvent(
                 agent=self.name,
                 phase=phase,
                 model=model,
@@ -1610,7 +1535,7 @@ class Agent:
 
         if ignored_all:
             detail = "\n".join(e.render() for e in ignored_all)
-            self.interceptor.notify.error(
+            self._notify_error(
                 f"{self.name}のmemory更新で{len(ignored_all)}件を反映しませんでした"
                 f"（差し戻しても直らないため再生成はしていません）。\n{detail}"
             )
@@ -1619,7 +1544,7 @@ class Agent:
             # リトライを使い切っても中断しないため、通知しなければ
             # 記憶が欠けたまま進んだことに誰も気付けない。
             detail = "\n".join(e.render() for e in errors)
-            self.interceptor.notify.error(
+            self._notify_error(
                 f"{self.name}のmemory更新で{len(errors)}件が反映されませんでした。\n{detail}"
             )
         else:
@@ -1632,7 +1557,10 @@ class Agent:
             ]
             detail = f"（{' / '.join(applied)}）" if applied else "（変更なし）"
             self.interceptor.notify.memory_updated(
-                f"{self.name}のmemoryを更新しました。{detail}"
+                MemoryUpdatedEvent(
+                    agent=self.name,
+                    message=f"{self.name}のmemoryを更新しました。{detail}",
+                )
             )
         return errors
 
@@ -1670,7 +1598,7 @@ class Agent:
             target = self._resolve_invokable(name)
             if target is None:
                 # 提示していない名前を無効化しようとした場合。処理は続ける。
-                self.interceptor.notify.error(
+                self._notify_error(
                     f"{self.name}が存在しない対象の無効化を指示しました: '{name}'"
                 )
                 continue
@@ -1684,7 +1612,11 @@ class Agent:
                 target.disabled = True
             self._runtime_disabled.add(name)
             self.interceptor.notify.memory_updated(
-                f"{self.name}が{name}を無効化しました。理由: {row.get('text') or '(記載なし)'}"
+                MemoryUpdatedEvent(
+                    agent=self.name,
+                    message=f"{self.name}が{name}を無効化しました。"
+                    f"理由: {row.get('text') or '(記載なし)'}",
+                )
             )
 
     def _is_disabled(self, target: Invokable) -> bool:
@@ -1836,9 +1768,7 @@ class Agent:
                     except Exception as e:  # noqa: BLE001
                         # Invokableは例外を投げない契約だが、スレッドの側で
                         # 何かが起きた場合にここで落とすと1件の失敗が全体を止める。
-                        self.interceptor.notify.error(
-                            f"並列実行が例外で終了しました: {e}"
-                        )
+                        self._notify_error(f"並列実行が例外で終了しました: {e}")
                         for index, _ in futures[future]:
                             results.setdefault(
                                 index,
@@ -1884,7 +1814,7 @@ class Agent:
             # 出せないのは、callerと周回数を知っているのが呼び出した側だけだから。
             # 実行されなかったもの（存在しない名前・重複で弾いたもの）も流す。
             self.interceptor.notify.executed(
-                ExecuteEvent(
+                ExecutedEvent(
                     caller=self.name,
                     callee=call.name,
                     call_type=("agent" if isinstance(target, Agent) else "tool")
@@ -1951,7 +1881,7 @@ class Agent:
         # LLMが書き方を変えても直らないため（利用側へ通知して知らせる）。
         unwritten = [*errors, *result.ignored]
         if unwritten:
-            self.interceptor.notify.error(
+            self._notify_error(
                 f"{tool_name}の結果のうち{len(unwritten)}件をmemoryへ書き込めませんでした。\n"
                 + "\n".join(e.render() for e in unwritten)
             )
@@ -2006,7 +1936,7 @@ class Agent:
                     f"必須の引数 {', '.join(missing)} が空のため実行しませんでした。"
                     f"この情報は取得できていません。"
                 )
-                self.interceptor.notify.error(
+                self._notify_error(
                     f"{self.name}の初期ステップ '{target.name}': {reason}"
                 )
                 plan.append(_PlannedCall(call=call, decided=ToolResult(error=reason)))

@@ -16,6 +16,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
+from .events import (
+    BeforeExecuteEvent,
+    ErrorEvent,
+    ExecuteBlockedEvent,
+    ExecuteEndEvent,
+    ExecuteStartEvent,
+)
 from .interceptor import Interceptor
 from .utils import format_message, with_timing
 
@@ -188,13 +195,20 @@ class Tool:
             return ToolResult(error="このツールは現在無効化されています。")
 
         if interceptor:
-            verdict = interceptor.check.before_execute(name=tool_name, kwargs=kwargs)
+            verdict = interceptor.check.before_execute(
+                BeforeExecuteEvent(name=tool_name, kwargs=kwargs)
+            )
             if not verdict.allowed:
                 # 理由をそのままLLMへ返す。「ブロックされました」だけだと、
                 # 止められた側が原因を探して追加の実行を始める。
                 detail = f" 理由: {verdict.reason}" if verdict.reason else ""
                 interceptor.notify.execute_blocked(
-                    f"{tool_name}の実行がブロックされました。{detail}"
+                    ExecuteBlockedEvent(
+                        name=tool_name,
+                        kwargs=kwargs,
+                        reason=verdict.reason,
+                        message=f"{tool_name}の実行がブロックされました。{detail}",
+                    )
                 )
                 return ToolResult(error=verdict.reason or "実行がブロックされました。")
 
@@ -203,10 +217,17 @@ class Tool:
             # 通知の失敗で本体の実行を止めない。
             try:
                 describe = self.describe_execution or self._default_describe_execution
-                interceptor.notify.execute_start(describe(kwargs))
+                interceptor.notify.execute_start(
+                    ExecuteStartEvent(
+                        name=tool_name, kwargs=kwargs, message=describe(kwargs)
+                    )
+                )
             except Exception as e:  # noqa: BLE001
                 interceptor.notify.error(
-                    f"{tool_name}の実行中メッセージの生成に失敗しました: {e}"
+                    ErrorEvent(
+                        source=tool_name,
+                        message=f"{tool_name}の実行中メッセージの生成に失敗しました: {e}",
+                    )
                 )
 
         try:
@@ -215,11 +236,18 @@ class Tool:
             result = parse_tool_return(tool_name, returned)
             if not result.success and interceptor:
                 # 契約違反は実装の誤りなので、観測側へも出す。
-                interceptor.notify.error(result.error or "")
+                interceptor.notify.error(
+                    ErrorEvent(source=tool_name, message=result.error or "")
+                )
         except Exception as e:  # noqa: BLE001
             # 観測者へは実際の例外を伝える（隠す相手はLLMだけ）。
             if interceptor:
-                interceptor.notify.error(f"{tool_name}の実行が失敗しました: {e}")
+                interceptor.notify.error(
+                    ErrorEvent(
+                        source=tool_name,
+                        message=f"{tool_name}の実行が失敗しました: {e}",
+                    )
+                )
             error_message = (
                 str(e)
                 if self.expose_error_details
@@ -229,7 +257,13 @@ class Tool:
 
         if interceptor:
             status = "完了しました" if result.success else "エラーで終了しました"
-            interceptor.notify.execute_end(f"{tool_name}の実行が{status}。")
+            interceptor.notify.execute_end(
+                ExecuteEndEvent(
+                    name=tool_name,
+                    success=result.success,
+                    message=f"{tool_name}の実行が{status}。",
+                )
+            )
 
         return result
 

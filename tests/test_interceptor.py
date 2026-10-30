@@ -1,43 +1,91 @@
 """
 Interceptor の検証。
 
-checkは拒否権を持つ「門」なので、既定値の向きが安全側かどうかが全て。
+guard / recover は判定を返す窓口なので、既定値の向きが安全側かどうかが全て。
 ここが逆を向くと、権限確認の失敗や予算の門が静かに開く。
+noticeは受け取るだけの窓口なので、何を返しても実行の可否に関わらないことを確かめる。
 """
 
 import threading
 
-from statecraft import Interceptor
+import pytest
+
+from statecraft import (
+    BeforeExecuteEvent,
+    BeforeGenerateEvent,
+    ErrorEvent,
+    ExecuteDecision,
+    GenerateDecision,
+    GenerationFailedEvent,
+    Interceptor,
+    RespondStartEvent,
+    RetryDecision,
+)
 from statecraft.prompts import Phase
 
 
-# ---- check.before_execute（既定は拒否） ----
+def before_execute(name: str = "t", kwargs: dict | None = None) -> BeforeExecuteEvent:
+    return BeforeExecuteEvent(name=name, kwargs=kwargs or {})
+
+
+def before_generate(model: str = "m") -> BeforeGenerateEvent:
+    return BeforeGenerateEvent(
+        agent="a", phase=Phase.ANSWER, model=model, attempt=1, step_no=1
+    )
+
+
+def generation_failed(
+    model: str = "m", error: Exception | None = None
+) -> GenerationFailedEvent:
+    return GenerationFailedEvent(
+        agent="a",
+        phase=Phase.ANSWER,
+        model=model,
+        attempt=1,
+        error=error or RuntimeError("x"),
+    )
+
+
+ALLOW = ExecuteDecision(allowed=True)
+
+
+# ---- guard.before_execute（既定は拒否） ----
 def test_登録が無ければ許可する():
-    verdict = Interceptor().check.before_execute(name="t", kwargs={})
+    verdict = Interceptor().check.before_execute(before_execute())
 
     assert verdict.allowed
 
 
-def test_Trueを返した時だけ許可する():
+def test_許可の判定を返した時だけ許可する():
     i = Interceptor()
-    i.on.before_execute(lambda *, name, kwargs: True)
+    i.guard.before_execute(lambda e: ALLOW)
 
-    assert i.check.before_execute(name="t", kwargs={}).allowed
+    assert i.check.before_execute(before_execute()).allowed
 
 
 def test_Noneを返すと拒否になる():
     """returnを書き忘れた場合。許可と解釈すると権限確認の失敗が通る。"""
     i = Interceptor()
-    i.on.before_execute(lambda *, name, kwargs: None)
+    i.guard.before_execute(lambda e: None)
 
-    assert not i.check.before_execute(name="t", kwargs={}).allowed
+    assert not i.check.before_execute(before_execute()).allowed
 
 
-def test_文字列は拒否の理由として持ち帰られる():
+def test_判定の型でなければTrueでも拒否になる():
+    """真偽値で返す書き方からの移行で起きる。許可と解釈すると、型の取り違えが門を開ける。"""
     i = Interceptor()
-    i.on.before_execute(lambda *, name, kwargs: "館長の承認が要ります")
+    i.guard.before_execute(lambda e: True)
 
-    verdict = i.check.before_execute(name="t", kwargs={})
+    assert not i.check.before_execute(before_execute()).allowed
+
+
+def test_拒否の理由は持ち帰られる():
+    i = Interceptor()
+    i.guard.before_execute(
+        lambda e: ExecuteDecision(allowed=False, reason="館長の承認が要ります")
+    )
+
+    verdict = i.check.before_execute(before_execute())
 
     assert not verdict.allowed
     assert verdict.reason == "館長の承認が要ります"
@@ -46,176 +94,192 @@ def test_文字列は拒否の理由として持ち帰られる():
 def test_コールバックの例外は拒否になる():
     i = Interceptor()
 
-    def broken(*, name, kwargs):
+    def broken(event):
         raise RuntimeError("判定の実装ミス")
 
-    i.on.before_execute(broken)
-    verdict = i.check.before_execute(name="t", kwargs={})
+    i.guard.before_execute(broken)
+    verdict = i.check.before_execute(before_execute())
 
     assert not verdict.allowed
     # 例外の内容を理由にしない（実装の不具合が外へ出る）
     assert verdict.reason == ""
 
 
-def test_全員がTrueでなければ拒否になる():
+def test_全員が許可しなければ拒否になる():
     i = Interceptor()
-    i.on.before_execute(lambda *, name, kwargs: True)
-    i.on.before_execute(lambda *, name, kwargs: False)
+    i.guard.before_execute(lambda e: ALLOW)
+    i.guard.before_execute(lambda e: ExecuteDecision(allowed=False))
 
-    assert not i.check.before_execute(name="t", kwargs={}).allowed
+    assert not i.check.before_execute(before_execute()).allowed
 
 
 def test_拒否が決まった後は後続を呼ばない():
     i = Interceptor()
     reached = []
-    i.on.before_execute(lambda *, name, kwargs: False)
-    i.on.before_execute(lambda *, name, kwargs: reached.append(1) or True)
+    i.guard.before_execute(lambda e: ExecuteDecision(allowed=False))
+    i.guard.before_execute(lambda e: reached.append(1) or ALLOW)
 
-    i.check.before_execute(name="t", kwargs={})
+    i.check.before_execute(before_execute())
 
     assert reached == []
 
 
-def test_判定には名前と引数が渡る():
-    seen = {}
+def test_判定には名前と引数がイベントで渡る():
+    seen = []
     i = Interceptor()
 
-    def gate(*, name, kwargs):
-        seen.update(name=name, kwargs=kwargs)
-        return True
+    def gate(event):
+        seen.append(event)
+        return ALLOW
 
-    i.on.before_execute(gate)
-    i.check.before_execute(name="issue_reservation", kwargs={"title": "深夜特急"})
+    i.guard.before_execute(gate)
+    i.check.before_execute(before_execute("issue_reservation", {"title": "深夜特急"}))
 
-    assert seen["name"] == "issue_reservation"
-    assert seen["kwargs"] == {"title": "深夜特急"}
+    assert seen[0].name == "issue_reservation"
+    assert seen[0].kwargs == {"title": "深夜特急"}
 
 
-# ---- check.before_generate（既定は生成する） ----
+# ---- guard.before_generate（既定は生成する） ----
 def test_登録が無ければ生成する():
     """未登録の利用側が動かなくなるのを避けるため、こちらの既定は通す。"""
-    decision = Interceptor().check.before_generate(
-        agent="a", phase=Phase.ANSWER, model="m", attempt=1, step_no=1
-    )
+    decision = Interceptor().check.before_generate(before_generate())
 
     assert decision.proceed
 
 
-def test_Falseを返すと生成を中止する():
+def test_中止の判定を返すと生成を中止する():
     i = Interceptor()
-    i.on.before_generate(lambda **kw: False)
+    i.guard.before_generate(lambda e: GenerateDecision(proceed=False))
 
-    decision = i.check.before_generate(
-        agent="a", phase=Phase.ANSWER, model="m", attempt=1, step_no=1
+    assert not i.check.before_generate(before_generate()).proceed
+
+
+def test_モデル名を付けるとそのモデルへ差し替わる():
+    i = Interceptor()
+    i.guard.before_generate(
+        lambda e: GenerateDecision(proceed=True, model="gemini-3.1-flash-lite")
     )
 
-    assert not decision.proceed
-
-
-def test_文字列はモデル名の差し替えになる():
-    i = Interceptor()
-    i.on.before_generate(lambda **kw: "gemini-3.1-flash-lite")
-
-    decision = i.check.before_generate(
-        agent="a", phase=Phase.ANSWER, model="pro", attempt=1, step_no=1
-    )
+    decision = i.check.before_generate(before_generate("pro"))
 
     assert decision.proceed
     assert decision.model == "gemini-3.1-flash-lite"
+
+
+def test_モデル名の無い許可は次の判定へ回る():
+    """予算の門と時間帯の門を別々に登録した時、前の門が通しても後ろの門が止められる。"""
+    i = Interceptor()
+    i.guard.before_generate(lambda e: GenerateDecision(proceed=True))
+    i.guard.before_generate(lambda e: GenerateDecision(proceed=False))
+
+    assert not i.check.before_generate(before_generate()).proceed
+
+
+def test_生成前の判定が型でなければ中止する():
+    i = Interceptor()
+    i.guard.before_generate(lambda e: True)
+
+    assert not i.check.before_generate(before_generate()).proceed
 
 
 def test_生成前の判定で例外が出たら中止する():
     """「生成してよい」と解釈すると、予算の門が不具合で開いてしまう。"""
     i = Interceptor()
 
-    def broken(**kw):
+    def broken(event):
         raise RuntimeError("x")
 
-    i.on.before_generate(broken)
-    decision = i.check.before_generate(
-        agent="a", phase=Phase.ANSWER, model="m", attempt=1, step_no=1
-    )
+    i.guard.before_generate(broken)
 
-    assert not decision.proceed
+    assert not i.check.before_generate(before_generate()).proceed
 
 
-# ---- check.generation_failed（既定は再試行しない） ----
+# ---- recover.generation_failed（既定は再試行しない） ----
 def test_登録が無ければ再試行しない():
     """何回試すか・どれだけ待つかは運用の方針なので、フレームワークは決めない。"""
-    decision = Interceptor().check.generation_failed(
-        agent="a", phase=Phase.ANSWER, model="m", attempt=1, error=RuntimeError("x")
-    )
+    decision = Interceptor().check.generation_failed(generation_failed())
 
     assert not decision.retry
 
 
-def test_Trueで同じモデルのまま再試行する():
+def test_再試行の判定で同じモデルのまま再試行する():
     i = Interceptor()
-    i.on.generation_failed(lambda **kw: True)
+    i.recover.generation_failed(lambda e: RetryDecision(retry=True))
 
-    decision = i.check.generation_failed(
-        agent="a", phase=Phase.ANSWER, model="m", attempt=1, error=RuntimeError("x")
-    )
+    decision = i.check.generation_failed(generation_failed())
 
     assert decision.retry
     assert decision.model == ""
 
 
-def test_文字列は別モデルでの再試行になる():
+def test_モデル名を付けると別モデルでの再試行になる():
     """枠を使い切ったモデルは待っても同じエラーが返るため。"""
     i = Interceptor()
-    i.on.generation_failed(lambda **kw: "flash-lite")
+    i.recover.generation_failed(lambda e: RetryDecision(retry=True, model="flash-lite"))
 
-    decision = i.check.generation_failed(
-        agent="a", phase=Phase.ANSWER, model="pro", attempt=1, error=RuntimeError("x")
-    )
+    decision = i.check.generation_failed(generation_failed("pro"))
 
     assert decision.retry
     assert decision.model == "flash-lite"
+
+
+def test_再試行しない判定は次の登録へ回る():
+    """待って直る失敗と、モデルを変えれば直る失敗を、別々の関数で扱えるようにするため。"""
+    i = Interceptor()
+    i.recover.generation_failed(lambda e: RetryDecision(retry=False))
+    i.recover.generation_failed(lambda e: RetryDecision(retry=True, model="flash-lite"))
+
+    decision = i.check.generation_failed(generation_failed())
+
+    assert decision.retry
+    assert decision.model == "flash-lite"
+
+
+def test_再試行の判定が型でなければ再試行しない():
+    i = Interceptor()
+    i.recover.generation_failed(lambda e: True)
+
+    assert not i.check.generation_failed(generation_failed()).retry
 
 
 def test_再試行の判定で例外が出たら諦める():
     """再試行として扱うと、コールバックの不具合が無限の再試行になる。"""
     i = Interceptor()
 
-    def broken(**kw):
+    def broken(event):
         raise RuntimeError("x")
 
-    i.on.generation_failed(broken)
-    decision = i.check.generation_failed(
-        agent="a", phase=Phase.ANSWER, model="m", attempt=1, error=RuntimeError("y")
-    )
+    i.recover.generation_failed(broken)
 
-    assert not decision.retry
+    assert not i.check.generation_failed(generation_failed()).retry
 
 
 def test_再試行の判定には元の例外が渡る():
-    seen = {}
+    seen = []
     i = Interceptor()
 
-    def decide(*, agent, phase, model, attempt, error):
-        seen["error"] = error
-        return False
+    def decide(event):
+        seen.append(event.error)
+        return RetryDecision(retry=False)
 
-    i.on.generation_failed(decide)
+    i.recover.generation_failed(decide)
     original = RuntimeError("429 Too Many Requests")
-    i.check.generation_failed(
-        agent="a", phase=Phase.ANSWER, model="m", attempt=1, error=original
-    )
+    i.check.generation_failed(generation_failed(error=original))
 
-    assert seen["error"] is original
+    assert seen[0] is original
 
 
-# ---- notify（観測側の不具合で実行を止めない） ----
+# ---- notice（観測側の不具合で実行を止めない） ----
 def test_通知は登録された全員へ届く():
     seen = []
     i = Interceptor()
-    i.on.error(seen.append)
-    i.on.error(seen.append)
+    i.notice.error(seen.append)
+    i.notice.error(seen.append)
 
-    i.notify.error("何かが起きた")
+    event = ErrorEvent(source="librarian", message="何かが起きた")
+    i.notify.error(event)
 
-    assert seen == ["何かが起きた", "何かが起きた"]
+    assert seen == [event, event]
 
 
 def test_通知コールバックの例外は握りつぶす():
@@ -223,20 +287,34 @@ def test_通知コールバックの例外は握りつぶす():
     reached = []
     i = Interceptor()
 
-    def broken(message):
+    def broken(event):
         raise RuntimeError("観測側のバグ")
 
-    i.on.error(broken)
-    i.on.error(reached.append)
+    i.notice.error(broken)
+    i.notice.error(reached.append)
 
-    i.notify.error("x")  # 例外が外へ出ないこと
+    event = ErrorEvent(source="librarian", message="x")
+    i.notify.error(event)  # 例外が外へ出ないこと
 
     # 前が落ちても後続は呼ばれる
-    assert reached == ["x"]
+    assert reached == [event]
+
+
+def test_通知へ登録した関数は実行の可否に関わらない():
+    """
+    窓口を分けた理由そのもの。観測のつもりの関数が何を返しても（返し忘れても）、
+    実行は止まらない。
+    """
+    i = Interceptor()
+    i.notice.execute_blocked(lambda e: False)
+    i.notice.execute_start(lambda e: None)
+
+    assert i.check.before_execute(before_execute()).allowed
 
 
 def test_登録が無い通知は何もしない():
-    Interceptor().notify.respond_start("x")  # 例外が出ないこと
+    # 例外が出ないこと
+    Interceptor().notify.respond_start(RespondStartEvent(agent="a", message="x"))
 
 
 def test_has_listenersは登録の有無を返す():
@@ -244,7 +322,7 @@ def test_has_listenersは登録の有無を返す():
     i = Interceptor()
     assert not i.has_listeners
 
-    i.on.error(lambda m: None)
+    i.notice.error(lambda e: None)
     assert i.has_listeners
 
 
@@ -256,7 +334,7 @@ def test_同じ種別の通知は1件ずつに直列化される():
     active = []
     lock = threading.Lock()
 
-    def slow(message):
+    def slow(event):
         with lock:
             active.append(1)
             if len(active) > 1:
@@ -265,8 +343,13 @@ def test_同じ種別の通知は1件ずつに直列化される():
         with lock:
             active.pop()
 
-    i.on.error(slow)
-    threads = [threading.Thread(target=i.notify.error, args=(f"m{n}",)) for n in range(5)]
+    i.notice.error(slow)
+    threads = [
+        threading.Thread(
+            target=i.notify.error, args=(ErrorEvent(source="a", message=f"m{n}"),)
+        )
+        for n in range(5)
+    ]
     for t in threads:
         t.start()
     for t in threads:
@@ -284,3 +367,16 @@ def test_登録と発火のイベント名が揃っている():
     from statecraft.interceptor import _verify_events
 
     _verify_events()  # 例外が出ないこと
+
+
+def test_同じイベント名が2つの登録の窓口にあると落とす(monkeypatch):
+    """どちらの既定値（拒否か、受け取るだけか）で扱うかが決まらなくなるため。"""
+    from statecraft import interceptor as module
+
+    def error(self, callback):
+        self._interceptor._register("error", callback)
+
+    monkeypatch.setattr(module._GuardRegistry, "error", error, raising=False)
+
+    with pytest.raises(ImportError):
+        module._verify_events()
