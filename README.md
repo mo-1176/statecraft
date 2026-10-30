@@ -1320,121 +1320,131 @@ Orchestrator（統括）    記憶を持ち、知識の取得と全体の判断�
 from statecraft import Interceptor
 
 ic = Interceptor()
-ic.on.execute_start(lambda message: print(message))
-ic.on.before_execute(guard)
+ic.notice.execute_start(lambda event: print(event.message))
+ic.guard.before_execute(guard)
 
 net = MyBuilder.from_dir(ROOT, ic).build()   # コードで組む場合は Network(agents=[...], interceptor=ic)
 ```
 
+### 登録の窓口は3つ
+
+**コールバックが何を返すかで、登録する窓口が分かれています。**
+
+| 窓口 | 何をするか | 返すもの | 登録が無い時 |
+|---|---|---|---|
+| `notice` | 起きたことを受け取るだけ | なし（返しても見ない） | 何も起きない |
+| `guard` | 実行・生成を止められる | 判定の型（`ExecuteDecision` / `GenerateDecision`） | 通す |
+| `recover` | 失敗した後にどうするかを決める | 判定の型（`RetryDecision`） | 再試行しない |
+
+**観測だけをしたい関数は、必ず `notice` へ登録してください。** `guard` へ置くと、返し方を誤った時に実行が止まります。止められた呼び出しの引数も、`notice.execute_blocked` で受け取れます。
+
 ### イベント一覧
 
-**check** は戻り値で挙動を変えられます。**notify** は起きたことを受け取るだけです。
+**どのコールバックも、イベントの型の値を1つだけ受け取ります。** 型の名前はタイミングの名前に揃えてあり（`execute_start` → `ExecuteStartEvent`）、定義は `src/statecraft/events.py` にまとまっています。エディタで `event.` と打てば、載っている項目が補完で出ます。
 
-**check** のコールバックは、受け取る引数がイベントごとに違います。下の表の「受け取るもの」がそのままキーワード引数の名前になるので、`def guard(*, name: str, kwargs: dict)` のように書いてください。
+| イベント | 窓口 | いつ呼ばれるか | 受け取る型 | 返すもの |
+|---|---|---|---|---|
+| `before_execute` | **guard** | ツール・エージェントを実行する直前 | `BeforeExecuteEvent` | `ExecuteDecision` |
+| `before_generate` | **guard** | LLMへリクエストを投げる直前 | `BeforeGenerateEvent` | `GenerateDecision` |
+| `generation_failed` | **recover** | 生成がエラーで終わった時 | `GenerationFailedEvent` | `RetryDecision` |
+| `execute_start` | notice | 実行を始めた時（`before_execute` を通った後） | `ExecuteStartEvent` | — |
+| `execute_end` | notice | 実行を終えた瞬間（呼ばれた側から） | `ExecuteEndEvent` | — |
+| `execute_blocked` | notice | 実行が止められた時 | `ExecuteBlockedEvent` | — |
+| `executed` | notice | 実行1件の記録（同じバッチの実行が終わった後に、呼んだ側から） | `ExecutedEvent` | — |
+| `generated` | notice | 生成が1回終わった時 | `GeneratedEvent` | — |
+| `memory_diff` | notice | 記憶へ書き込まれた時 | `MemoryDiffEvent` | — |
+| `memory_updated` | notice | 記憶の更新が終わった時 | `MemoryUpdatedEvent` | — |
+| `respond_start` / `respond_end` | notice | `respond()` の開始・終了 | `RespondStartEvent` / `RespondEndEvent` | — |
+| `error` | notice | 処理は続くが記録すべき異常が起きた時 | `ErrorEvent` | — |
 
-| イベント | 種別 | いつ呼ばれるか | 受け取るもの |
-|---|---|---|---|
-| `before_execute` | **check** | ツール・エージェントを実行する直前 | `name` / `kwargs` |
-| `before_generate` | **check** | LLMへリクエストを投げる直前 | `agent` / `phase` / `model` / `attempt` / `step_no` |
-| `generation_failed` | **check** | 生成がエラーで終わった時 | `agent` / `phase` / `model` / `attempt` / `error` |
-| `executed` | notify | 実行が終わった時 | `event`（`ExecuteEvent`） |
-| `memory_diff` | notify | 記憶へ書き込まれた時 | `event`（`MemoryDiffEvent`） |
-| `generated` | notify | 生成が1回終わった時 | `event`（`GenerationEvent`） |
-| `execute_start` / `execute_end` / `execute_blocked` | notify | 実行の開始・終了・拒否 | `message`（`str`） |
-| `respond_start` / `respond_end` | notify | `respond()` の開始・終了 | `message`（`str`） |
-| `memory_updated` | notify | 記憶の更新が終わった時 | `message`（`str`） |
-| `error` | notify | 処理は続くが記録すべき異常が起きた時 | `message`（`str`） |
+```python
+def guard(event: BeforeExecuteEvent) -> ExecuteDecision: ...
+def log_call(event: ExecutedEvent) -> None: ...
+```
 
-**「表示用の文章」と「構造のまま」の違いが要点です。** 前者は人が読むための1本の文字列で、機械で扱うには向きません（`『深夜特急』の所蔵状況を照会しています...` のような文です）。引数や戻り値、トークン数を数えたい場合は、後者の3つ（`executed` / `memory_diff` / `generated`）を使ってください。
+引数名は自由です（位置で1つ渡るため）。`event` は慣習的な名前です。
+
+**`message` は人が読むための1行です。** `『深夜特急』の所蔵状況を照会しています...` のような文で、機械で扱うには向きません。名前・引数・成否は、`message` 以外の項目から読んでください。戻り値やトークン数まで数えたい場合は、`executed` / `memory_diff` / `generated` が構造のまま持っています。
 
 `before_execute` は**ツールとエージェントの両方で呼ばれる**ので、委譲そのものも審査できます。
 
-#### check に渡ってくる引数
+#### 項目の一覧
 
-**すべてキーワード引数**で渡ります。関数の定義に `*` を付けてください。
+`executed` / `memory_diff` / `generated` の項目は、それぞれの節にあります（[executed](#実行を観測する--executed) / [memory_diff](#記憶の変化を観測する--memory_diff) / [generated](#生成を計測する--generated)）。
 
-```python
-def guard(*, name: str, kwargs: dict) -> bool | str: ...
-def budget(*, agent: str, phase, model: str, attempt: int, step_no: int) -> bool | str: ...
-def on_fail(*, agent: str, phase, model: str, attempt: int, error: Exception) -> bool | str: ...
-```
+| 型 | 項目 |
+|---|---|
+| `BeforeExecuteEvent` | `name`（呼ばれようとしているtool / agentの名前）/ `kwargs`（それへ渡される引数。LLMが埋めた値） |
+| `BeforeGenerateEvent` | `agent` / `phase`（→ [モデルの割り当て](#モデルの割り当て)）/ `model`（そのとき使うモデル。切り替えた後は切り替え先）/ `attempt`（何回目の試行か。1始まり）/ `step_no`（ReActループの何周目か。1始まり） |
+| `GenerationFailedEvent` | `agent` / `phase` / `model`（その回に実際に使ったモデル）/ `attempt` / `error`（起きた例外そのもの） |
+| `ExecuteStartEvent` | `name` / `kwargs` / `message`（`execution_message` が展開された文） |
+| `ExecuteEndEvent` | `name` / `success` / `message`。失敗の中身は `error` イベントで流れる |
+| `ExecuteBlockedEvent` | `name` / `kwargs` / `reason`（`before_execute` が返した理由。理由を伝えない拒否と、無効化による停止では空文字）/ `message` |
+| `RespondStartEvent` / `RespondEndEvent` | `agent` / `message` |
+| `MemoryUpdatedEvent` | `agent` / `message`（何を更新・無効化したか） |
+| `ErrorEvent` | `source`（異常を見つけたtool / agentの名前）/ `message` |
 
-| 引数 | 型 | 内容 |
+#### 判定の型
+
+`guard` と `recover` のコールバックは、**決まった型で返します。** `True` や文字列では返せません（返すと安全側に倒れ、ログに正しい返し方が出ます）。以前は文字列が判定によって「拒否の理由」だったり「モデル名」だったりしたので、型で分けました。
+
+| 型 | 項目 | 返すイベント |
 |---|---|---|
-| `name` | `str` | 呼ばれようとしているtool / agentの名前 |
-| `kwargs` | `dict` | それへ渡される引数。LLMが埋めた値 |
-| `agent` | `str` | 生成しようとしているAgentの名前 |
-| `phase` | `Phase` | どのphaseの生成か（→ [モデルの割り当て](#モデルの割り当て)） |
-| `model` | `str` | そのとき使うモデル名。切り替えた後は切り替え先が入る |
-| `attempt` | `int` | 何回目の試行か（1始まり） |
-| `step_no` | `int` | ReActループの何周目か（1始まり） |
-| `error` | `Exception` | 起きた例外そのもの |
+| `ExecuteDecision` | `allowed`（許可するか）/ `reason`（拒否の理由。LLMへそのまま渡る） | `before_execute` |
+| `GenerateDecision` | `proceed`（生成するか）/ `model`（使うモデル。空文字なら元のまま） | `before_generate` |
+| `RetryDecision` | `retry`（やり直すか）/ `model`（使うモデル。空文字なら元のまま） | `generation_failed` |
 
-引数を使わない場合も、**受け取りだけは書く必要があります**（キーワード引数なので、宣言していないと `TypeError` になります）。全部要らない場合は `**_` で受けられます。
-
-```python
-def guard(*, name: str, **_) -> bool | str:  # kwargs を使わない場合
-    return name != "send_mail"
-```
-
-#### notify に渡ってくる引数
-
-**位置引数が1つだけ**です。`*` は付けません。
-
-```python
-def log_call(event) -> None: ...  # executed / memory_diff / generated
-def show(message: str) -> None: ...  # それ以外
-```
-
-| 引数 | 型 | 内容 |
-|---|---|---|
-| `event` | `ExecuteEvent` | 実行1件の記録（→ [フィールド](#実行を観測する--executed)） |
-| `event` | `MemoryDiffEvent` | 記憶の差分1件（→ [フィールド](#記憶の変化を観測する--memory_diff)） |
-| `event` | `GenerationEvent` | 生成1回の実測値（→ [フィールド](#生成を計測する--generated)） |
-| `message` | `str` | 表示用の文章1本 |
-
-引数名は自由です（位置で渡るため）。`event` / `message` は慣習的な名前です。
+`GenerateDecision` と `RetryDecision` は形が同じですが、意味が違うので別の型にしてあります。
 
 ---
 
 ### 実行を止める — before_execute
 
 ```python
-def guard(*, name: str, kwargs: dict) -> bool | str:
+from statecraft import BeforeExecuteEvent, ExecuteDecision
+
+
+def guard(event: BeforeExecuteEvent) -> ExecuteDecision:
+    name, kwargs = event.name, event.kwargs
+
     # ツール名で止める
     if name == "send_mail":
-        return "外部への送信はこの環境では実行できません。"
+        return ExecuteDecision(allowed=False, reason="外部への送信はこの環境では実行できません。")
 
     # 引数の内容で止める
     if name == "issue_ticket":
         if not kwargs.get("member_id", "").startswith("M-"):
-            return "受け取った会員番号は正しい形式ではありません。利用者から取得してください。"
+            return ExecuteDecision(
+                allowed=False,
+                reason="受け取った会員番号は正しい形式ではありません。利用者から取得してください。",
+            )
 
     # 外部の状態で止める
     if name == "delete_record" and not is_business_hours():
-        return "営業時間外のため実行できません。"
+        return ExecuteDecision(allowed=False, reason="営業時間外のため実行できません。")
 
     # 理由を伝えたくない場合
     if name == "check_stock" and kwargs.get("title") in RESTRICTED:
-        return False
+        return ExecuteDecision(allowed=False)
 
-    return True
+    return ExecuteDecision(allowed=True)
 
 
-ic.on.before_execute(guard)
+ic.guard.before_execute(guard)
 ```
 
 | 戻り値 | 結果 |
 |---|---|
-| `True` | 許可 |
-| 文字列 | 拒否。**その文字列が理由としてLLMへ渡る** |
-| `False` / `None` / 戻り値なし / 例外 | 拒否。理由は渡らない |
+| `ExecuteDecision(allowed=True)` | 許可 |
+| `ExecuteDecision(allowed=False, reason="…")` | 拒否。**`reason` が理由としてLLMへ渡る** |
+| `ExecuteDecision(allowed=False)` | 拒否。理由は渡らない |
+| それ以外（`True` / `None` / 戻り値なし）・例外 | 拒否。理由は渡らない（型の違う値はログに出る） |
 
 **判定できなかったものが「許可」として通ることはありません。**
 
 止まるのは**その1件だけ**で、同じバッチの他の呼び出しは走ります。LLMは拒否の理由を読んで、次の手を考えます。
 
-理由を返すかどうかは、拒否ごとに選べます。引数を直せば通るもの（形式の誤り）や、条件が分かれば諦められるもの（営業時間外）は伝えてください。理由そのものが審査基準になる場合は `False` を返します。
+理由を返すかどうかは、拒否ごとに選べます。引数を直せば通るもの（形式の誤り）や、条件が分かれば諦められるもの（営業時間外）は伝えてください。理由そのものが審査基準になる場合は `reason` を付けずに拒否します。
 
 **理由に「何なら通るか」は書かないでください。** 形式を教えると、その形式に合わせて値を作られます。
 
@@ -1448,20 +1458,20 @@ OK: 「受け取った会員番号は正しい形式ではありません。利�
 
 形式チェックだけでは、形を真似た値が通ります。**実在の確認はツール本体で行ってください。**
 
-#### 複数のコールバック
+#### 複数の判定
 
-`before_execute` は複数登録でき、**全員が `True` を返した時だけ許可**されます。観測だけを行う関数でも `return True` が必須です。
+`before_execute` は複数登録でき、**全員が許可した時だけ実行されます。** 判定は登録順に呼ばれ、1つが拒否した時点で後続は呼ばれません。
 
-判定は登録順に呼ばれ、1つが拒否した時点で後続は呼ばれません。**観測用は拒否用より先に登録してください**（後ろに置くと、止められた実行の引数だけがログに残りません）。
+**観測は `guard` ではなく `notice` に置いてください。** 実行が始まった時は `execute_start`、止められた時は `execute_blocked` が、どちらも名前と引数を持って流れます。`notice` の関数は何を返しても実行を止めないので、登録の順番も気にしなくて済みます。
 
 ```python
-def watch(*, name: str, kwargs: dict) -> bool:
-    print(f"[引数] {name}({kwargs})")
-    return True  # 書き忘れると全ての実行が拒否される
+def watch(event) -> None:  # ExecuteStartEvent / ExecuteBlockedEvent
+    print(f"[引数] {event.name}({event.kwargs})")
 
 
-ic.on.before_execute(watch)  # 先に登録する
-ic.on.before_execute(guard)
+ic.notice.execute_start(watch)
+ic.notice.execute_blocked(watch)  # 止められた呼び出しの引数も見る
+ic.guard.before_execute(guard)
 ```
 
 #### プロンプト攻撃を別のAgentに見張らせる
@@ -1478,13 +1488,15 @@ ic.on.before_execute(guard)
 auditor = ReflexAgent(name="auditor", ..., shared_memory=SharedMemory(), max_steps=1)
 
 
-def guard(*, name: str, kwargs: dict) -> bool | str:
-    if name in NEEDS_AUDIT:
-        result = auditor.execute(kwargs={"message": f"次の実行を審査せよ: {name} {kwargs}"})
+def guard(event: BeforeExecuteEvent) -> ExecuteDecision:
+    if event.name in NEEDS_AUDIT:
+        result = auditor.execute(
+            kwargs={"message": f"次の実行を審査せよ: {event.name} {event.kwargs}"}
+        )
         if not result.success:
-            return False  # 審査できなかったものは通さない
-        return json.loads(result.value).get("allowed") is True
-    return True
+            return ExecuteDecision(allowed=False)  # 審査できなかったものは通さない
+        return ExecuteDecision(allowed=json.loads(result.value).get("allowed") is True)
+    return ExecuteDecision(allowed=True)
 ```
 
 **審査するAgentは `Network` に渡しません。** 渡すと3つの問題が起きます。
@@ -1530,23 +1542,26 @@ LLMの審査が効くのは、**機械的な条件では書けないもの**だ�
 生成の直前に呼ばれます。**走行中の状態を見て決められる**ので、予算の上限やレート制限に使えます。
 
 ```python
-def budget(*, agent, phase, model, attempt, step_no) -> bool | str:
+from statecraft import BeforeGenerateEvent, GenerateDecision
+
+
+def budget(event: BeforeGenerateEvent) -> GenerateDecision:
     spent = net.total_tokens()[0]
     if spent >= 100_000:
-        return False  # 中止
+        return GenerateDecision(proceed=False)  # 中止
     if spent >= 50_000:
-        return "gemini-3.5-flash-lite"  # 軽いモデルへ落とす
-    return True
+        return GenerateDecision(proceed=True, model="gemini-3.5-flash-lite")  # 軽いモデルへ落とす
+    return GenerateDecision(proceed=True)
 
 
-ic.on.before_generate(budget)
+ic.guard.before_generate(budget)
 ```
 
 | 戻り値 | 結果 |
 |---|---|
-| `True` | そのまま生成する |
-| 文字列 | **そのモデル名**で生成する |
-| それ以外（`False` / `None` / 例外） | 中止する（`GenerationAborted` が飛ぶ） |
+| `GenerateDecision(proceed=True)` | そのまま生成する（後ろに別の判定があれば、そちらにも尋ねる） |
+| `GenerateDecision(proceed=True, model="…")` | **そのモデル**で生成する（ここで決まる） |
+| `GenerateDecision(proceed=False)`・それ以外の値・例外 | 中止する（`GenerationAborted` が飛ぶ） |
 
 **登録しなければ、そのまま生成します。** `before_execute` と同じ向きです。
 
@@ -1557,8 +1572,8 @@ ic.on.before_generate(budget)
 中止すると例外になります。委譲先で起きた場合は依頼元が受け止めて別の手を考えられますが、**回答フェーズで中止すると、回答そのものが作られません。** `phase` が渡るので、回答だけは通す判定も書けます。
 
 ```python
-if phase in (Phase.ANSWER, Phase.CUTOFF_ANSWER, Phase.STALLED_ANSWER):
-    return True
+if event.phase in (Phase.ANSWER, Phase.CUTOFF_ANSWER, Phase.STALLED_ANSWER):
+    return GenerateDecision(proceed=True)
 ```
 
 ---
@@ -1574,35 +1589,41 @@ if phase in (Phase.ANSWER, Phase.CUTOFF_ANSWER, Phase.STALLED_ANSWER):
 
 `429` はレスポンスに `retryDelay: 29s` が入っていても、それが1日あたりの上限であれば待っても同じエラーが返ります。同じモデルで何度やり直しても越えられません。
 
+止めるかどうかではなく次の手を決めるものなので、`guard` ではなく `recover` に登録します。
+
 | 戻り値 | 意味 |
 |---|---|
-| `True` | 同じモデルで再試行する |
-| 文字列 | **そのモデル名**で再試行する |
-| それ以外（`False` / `None` / 例外） | 諦める |
+| `RetryDecision(retry=True)` | 同じモデルで再試行する |
+| `RetryDecision(retry=True, model="…")` | **そのモデル**で再試行する |
+| `RetryDecision(retry=False)`・それ以外の値 | この関数は再試行しない（後ろに別の登録があれば、そちらに尋ねる） |
+| 例外 | 諦める（後ろの登録にも尋ねない） |
 
 待つ場合は、コールバックの中で待ちます。何秒待つか、何回試すか、どのモデルへ逃がすかは、フレームワークが持ちません。
 
 ```python
-def retry_on_overload(*, agent, phase, model, attempt, error) -> bool | str:
-    text = str(error)
+from statecraft import GenerationFailedEvent, RetryDecision
+
+
+def retry_on_overload(event: GenerationFailedEvent) -> RetryDecision:
+    text = str(event.error)
 
     # 枠を使い切った場合は待っても同じエラーが返る。モデルを変える
-    if "RESOURCE_EXHAUSTED" in text and model != "gemini-3.5-flash-lite":
-        return "gemini-3.5-flash-lite"
+    if "RESOURCE_EXHAUSTED" in text and event.model != "gemini-3.5-flash-lite":
+        return RetryDecision(retry=True, model="gemini-3.5-flash-lite")
 
     # 一時的な過負荷なら、待てば同じモデルで通る
-    if "503" in text and attempt < 3:
-        time.sleep(2.0 * attempt)
-        return True
+    if "503" in text and event.attempt < 3:
+        time.sleep(2.0 * event.attempt)
+        return RetryDecision(retry=True)
 
     # 記憶を作るphaseは、軽いモデルへ落とすより諦めた方がよい場合もある
-    if phase in (Phase.INITIAL_MEMORY, Phase.MEMORY_UPDATE):
-        return False
+    if event.phase in (Phase.INITIAL_MEMORY, Phase.MEMORY_UPDATE):
+        return RetryDecision(retry=False)
 
-    return False
+    return RetryDecision(retry=False)
 
 
-ic.on.generation_failed(retry_on_overload)
+ic.recover.generation_failed(retry_on_overload)
 ```
 
 **登録しなければ再試行しません。** `before_execute` / `before_generate`（登録が無ければ進む）とは既定が逆になります。
@@ -1631,7 +1652,10 @@ ic.on.generation_failed(retry_on_overload)
 | `caller_run_id` / `callee_run_id` | 呼び出した側 / 呼ばれた側の起動ID。`callee_run_id` は agent の場合だけ入る（tool は空文字） |
 
 ```python
-def log_call(event) -> None:
+from statecraft import ExecutedEvent
+
+
+def log_call(event: ExecutedEvent) -> None:
     mark = "✓" if event.success else "✗"
     print(
         f"{mark} step{event.step_no} {event.caller} → {event.callee} "
@@ -1639,23 +1663,28 @@ def log_call(event) -> None:
     )
 
 
-ic.on.executed(log_call)
+ic.notice.executed(log_call)
 ```
 
 **実行されなかった呼び出しも流れます。** 拒否されたもの、存在しない名前を呼んだものも記録されます。拒否だけを観測したい場合は `execute_blocked` を見てください。
+
+**`execute_end` との違いは、流れるタイミングです。** `execute_end` は実行が終わった瞬間に、呼ばれた側から流れます（進捗の表示向き）。`executed` は同じバッチの実行がすべて終わった後に、呼んだ側から、呼び出しの順に流れます（記録向き）。ループを通さずに `tool.execute()` を直接呼んだ場合、`executed` は流れません。
 
 ### 記憶の変化を観測する — memory_diff
 
 記憶の差分を構造のまま渡します。材料（`tool_results`）・出力（`rows`）・結果（`errors`）が揃うので、「この入力に対してこの記憶の作り方で合っているか」を検証できます。**失敗時にも発火します。**
 
 ```python
-def record(event) -> None:
+from statecraft import MemoryDiffEvent
+
+
+def record(event: MemoryDiffEvent) -> None:
     print(f"{event.agent} / {event.phase} / {event.attempt}回目")
     for row in event.rows:
         print(f"  {row.get('field')}[{row.get('id')}] {row.get('text')}")
 
 
-ic.on.memory_diff(record)
+ic.notice.memory_diff(record)
 ```
 
 | フィールド | 内容 |
@@ -1691,21 +1720,21 @@ ic.on.memory_diff(record)
 
 **届く順序は、記憶へ適用された順序ではありません。** 並列に走ったエージェントの間で入れ替わります。差分を保存して後から並べ直すなら、受け取った順ではなく `apply_seq` の昇順を使ってください。
 
-`run_id` には、この差分がどの起動の中で作られたかが入ります（`GenerationEvent.run_id` と同じ定義）。`apply_seq` が「適用の順序」、`run_id` が「どの実行に属するか」で、別の軸です。
+`run_id` には、この差分がどの起動の中で作られたかが入ります（`GeneratedEvent.run_id` と同じ定義）。`apply_seq` が「適用の順序」、`run_id` が「どの実行に属するか」で、別の軸です。
 
 ### 呼び出しの木を組む — run_id
 
 イベントが持つ `agent` / `caller` / `callee` は名前なので、同じエージェントが並列に呼ばれると、その内側で流れた `generated` / `memory_diff` をどちらの委譲に紐付けるか決められません。コールバックの順序は終了順で、スレッドはワーカー間で使い回されるため、順序やスレッドIDからは復元できません。
 
-`run_id` は `respond()` / `execute()` 1回ごとに発行されます。`ExecuteEvent.callee_run_id` と、その委譲先が出す `run_id` が同じ値になるので、この2つで木が組めます。
+`run_id` は `respond()` / `execute()` 1回ごとに発行されます。`ExecutedEvent.callee_run_id` と、その委譲先が出す `run_id` が同じ値になるので、この2つで木が組めます。
 
 ```python
 runs: dict[str, list] = {}          # run_id → その実行の中で流れたイベント
 edges: list = []                    # 委譲の辺
 
-ic.on.generated(lambda e: runs.setdefault(e.run_id, []).append(e))
-ic.on.memory_diff(lambda e: runs.setdefault(e.run_id, []).append(e))
-ic.on.executed(lambda e: edges.append(e) if e.callee_run_id else None)
+ic.notice.generated(lambda e: runs.setdefault(e.run_id, []).append(e))
+ic.notice.memory_diff(lambda e: runs.setdefault(e.run_id, []).append(e))
+ic.notice.executed(lambda e: edges.append(e) if e.callee_run_id else None)
 
 # front [8ec2004d6358] 生成2回
 #   - librarian_a [f2b47d7b6b97] 生成4回 / 差分3件
@@ -1730,12 +1759,15 @@ ic.on.executed(lambda e: edges.append(e) if e.callee_run_id else None)
 | `attempt` | 何回目の試行か（1始まり）。再試行が起きると同じphaseから複数回流れる |
 | `step_no` | ReActループの何周目か（1始まり） |
 | `error` | 失敗した試行では例外の内容。成功した試行では空文字 |
-| `run_id` | この生成がどの起動の中で走ったか。`ExecuteEvent.callee_run_id` と一致する |
+| `run_id` | この生成がどの起動の中で走ったか。`ExecutedEvent.callee_run_id` と一致する |
 | `stop_reason` | なぜ生成が終わったか。`"end"` / `"tool_use"` / `"max_tokens"` / `"refusal"` など。例外で失敗した試行では空文字 |
 | `thoughts` | 思考の要約。`carry_thoughts` の Agent の生成でだけ入る（→ [思考の継承](#思考の継承)） |
 
 ```python
-def measure(event) -> None:
+from statecraft import GeneratedEvent
+
+
+def measure(event: GeneratedEvent) -> None:
     if event.error:
         print(f"{event.agent} / {event.phase} / {event.attempt}回目が失敗")
         return
@@ -1743,7 +1775,7 @@ def measure(event) -> None:
     print(f"{event.model} / {event.elapsed:.1f}秒 / in {event.input_tokens:,} (cached {rate:.0f}%)")
 
 
-ic.on.generated(measure)
+ic.notice.generated(measure)
 ```
 
 **失敗した試行も、このイベントで流れます。** `input_tokens` / `output_tokens` は 0 で、累計にも加算されません。`elapsed` に再試行の待ち時間は含みません（待つのは `generation_failed` のコールバック側です）。
@@ -1751,7 +1783,7 @@ ic.on.generated(measure)
 `stop_reason` は `error` では代わりになりません。**`max_tokens` と `refusal` はAPIが正常応答として返すため、例外にならず `error` は空文字のままです。** 同じphaseの生成が何度も並んでいる時、その理由がここにだけ出ます。
 
 ```python
-def watch_truncation(event) -> None:
+def watch_truncation(event: GeneratedEvent) -> None:
     if event.stop_reason in ("max_tokens", "refusal"):
         print(f"{event.agent} / {event.phase} が {event.stop_reason} で終わりました")
 ```
@@ -1764,12 +1796,27 @@ def watch_truncation(event) -> None:
 Tool(func=check_stock, summary="...", execution_message="『{title}』の在庫を照会しています...")
 Agent(name="worker", execution_message="調査しています...", ...)
 
-ic.on.execute_start(lambda message: send_to_frontend(message))
+ic.notice.execute_start(lambda event: send_to_frontend(event.message))
 ```
 
 引数は `{名前}` で差し込めます。渡さなければ、開発者向けの汎用文が使われます。差し込みに失敗しても例外にはなりません（そのキーが空文字になります）。
 
 同じ Interceptor に**宛先の違う購読者を並べられます**。`execute_start` は利用者の画面へ、`execute_blocked` や `error` は内部の文言なのでログへ送る、といった使い分けができます。
+
+### 0.6.0 での書き換え（0.5.0 までの書き方からの移行）
+
+| 0.5.0 まで | 0.6.0 から |
+|---|---|
+| `ic.on.before_execute(cb)` / `ic.on.before_generate(cb)` | `ic.guard.before_execute(cb)` / `ic.guard.before_generate(cb)` |
+| `ic.on.generation_failed(cb)` | `ic.recover.generation_failed(cb)` |
+| `ic.on.（上記以外）(cb)` | `ic.notice.（同じ名前）(cb)` |
+| `def guard(*, name, kwargs)` | `def guard(event)`（`event.name` / `event.kwargs`） |
+| `lambda message: ...` | `lambda event: ...`（文は `event.message`） |
+| `return True` / `return "理由"`（before_execute） | `ExecuteDecision(allowed=True)` / `ExecuteDecision(allowed=False, reason="理由")` |
+| `return True` / `return "モデル名"`（before_generate） | `GenerateDecision(proceed=True)` / `GenerateDecision(proceed=True, model="モデル名")` |
+| `return True` / `return "モデル名"`（generation_failed） | `RetryDecision(retry=True)` / `RetryDecision(retry=True, model="モデル名")` |
+| 観測のために `before_execute` へ登録して `return True` | `notice.execute_start` と `notice.execute_blocked` へ登録する |
+| `ExecuteEvent` / `GenerationEvent` / `CheckResult` | `ExecutedEvent` / `GeneratedEvent` / `ExecuteDecision` |
 
 ---
 
@@ -1900,7 +1947,7 @@ pytest -v                                 # 1件ずつ名前を出す
 | `test_agent_loop.py` | ReActループ。5つの終わり方すべてで必ず回答が返ること、重複を実行しないこと |
 | `test_agent_helpers.py` | 引数の空判定、生成設定の解決、停滞の指紋など、単体で確かめられる部品 |
 | `test_tools.py` | 戻り値の契約と、型ヒントからのスキーマ生成。利用者の関数が壊れても例外を外へ出さないこと |
-| `test_interceptor.py` | 判定の既定値の向き。書き忘れ・例外が「許可」に倒れないこと |
+| `test_interceptor.py` | 判定の既定値の向き。書き忘れ・型の違う戻り値・例外が「許可」に倒れないこと。notice へ登録した関数が実行の可否に関わらないこと |
 | `test_network.py` | 配線の検証。実行時に静かに壊れる設定ミスを構築時に落とすこと |
 | `test_config.py` | 設定ファイルの読み込み。書き間違いが静かに読めてしまわないこと |
 | `test_builder.py` | 設定からの組み立て。設定の値が Agent / Tool へ渡り、書かなかった項目は既定値になること |

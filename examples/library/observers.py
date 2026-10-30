@@ -1,10 +1,11 @@
 """
-interceptor に登録するもの。通知（notify）は観測のみ、判定（check）は拒否権を持つ。
+interceptor に登録するもの。notice は受け取るだけ、guard は止められる、
+recover は失敗した後にどうするかを決める。
 
-    Guard             実行の手前で可否を決める（審査役への問い合わせを含む）
-    ArgumentWatcher   呼ばれた対象と引数を出す
-    CostMeter         生成ごとのトークンと概算コストを積む
-    その他             画面への表示、記憶の変化の表示、生成失敗時の再試行
+    Guard             実行の手前で可否を決める（guard。審査役への問い合わせを含む）
+    ArgumentWatcher   呼ばれた対象と引数を出す（notice）
+    CostMeter         生成ごとのトークンと概算コストを積む（notice）
+    その他             画面への表示、記憶の変化の表示（notice）、生成失敗時の再試行（recover）
 
 Interceptor は文言を持たない。誰に何を見せるかは購読する側で決める。
 """
@@ -13,7 +14,16 @@ import json
 import time
 from typing import ClassVar
 
-from statecraft import Agent, Interceptor
+from statecraft import (
+    Agent,
+    BeforeExecuteEvent,
+    ExecuteBlockedEvent,
+    ExecuteDecision,
+    ExecuteStartEvent,
+    GenerationFailedEvent,
+    Interceptor,
+    RetryDecision,
+)
 
 from . import tools
 from .network import build_compliance
@@ -24,11 +34,12 @@ FALLBACK_MODEL = "gemini-3.5-flash-lite"
 
 class Guard:
     """
-    実行の直前に呼ばれ、拒否できる（before_execute）。
+    実行の直前に呼ばれ、拒否できる（guard.before_execute）。
 
-    True を返した場合のみ許可される（None・返し忘れ・例外はすべて拒否）。
-    文字列を返すと拒否のうえ理由として実行側へ返る。理由そのものが審査基準に
-    なるものは返さない。ずっと使わせないなら Tool.disabled を使う。
+    ExecuteDecision(allowed=True) を返した場合のみ許可される（返し忘れ・
+    型の違う値・例外はすべて拒否）。拒否に reason を付けると、理由として
+    実行側へ返る。理由そのものが審査基準になるものは付けない。
+    ずっと使わせないなら Tool.disabled を使う。
     """
 
     # 操作の審査を通す対象。全toolに掛けると、そのたびに生成が1回増えて遅くなる。
@@ -41,8 +52,9 @@ class Guard:
     def __init__(self) -> None:
         self.compliance: Agent = build_compliance()
 
-    def __call__(self, *, name: str, kwargs: dict) -> bool | str:
-        # ①②③は文字列を返す（拒否と同時に理由がLLMへ渡る）。理由が無いと、
+    def __call__(self, event: BeforeExecuteEvent) -> ExecuteDecision:
+        name, kwargs = event.name, event.kwargs
+        # ①②③は理由を付けて拒否する（拒否と同時に理由がLLMへ渡る）。理由が無いと、
         # 止められた側は原因を探して追加の実行を始める。
         # 引数を直せば通るものは、直せる形で伝える。
 
@@ -50,8 +62,9 @@ class Guard:
         if name == "send_overdue_notice":
             # 「なぜ使えないか」を返す。返さないと、LLMは条件を変えて
             # 何度も呼び直そうとする（このtoolは何をしても通らない）。
-            return (
-                "外部への送信を伴うため、この環境では実行できません。別の手段を検討してください。"
+            return ExecuteDecision(
+                allowed=False,
+                reason="外部への送信を伴うため、この環境では実行できません。別の手段を検討してください。",
             )
 
         # ② 引数の内容で止める — 会員番号の形式が不正なら予約させない
@@ -61,30 +74,36 @@ class Guard:
                 # 何が問題かは返すが、正しい形式は返さない。
                 # 形式を教えると、その形式に合わせて値を作られる
                 # （「M- で始まる」と返したら「12345」を「M-12345」にされた）。
-                return (
-                    f"受け取った会員番号（{member_id!r}）は正しい形式ではありません。"
-                    "利用者から正しい会員番号を取得してください。"
-                    "値を推測したり、形式に合わせて書き換えたりしてはいけません。"
+                return ExecuteDecision(
+                    allowed=False,
+                    reason=(
+                        f"受け取った会員番号（{member_id!r}）は正しい形式ではありません。"
+                        "利用者から正しい会員番号を取得してください。"
+                        "値を推測したり、形式に合わせて書き換えたりしてはいけません。"
+                    ),
                 )
 
         # ③ 外部の状態で止める — 開館時間外は予約の登録を受け付けない
         if name == "issue_reservation" and not tools.is_open_hours():
-            return "開館時間外のため、予約の登録を受け付けられません。開館時間は9時から20時です。"
+            return ExecuteDecision(
+                allowed=False,
+                reason="開館時間外のため、予約の登録を受け付けられません。開館時間は9時から20時です。",
+            )
 
         # ④ 内容を審査して止める — 機械的な条件では書けない場合
         #
         # 判定が必要なものだけに絞る。全toolに掛けると実行のたびに生成が1回増える。
-        # ここは False を返す（理由が審査基準そのものなので伝えない）。
+        # ここは理由を付けない（理由が審査基準そのものなので伝えない）。
         if name in self.NEEDS_COMPLIANCE:
-            return self.judge_execution(name, kwargs)
+            return ExecuteDecision(allowed=self.judge_execution(name, kwargs))
 
         # ⑤ 依頼の内容を審査して止める — 委譲の引数そのものを見る。
         # before_execute は tool と agent の両方で発火するので、「委譲してよいか」
         # も同じ機構で審査できる。ここも理由は返さない（審査基準に当たる）。
         if name in self.NEEDS_REQUEST_AUDIT:
-            return self.judge_request(name, kwargs)
+            return ExecuteDecision(allowed=self.judge_request(name, kwargs))
 
-        return True
+        return ExecuteDecision(allowed=True)
 
     def judge_execution(self, name: str, kwargs: dict) -> bool:
         """操作の審査。規程に反しないかを見る。"""
@@ -141,16 +160,18 @@ class ArgumentWatcher:
     """
     呼ばれた対象と引数を出す。観測だけで、可否の判断はしない。
 
-    before_execute は拒否権を持つ判定。観測するだけのつもりでも
-    True を返し忘れると、その時点で全ての実行が拒否される。
+    notice へ登録するので、何を返しても実行は止まらない。実行が始まった時
+    （execute_start）と止められた時（execute_blocked）の両方を受け取るので、
+    拒否された呼び出しの引数も出る。
     """
 
     def __init__(self) -> None:
         self.call_counts: dict[str, int] = {}
 
-    def __call__(self, *, name: str, kwargs: dict) -> bool:
+    def __call__(self, event: ExecuteStartEvent | ExecuteBlockedEvent) -> None:
+        name = event.name
         shown = []
-        for key, value in kwargs.items():
+        for key, value in event.kwargs.items():
             text = str(value).replace("\n", " ")
             if len(text) > 70:
                 text = f"{text[:70]}…（全{len(str(value))}字）"
@@ -163,13 +184,13 @@ class ArgumentWatcher:
         self.call_counts[name] = self.call_counts.get(name, 0) + 1
         count = self.call_counts[name]
         repeat = f"  ※{count}回目" if count > 1 else ""
-        print(f"  [引数] {name}({', '.join(shown)}){repeat}")
+        blocked = "  ※拒否" if isinstance(event, ExecuteBlockedEvent) else ""
+        print(f"  [引数] {name}({', '.join(shown)}){repeat}{blocked}")
 
         # 同じ対象が何度も呼ばれるのは、前回の結果が記憶へ反映されていない、
         # あるいはtasksが完了扱いになっていない兆候として観測できる。
-        # ここで止めることもできるが、正当な再実行（引数を変えた再試行）も
-        # あるため、このデモでは数えて見せるだけにしている。
-        return True
+        # 止めたいなら guard に別の判定として書く。正当な再実行（引数を変えた
+        # 再試行）もあるため、このデモでは数えて見せるだけにしている。
 
 
 class CostMeter:
@@ -367,52 +388,58 @@ class GenerationPrinter:
         print(f"{head} / in {event.input_tokens:,}{detail} out {event.output_tokens:,}{money}")
 
 
-def retry_on_overload(*, agent: str, phase, model: str, attempt: int, error: Exception) -> bool | str:
+def retry_on_overload(event: GenerationFailedEvent) -> RetryDecision:
     """
-    生成が失敗した時の再試行。Trueなら同じモデルで、モデル名を返すとそのモデルでやり直す。
+    生成が失敗した時の再試行（recover.generation_failed）。モデル名を付けると
+    そのモデルで、付けなければ同じモデルでやり直す。
 
     登録しなければ例外がそのまま外へ出る。「何回待つか」「どこへ逃がすか」は
     フレームワークが決めない。
     """
-    text = str(error)
+    agent, phase, model, attempt = event.agent, event.phase, event.model, event.attempt
+    text = str(event.error)
 
     # 枠を使い切った場合は、待っても同じエラーが返る。同じ条件での
     # やり直しでは越えられないので、既定のモデルへ逃がす。
     if ("429" in text or "RESOURCE_EXHAUSTED" in text) and model != FALLBACK_MODEL:
         print(f"  [再試行] {agent} / {phase.value} / 枠切れのため {FALLBACK_MODEL} でやり直します。")
-        return FALLBACK_MODEL
+        return RetryDecision(retry=True, model=FALLBACK_MODEL)
 
     # 一時的な過負荷なら、待てば同じモデルで通ることが多い。
     # 引数の不正やスキーマの誤りは何度やっても同じ結果になるので対象外。
     temporary = "503" in text or "UNAVAILABLE" in text
     if not temporary or attempt >= 3:
-        return False
+        return RetryDecision(retry=False)
 
     wait = 2.0 * attempt  # 待つのはこちらの仕事。回を追うごとに延ばす
     print(f"  [再試行] {agent} / {phase.value} / {attempt}回目が失敗。{wait:.0f}秒待って再試行します。")
     time.sleep(wait)
-    return True
+    return RetryDecision(retry=True)
 
 
 def build_interceptor(cost: CostMeter) -> Interceptor:
     """1リクエスト分のinterceptorを作る。costはリクエストをまたいで積み上げる。"""
     interceptor = Interceptor()
 
-    # 観測を判定より先に登録する。判定は登録順に呼ばれ、1つが False を返した
-    # 時点で後続は呼ばれない。観測を後ろに置くと、拒否された実行の引数だけが
-    # ログに出ないことになり、「なぜ止まったのか」を追えなくなる。
-    interceptor.on.before_execute(ArgumentWatcher())
-    interceptor.on.before_execute(Guard())
+    # 止める判定は guard、見るだけのものは notice。観測を guard に置かないので、
+    # 返し忘れで実行が止まることはなく、登録の順番を気にする必要もない。
+    interceptor.guard.before_execute(Guard())
+
+    # 引数は、実行が始まった時と止められた時の両方で出す。
+    # 拒否された実行の引数が出ないと「なぜ止まったのか」を追えない。
+    watcher = ArgumentWatcher()
+    interceptor.notice.execute_start(watcher)
+    interceptor.notice.execute_blocked(watcher)
 
     # 利用者の画面へ — 実行の開始だけを流す。
     # 各 Tool / Agent の execution_message が展開された文言が届く。
     # ここに「どのtoolなら何を出すか」の分岐は書かない。
     # 分岐を書くと、toolを足すたびに定義とUIの2箇所を直すことになる。
-    interceptor.on.execute_start(lambda message: print(f"  ▷ {message}"))
+    interceptor.notice.execute_start(lambda event: print(f"  ▷ {event.message}"))
 
-    interceptor.on.memory_diff(print_memory_diff)
-    interceptor.on.generated(GenerationPrinter(cost))
-    interceptor.on.generation_failed(retry_on_overload)
+    interceptor.notice.memory_diff(print_memory_diff)
+    interceptor.notice.generated(GenerationPrinter(cost))
+    interceptor.recover.generation_failed(retry_on_overload)
 
     # 開発者向けのログへ — 内部の文言なので画面へは出さない。
     # execute_blocked や error は利用者に見せる文面ではなく、
@@ -425,6 +452,6 @@ def build_interceptor(cost: CostMeter) -> Interceptor:
         "memory_updated",
         "error",
     ):
-        getattr(interceptor.on, event)(lambda message, event=event: print(f"  [{event}] {message}"))
+        getattr(interceptor.notice, event)(lambda e, event=event: print(f"  [{event}] {e.message}"))
 
     return interceptor

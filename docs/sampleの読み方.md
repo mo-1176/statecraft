@@ -358,7 +358,7 @@ return {
 
 ## 実行を止める5つの場所
 
-`Guard`（`library/observers.py`）が `before_execute` に登録されていて、実行の直前に呼ばれます。上から順に判定され、**先に該当したものが勝ちます。**
+`Guard`（`library/observers.py`）が `guard.before_execute` に登録されていて、実行の直前に呼ばれます。上から順に判定され、**先に該当したものが勝ちます。**
 
 | | 対象 | 止め方 | 理由を返すか |
 |---|---|---|---|
@@ -412,7 +412,7 @@ if member_id not in MEMBERS:
 | | 使う場面 |
 |---|---|
 | `Tool.disabled` | そのセッションで一切使わせない。**LLMに存在すら見せない** |
-| `Guard`（`before_execute`） | 引数の内容や外部の状態で可否が変わる |
+| `Guard`（`guard.before_execute`） | 引数の内容や外部の状態で可否が変わる |
 
 ---
 
@@ -489,12 +489,12 @@ Geminiはスキーマで保証されますが、他のプロバイダでは指�
 
 | 行 | 何のイベントか | 宛先 |
 |---|---|---|
-| `[引数] name(...)` | `before_execute`（観測用の `ArgumentWatcher`） | 開発者 |
+| `[引数] name(...)` | `execute_start` と `execute_blocked`（観測用の `ArgumentWatcher`） | 開発者 |
 | `▷ ...` | `execute_start` | **利用者** |
 | `[審査/許可]` `[拒否]` | `Guard` の中の `print` | 開発者 |
 | `[memory_diff]` | `memory_diff` | 検証用 |
 | `[生成]` | `generated` | 計測用 |
-| `[再試行]` | `generation_failed` の中の `print` | 開発者 |
+| `[再試行]` | `generation_failed`（`recover`）の中の `print` | 開発者 |
 | `[respond_start]` など6種 | message系のイベント | 開発者 |
 
 **`▷` の行だけが利用者向けです。** 文言は各ツールとエージェントの `execution_message` が持っています。`{名前}` には実行時の引数が入ります。
@@ -510,23 +510,26 @@ Geminiはスキーマで保証されますが、他のプロバイダでは指�
 ```
 
 ```python
-interceptor.on.execute_start(lambda message: print(f"  ▷ {message}"))
+interceptor.notice.execute_start(lambda event: print(f"  ▷ {event.message}"))
 ```
 
 **受け取る側に分岐がありません。** 「どのツールなら何を出すか」を書くと、ツールを足すたびに定義とUIの2箇所を直すことになります。
 
 `send_overdue_notice` だけ `execution_message` を書いていません。既定の汎用文が使われます。全部に用意する必要はありません。
 
-### 観測用を先に登録する
+### 観測は notice、止めるのは guard
 
 ```python
-interceptor.on.before_execute(ArgumentWatcher())  # 先
-interceptor.on.before_execute(Guard())
+interceptor.guard.before_execute(Guard())
+
+watcher = ArgumentWatcher()
+interceptor.notice.execute_start(watcher)    # 実行が始まった時
+interceptor.notice.execute_blocked(watcher)  # 止められた時
 ```
 
-**判定は登録順に呼ばれ、1つが拒否した時点で後続は呼ばれません。** 観測を後ろに置くと、止められた実行の引数だけがログに出ず、「なぜ止まったのか」を追えなくなります。
+**止める判定と、見るだけのものは、登録する窓口が違います。** `guard` は判定の型（`ExecuteDecision`）を返し、返し忘れると実行が止まります。`notice` は何を返しても実行に関わりません。
 
-そして `ArgumentWatcher` は**観測だけですが `True` を返すのが必須**です。返し忘れると全ての実行が拒否されます。
+`ArgumentWatcher` は見るだけなので `notice` に置いています。`execute_blocked` にも登録しているので、止められた実行の引数も `[引数] ...  ※拒否` として出て、「なぜ止まったのか」を追えます。
 
 ### 同じ対象が何度も呼ばれたら分かるようにしている
 

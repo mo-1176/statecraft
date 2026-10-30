@@ -153,7 +153,7 @@ def test_思考の要約を生成のイベントで観測できる():
     responses[0] = replied(responses[0], "r-initial", thoughts="まず規程を調べる")
     events = []
     interceptor = Interceptor()
-    interceptor.on.generated(events.append)
+    interceptor.notice.generated(events.append)
     agent = build_agent(FakeLLM(responses), interceptor=interceptor)
 
     agent.respond(message="貸出規程を教えて")

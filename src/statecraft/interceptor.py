@@ -1,37 +1,56 @@
 """
-実行の観測と、実行前の拒否。
+実行の観測と、実行前の判定。
 
-    interceptor.on.execute_start(callback)            # 利用側が登録する
-    interceptor.notify.execute_start("...")           # フレームワークが通知する
-    interceptor.check.before_execute(name=, kwargs=)  # フレームワークが判定を仰ぐ
+    interceptor.notice.execute_start(callback)        # 利用側が登録する（受け取るだけ）
+    interceptor.guard.before_execute(callback)        # 利用側が登録する（止められる）
+    interceptor.recover.generation_failed(callback)   # 利用側が登録する（失敗の後を決める）
 
-notifyは起きたことを伝えるだけ。checkは拒否権を持つ。
-イベントの一覧と、各コールバックの引数・戻り値はREADMEを参照。
+    interceptor.notify.execute_start(event)           # フレームワークが通知する
+    interceptor.check.before_execute(event)           # フレームワークが判定を仰ぐ
+
+登録の窓口は、コールバックが何を返すかで分けてある。noticeは何も返さず、
+guardは止めるかどうかを、recoverは失敗した後にどうするかを返す。窓口が1つだと、
+観測のつもりで登録した関数が拒否権を持ち、返し忘れで実行を止めてしまう。
+
+コールバックが受け取るのは、どの窓口でもイベントの型1つ（events.py）。
+guard / recoverは判定の型（ExecuteDecision など）で返す。真偽値や文字列で返させない
+のは、同じ文字列が判定ごとに「拒否の理由」「モデル名」と別の意味になっていたため。
+イベントの一覧と使い方はREADMEを参照。
 
 イベント名は各メソッドが文字列で明示し、_verify_events()がimport時に
-名前の一致と3面の対称性を確かめる（ズレると静かに呼ばれなくなるため）。
+名前の一致と窓口の対称性を確かめる（ズレると静かに呼ばれなくなるため）。
 """
 
 import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
 
-if TYPE_CHECKING:
-    # 実行時にimportしない。イベントの型はagent側が定義しており、
-    # ここで本当にimportすると依存が逆流する（agent → interceptor）。
-    from .agent import ExecuteEvent, GenerationEvent, MemoryDiffEvent
-    from .prompts import Phase
+from .events import (
+    BeforeExecuteEvent,
+    BeforeGenerateEvent,
+    ErrorEvent,
+    ExecuteBlockedEvent,
+    ExecutedEvent,
+    ExecuteEndEvent,
+    ExecuteStartEvent,
+    GeneratedEvent,
+    GenerationFailedEvent,
+    MemoryDiffEvent,
+    MemoryUpdatedEvent,
+    RespondEndEvent,
+    RespondStartEvent,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # ---- 判定の結果 ----
+# guard / recoverのコールバックが返し、フレームワークもこの形で受け取る。
 @dataclass
-class CheckResult:
+class ExecuteDecision:
     """
-    実行前の判定の結果。
+    実行前の判定の結果（before_execute）。
 
     理由を返せるのは、無いと止められた側が原因を探して追加の実行を始めるため。
     返すかどうかは拒否する側が選べる（審査基準を伝えると回避される）。
@@ -39,13 +58,23 @@ class CheckResult:
 
     allowed: bool
     # 拒否した理由。空文字なら理由を伝えない拒否。LLMへそのまま渡る。
+    # 許可した場合は読まない。
     reason: str = ""
+
+
+@dataclass
+class GenerateDecision:
+    """生成の前の判定の結果（before_generate）。RetryDecisionと形は同じだが意味が違う。"""
+
+    proceed: bool
+    # 生成に使うモデル名。空文字なら元のモデルのまま。
+    model: str = ""
 
 
 @dataclass
 class RetryDecision:
     """
-    生成が失敗した時の判定の結果。
+    生成が失敗した時の判定の結果（generation_failed）。
 
     枠を使い切ったモデルは待っても同じエラーが返るため、モデル名を返せる。
     """
@@ -55,69 +84,104 @@ class RetryDecision:
     model: str = ""
 
 
-@dataclass
-class GenerateDecision:
-    """生成の前の判定の結果。RetryDecisionと形は同じだが意味が違う。"""
+def _log_wrong_type(event: str, verdict: object, expected: type, fallback: str) -> None:
+    """
+    判定の型以外が返った時に、何を返すべきだったかをログへ出す。
 
-    proceed: bool
-    # 生成に使うモデル名。空文字なら元のモデルのまま。
-    model: str = ""
-
-
-# ---- コールバックの形 ----
-# 判定（check）は引数がイベントごとに違う。Protocolにしておくと利用側が書いた
-# 関数の形を型チェッカーが見られる（Callable[..., bool] では引数が消える）。
-class BeforeExecute(Protocol):
-    """Trueだけが許可。文字列は拒否の理由としてLLMへ渡る。"""
-
-    def __call__(self, *, name: str, kwargs: dict) -> bool | str | None: ...
+    True や文字列で返す書き方からの移行で起きやすい。黙って安全側へ倒すだけだと、
+    「なぜ全部止まるのか」が追えない。
+    """
+    logger.error(
+        "%sのコールバックが%s以外を返しました（%r）。%sとして扱います。",
+        event,
+        expected.__name__,
+        verdict,
+        fallback,
+    )
 
 
-class BeforeGenerate(Protocol):
-    """Trueでそのまま生成。文字列はそのモデル名で生成。それ以外は中止。"""
-
-    def __call__(
-        self, *, agent: str, phase: "Phase", model: str, attempt: int, step_no: int
-    ) -> bool | str | None: ...
-
-
-class GenerationFailed(Protocol):
-    """Trueで同じモデルで再試行。文字列はそのモデル名で再試行。それ以外は諦める。"""
-
-    def __call__(
-        self, *, agent: str, phase: "Phase", model: str, attempt: int, error: Exception
-    ) -> bool | str | None: ...
-
-
-# ---- 登録・通知・判定の3つの名前空間 ----
+# ---- 登録の窓口（利用側が使う） ----
 # 文字列キーの窓口（on("tool_strat", cb)）にしないのは、タイポが静かに何も
 # しない状態になるため。メソッドなら補完が効き、誤りが実行前に分かる。
-class _OnRegistry:
-    """イベントの登録。interceptor.on.xxx(callback) の形で使う。"""
+class _NoticeRegistry:
+    """
+    通知の登録。interceptor.notice.xxx(callback) の形で使う。
+
+    起きたことを受け取るだけで、戻り値は見ない。観測はすべてここへ登録する。
+    """
 
     def __init__(self, interceptor: "Interceptor"):
         self._interceptor = interceptor
 
+    # ---- 応答（respondの境界） ----
+    def respond_start(self, callback: Callable[[RespondStartEvent], None]) -> None:
+        self._interceptor._register("respond_start", callback)
+
+    def respond_end(self, callback: Callable[[RespondEndEvent], None]) -> None:
+        self._interceptor._register("respond_end", callback)
+
     # ---- 実行（tool / agent 共通） ----
-    def before_execute(self, callback: BeforeExecute) -> None:
+    def execute_start(self, callback: Callable[[ExecuteStartEvent], None]) -> None:
+        self._interceptor._register("execute_start", callback)
+
+    def execute_end(self, callback: Callable[[ExecuteEndEvent], None]) -> None:
+        self._interceptor._register("execute_end", callback)
+
+    def execute_blocked(self, callback: Callable[[ExecuteBlockedEvent], None]) -> None:
+        self._interceptor._register("execute_blocked", callback)
+
+    def executed(self, callback: Callable[[ExecutedEvent], None]) -> None:
+        """
+        実行1回ごとに、引数と戻り値を構造のまま受け取る。
+
+        呼び出した側から発火するため、ループを経由しない直接のexecute()
+        呼び出しでは流れない。
+        """
+        self._interceptor._register("executed", callback)
+
+    # ---- 生成 ----
+    def generated(self, callback: Callable[[GeneratedEvent], None]) -> None:
+        """LLMの生成1回ごとに、かかった時間とトークン数を受け取る。"""
+        self._interceptor._register("generated", callback)
+
+    # ---- 記憶 ----
+    def memory_updated(self, callback: Callable[[MemoryUpdatedEvent], None]) -> None:
+        self._interceptor._register("memory_updated", callback)
+
+    def memory_diff(self, callback: Callable[[MemoryDiffEvent], None]) -> None:
+        """記憶の差分を1回の生成ごとに受け取る。検証・評価のための経路。"""
+        self._interceptor._register("memory_diff", callback)
+
+    # ---- 異常 ----
+    def error(self, callback: Callable[[ErrorEvent], None]) -> None:
+        self._interceptor._register("error", callback)
+
+
+class _GuardRegistry:
+    """
+    止められる判定の登録。interceptor.guard.xxx(callback) の形で使う。
+
+    判定の型以外を返すと止まる（安全側）。観測だけをしたい関数はnoticeへ
+    登録する。拒否された呼び出しの引数も、execute_blockedで受け取れる。
+    """
+
+    def __init__(self, interceptor: "Interceptor"):
+        self._interceptor = interceptor
+
+    def before_execute(
+        self, callback: Callable[[BeforeExecuteEvent], ExecuteDecision]
+    ) -> None:
         """
         実行してよいかを判定する。
 
-        登録された全てがTrueを返した時だけ実行される。観測だけを行う場合も
-        必ずTrueを返すこと（None・書き忘れ・例外はすべて拒否になる）。
+        登録された全てが ExecuteDecision(allowed=True) を返した時だけ実行される。
+        それ以外（返し忘れ・型の違う値・例外）はすべて拒否になる。
         """
         self._interceptor._register("before_execute", callback)
 
-    def generation_failed(self, callback: GenerationFailed) -> None:
-        """
-        生成が例外で失敗した時に、再試行するかどうかを判定する。
-
-        文字列がモデル名を意味するのはこのイベントだけ。登録が無い場合は
-        再試行しない。待つ処理を書けるよう、直列化されない。
-        """
-        self._interceptor._register("generation_failed", callback)
-
-    def before_generate(self, callback: BeforeGenerate) -> None:
+    def before_generate(
+        self, callback: Callable[[BeforeGenerateEvent], GenerateDecision]
+    ) -> None:
         """
         生成を行う前に、行うかどうかを判定する。登録が無ければ生成する。
 
@@ -128,141 +192,107 @@ class _OnRegistry:
         """
         self._interceptor._register("before_generate", callback)
 
-    def execute_start(self, callback: Callable[[str], None]) -> None:
-        self._interceptor._register("execute_start", callback)
 
-    def execute_end(self, callback: Callable[[str], None]) -> None:
-        self._interceptor._register("execute_end", callback)
+class _RecoverRegistry:
+    """
+    失敗した後にどうするかの判定の登録。interceptor.recover.xxx(callback) の形で使う。
 
-    def execute_blocked(self, callback: Callable[[str], None]) -> None:
-        self._interceptor._register("execute_blocked", callback)
-
-    def executed(self, callback: Callable[["ExecuteEvent"], None]) -> None:
-        """
-        実行1回ごとに、引数と戻り値を構造のまま受け取る。
-
-        呼び出した側から発火するため、ループを経由しない直接のexecute()
-        呼び出しでは流れない。
-        """
-        self._interceptor._register("executed", callback)
-
-    # ---- 応答（respondの境界） ----
-    def respond_start(self, callback: Callable[[str], None]) -> None:
-        self._interceptor._register("respond_start", callback)
-
-    def respond_end(self, callback: Callable[[str], None]) -> None:
-        self._interceptor._register("respond_end", callback)
-
-    # ---- 生成 ----
-    def generated(self, callback: Callable[["GenerationEvent"], None]) -> None:
-        """LLMの生成1回ごとに、かかった時間とトークン数を受け取る。"""
-        self._interceptor._register("generated", callback)
-
-    # ---- 記憶 ----
-    def memory_updated(self, callback: Callable[[str], None]) -> None:
-        self._interceptor._register("memory_updated", callback)
-
-    def memory_diff(self, callback: Callable[["MemoryDiffEvent"], None]) -> None:
-        """記憶の差分を1回の生成ごとに受け取る。検証・評価のための経路。"""
-        self._interceptor._register("memory_diff", callback)
-
-    # ---- 異常 ----
-    def error(self, callback: Callable[[str], None]) -> None:
-        self._interceptor._register("error", callback)
-
-
-class _CheckDispatcher:
-    """拒否権を持つ判定。interceptor.check.xxx() の形でフレームワークが呼ぶ。"""
+    guardと違い、止めるかどうかではなく次の手（やり直すか、何で）を返す。
+    """
 
     def __init__(self, interceptor: "Interceptor"):
         self._interceptor = interceptor
 
-    def before_execute(self, *, name: str, kwargs: dict) -> CheckResult:
-        """tool / agent の実行前判定。Invokableとして同一に扱うため共通。"""
-        return self._interceptor._check("before_execute", name=name, kwargs=kwargs)
-
-    def before_generate(
-        self, *, agent: str, phase: "Phase", model: str, attempt: int, step_no: int
-    ) -> GenerateDecision:
-        """生成の前の判定。登録が無ければ生成する。"""
-        return self._interceptor._decide_generate(
-            "before_generate",
-            agent=agent,
-            phase=phase,
-            model=model,
-            attempt=attempt,
-            step_no=step_no,
-        )
-
     def generation_failed(
-        self, *, agent: str, phase: "Phase", model: str, attempt: int, error: Exception
-    ) -> RetryDecision:
+        self, callback: Callable[[GenerationFailedEvent], RetryDecision]
+    ) -> None:
+        """
+        生成が例外で失敗した時に、再試行するかどうかを判定する。
+
+        登録が無い場合は再試行しない。待つ処理を書けるよう、直列化されない。
+        """
+        self._interceptor._register("generation_failed", callback)
+
+
+# ---- 発火の窓口（フレームワークが使う） ----
+class _CheckDispatcher:
+    """
+    判定を仰ぐ。interceptor.check.xxx(event) の形でフレームワークが呼ぶ。
+
+    guardとrecoverに登録されたものが、ここから呼ばれる。
+    """
+
+    def __init__(self, interceptor: "Interceptor"):
+        self._interceptor = interceptor
+
+    def before_execute(self, event: BeforeExecuteEvent) -> ExecuteDecision:
+        """tool / agent の実行前判定。Invokableとして同一に扱うため共通。"""
+        return self._interceptor._check("before_execute", event)
+
+    def before_generate(self, event: BeforeGenerateEvent) -> GenerateDecision:
+        """生成の前の判定。登録が無ければ生成する。"""
+        return self._interceptor._decide_generate("before_generate", event)
+
+    def generation_failed(self, event: GenerationFailedEvent) -> RetryDecision:
         """生成が失敗した時の再試行判定。登録が無ければ再試行しない。"""
-        return self._interceptor._decide_retry(
-            "generation_failed",
-            agent=agent,
-            phase=phase,
-            model=model,
-            attempt=attempt,
-            error=error,
-        )
+        return self._interceptor._decide_retry("generation_failed", event)
 
 
 class _NotifyDispatcher:
-    """通知。interceptor.notify.xxx() の形でフレームワークが呼ぶ。戻り値は見ない。"""
+    """
+    通知。interceptor.notify.xxx(event) の形でフレームワークが呼ぶ。戻り値は見ない。
+
+    noticeに登録されたものが、ここから呼ばれる。
+    """
 
     def __init__(self, interceptor: "Interceptor"):
         self._interceptor = interceptor
 
-    def execute_start(self, message: str) -> None:
-        self._interceptor._notify("execute_start", message)
+    def respond_start(self, event: RespondStartEvent) -> None:
+        self._interceptor._notify("respond_start", event)
 
-    def execute_end(self, message: str) -> None:
-        self._interceptor._notify("execute_end", message)
+    def respond_end(self, event: RespondEndEvent) -> None:
+        self._interceptor._notify("respond_end", event)
 
-    def execute_blocked(self, message: str) -> None:
-        self._interceptor._notify("execute_blocked", message)
+    def execute_start(self, event: ExecuteStartEvent) -> None:
+        self._interceptor._notify("execute_start", event)
 
-    def executed(self, event: "ExecuteEvent") -> None:
+    def execute_end(self, event: ExecuteEndEvent) -> None:
+        self._interceptor._notify("execute_end", event)
+
+    def execute_blocked(self, event: ExecuteBlockedEvent) -> None:
+        self._interceptor._notify("execute_blocked", event)
+
+    def executed(self, event: ExecutedEvent) -> None:
         self._interceptor._notify("executed", event)
 
-    def respond_start(self, message: str) -> None:
-        self._interceptor._notify("respond_start", message)
-
-    def respond_end(self, message: str) -> None:
-        self._interceptor._notify("respond_end", message)
-
-    def generated(self, event: "GenerationEvent") -> None:
+    def generated(self, event: GeneratedEvent) -> None:
         self._interceptor._notify("generated", event)
 
-    def memory_updated(self, message: str) -> None:
-        self._interceptor._notify("memory_updated", message)
+    def memory_updated(self, event: MemoryUpdatedEvent) -> None:
+        self._interceptor._notify("memory_updated", event)
 
-    def memory_diff(self, event: "MemoryDiffEvent") -> None:
+    def memory_diff(self, event: MemoryDiffEvent) -> None:
         self._interceptor._notify("memory_diff", event)
 
-    def error(self, message: str) -> None:
-        """
-        処理は継続するが記録すべき異常。
-
-        LLMへ返すエラー文（expose_error_detailsで隠れる場合がある）とは別に、
-        観測者へは実際に起きたことを伝える。
-        """
-        self._interceptor._notify("error", message)
+    def error(self, event: ErrorEvent) -> None:
+        self._interceptor._notify("error", event)
 
 
 def _verify_events() -> None:
     """
-    3つの名前空間の整合をimport時に確かめる。メソッドが自分の名前を渡して
-    いるか、on と（check | notify）で名前が揃っているか、同じ名前がcheckと
-    notifyの両方に無いか。
+    登録と発火の窓口の整合をimport時に確かめる。メソッドが自分の名前を渡して
+    いるか、同じ名前が2つの登録の窓口に無いか、noticeとnotify、guard・recoverと
+    checkで名前が揃っているか。
 
     どれもズレても実行時エラーにはならず「登録したのに呼ばれない」という形で
     静かに壊れるため、ここで落とす。
     """
     faces: dict[str, set[str]] = {}
     for face, cls in (
-        ("on", _OnRegistry),
+        ("notice", _NoticeRegistry),
+        ("guard", _GuardRegistry),
+        ("recover", _RecoverRegistry),
         ("check", _CheckDispatcher),
         ("notify", _NotifyDispatcher),
     ):
@@ -279,15 +309,23 @@ def _verify_events() -> None:
             names.add(name)
         faces[face] = names
 
-    fired = faces["check"] | faces["notify"]
-    if faces["on"] != fired:
-        raise ImportError(
-            f"イベント名が揃っていません。"
-            f"登録だけあるもの: {sorted(faces['on'] - fired)} / "
-            f"発火だけあるもの: {sorted(fired - faces['on'])}"
-        )
-    if both := faces["check"] & faces["notify"]:
-        raise ImportError(f"checkとnotifyに同じイベント名があります: {sorted(both)}")
+    # 同じイベントが2つの登録の窓口にあると、どちらの既定値で判定するかが決まらない。
+    registries = ("notice", "guard", "recover")
+    for i, a in enumerate(registries):
+        for b in registries[i + 1 :]:
+            if both := faces[a] & faces[b]:
+                raise ImportError(f"{a}と{b}に同じイベント名があります: {sorted(both)}")
+
+    for fire, registered in (
+        ("notify", faces["notice"]),
+        ("check", faces["guard"] | faces["recover"]),
+    ):
+        if faces[fire] != registered:
+            raise ImportError(
+                f"{fire}と登録の窓口でイベント名が揃っていません。"
+                f"登録だけあるもの: {sorted(registered - faces[fire])} / "
+                f"発火だけあるもの: {sorted(faces[fire] - registered)}"
+            )
 
 
 _verify_events()
@@ -300,17 +338,19 @@ class Interceptor:
 
     並列実行では複数のスレッドから呼ばれる。同じ種別のコールバックは1件ずつに
     直列化してあるが、順序は実行の終了順なので「前の通知の内容」には依存できない。
-    notifyとcheckは互いに直列化されず（別のロック）、generation_failedは
-    どちらとも直列化されない。
+    通知とbefore_executeは別のロックで、互いを待たない。before_generateと
+    generation_failedはロックを取らない（中で待つ処理を書けるようにするため）。
     """
 
     def __init__(self):
         self._listeners: dict[str, list[Callable]] = {}
-        # 別のロックにするのは、checkが人の承認を待つ場合に無関係な実行の通知まで
-        # 止めないため。コールバックの中からさらに通知が出るためRLock。
+        # 別のロックにするのは、before_executeが人の承認を待つ場合に無関係な実行の
+        # 通知まで止めないため。コールバックの中からさらに通知が出るためRLock。
         self._notify_lock = threading.RLock()
         self._check_lock = threading.RLock()
-        self.on = _OnRegistry(self)
+        self.notice = _NoticeRegistry(self)
+        self.guard = _GuardRegistry(self)
+        self.recover = _RecoverRegistry(self)
         self.check = _CheckDispatcher(self)
         self.notify = _NotifyDispatcher(self)
 
@@ -319,11 +359,11 @@ class Interceptor:
         """コールバックが1つでも登録されているか。Networkが配線時に参照する。"""
         return any(self._listeners.values())
 
-    # ---- 3つの名前空間からのみ呼ばれる ----
+    # ---- 窓口からのみ呼ばれる ----
     def _register(self, event: str, callback: Callable) -> None:
         self._listeners.setdefault(event, []).append(callback)
 
-    def _notify(self, event: str, *args) -> None:
+    def _notify(self, event: str, payload: object) -> None:
         """
         通知を発火する。
 
@@ -333,78 +373,91 @@ class Interceptor:
         with self._notify_lock:
             for callback in self._listeners.get(event, []):
                 try:
-                    callback(*args)
+                    callback(payload)
                 except Exception:
                     logger.exception(
                         "通知コールバックが例外を送出しました: event=%s", event
                     )
 
-    def _decide_retry(self, event: str, **kwargs) -> RetryDecision:
+    def _decide_retry(
+        self, event: str, payload: GenerationFailedEvent
+    ) -> RetryDecision:
         """
-        失敗した後にどうするかの判定。登録順に尋ね、Trueか文字列を返したものが
-        あればそこで決まる。それ以外と例外、登録が無い場合は再試行しない。
+        失敗した後にどうするかの判定。登録順に尋ね、RetryDecision(retry=True)を
+        返したものがあればそこで決まる。それ以外は次の登録へ回し、例外と
+        登録が無い場合は再試行しない。
 
         直列化しない（待つ処理がコールバックの中に書かれるため、直列化すると
         他の実行が無関係な待ち時間まで待たされる）。
         """
         for callback in self._listeners.get(event, []):
             try:
-                verdict = callback(**kwargs)
+                verdict = callback(payload)
             except Exception:
                 logger.exception(
                     "判定コールバックが例外を送出しました: event=%s", event
                 )
                 # 再試行として扱うと、コールバックの不具合が無限の再試行になる。
                 return RetryDecision(retry=False)
-            if verdict is True:
-                return RetryDecision(retry=True)
-            if isinstance(verdict, str) and verdict:
-                return RetryDecision(retry=True, model=verdict)
+            if not isinstance(verdict, RetryDecision):
+                _log_wrong_type(
+                    event, verdict, RetryDecision, "再試行しない（次の登録へ回す）"
+                )
+                continue
+            if verdict.retry is True:
+                return RetryDecision(retry=True, model=verdict.model or "")
         return RetryDecision(retry=False)
 
-    def _decide_generate(self, event: str, **kwargs) -> GenerateDecision:
+    def _decide_generate(
+        self, event: str, payload: BeforeGenerateEvent
+    ) -> GenerateDecision:
         """
-        生成の前の判定。_decide_retryと形は同じだが既定が逆で、登録が無ければ
-        生成する（未登録の利用側が動かなくなるのを避ける）。ロックは取らない。
+        生成の前の判定。登録順に尋ね、GenerateDecision(proceed=True)なら次の登録へ
+        回す。モデル名が付いていればそこで決まる。中止・型の違う値・例外は
+        そこで中止する。
+
+        _decide_retryと形は同じだが既定が逆で、登録が無ければ生成する
+        （未登録の利用側が動かなくなるのを避ける）。ロックは取らない。
         """
         for callback in self._listeners.get(event, []):
             try:
-                verdict = callback(**kwargs)
+                verdict = callback(payload)
             except Exception:
                 logger.exception(
                     "判定コールバックが例外を送出しました: event=%s", event
                 )
                 # 「生成してよい」と解釈すると、予算の門が不具合で開く。
                 return GenerateDecision(proceed=False)
-            if verdict is True:
-                continue
-            if isinstance(verdict, str) and verdict:
-                return GenerateDecision(proceed=True, model=verdict)
-            return GenerateDecision(proceed=False)
+            if not isinstance(verdict, GenerateDecision):
+                _log_wrong_type(event, verdict, GenerateDecision, "中止")
+                return GenerateDecision(proceed=False)
+            if verdict.proceed is not True:
+                return GenerateDecision(proceed=False)
+            if verdict.model:
+                return GenerateDecision(proceed=True, model=verdict.model)
         return GenerateDecision(proceed=True)
 
-    def _check(self, event: str, **kwargs) -> CheckResult:
+    def _check(self, event: str, payload: BeforeExecuteEvent) -> ExecuteDecision:
         """
-        拒否権のある判定。明示的にTrueを返したものだけ許可し、None・書き忘れ・
-        例外はすべて拒否（許可と解釈すると権限確認の失敗が通る）。
-        文字列も拒否で、その文字列を理由として持ち帰る。
+        拒否権のある判定。ExecuteDecision(allowed=True)を返したものだけ許可し、
+        返し忘れ・型の違う値・例外はすべて拒否（許可と解釈すると権限確認の
+        失敗が通る）。拒否の理由は、返された判定からそのまま持ち帰る。
 
-        checkだけのロックを取るので、人の承認を待つあいだも通知は流れ続ける。
+        判定だけのロックを取るので、人の承認を待つあいだも通知は流れ続ける。
         """
         with self._check_lock:
             for callback in self._listeners.get(event, []):
                 try:
-                    verdict = callback(**kwargs)
+                    verdict = callback(payload)
                 except Exception:
                     logger.exception(
                         "判定コールバックが例外を送出しました: event=%s", event
                     )
                     # 例外の内容は理由にしない（実装の不具合が外へ出る）。
-                    return CheckResult(allowed=False)
-                if verdict is True:
-                    continue
-                # ここへ来たものはすべて拒否。文字列なら理由として扱う。
-                return CheckResult(
-                    allowed=False, reason=verdict if isinstance(verdict, str) else ""
-                )
-            return CheckResult(allowed=True)
+                    return ExecuteDecision(allowed=False)
+                if not isinstance(verdict, ExecuteDecision):
+                    _log_wrong_type(event, verdict, ExecuteDecision, "拒否")
+                    return ExecuteDecision(allowed=False)
+                if verdict.allowed is not True:
+                    return ExecuteDecision(allowed=False, reason=verdict.reason or "")
+            return ExecuteDecision(allowed=True)
