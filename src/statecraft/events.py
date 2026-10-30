@@ -17,6 +17,7 @@ Interceptorへ渡るイベント。タイミング1つにつき型1つで、名�
     guard（止められる。判定の型で返す）
         before_execute      BeforeExecuteEvent      → ExecuteDecision
         before_generate     BeforeGenerateEvent     → GenerateDecision
+        before_memory_diff  BeforeMemoryDiffEvent   → MemoryDiffDecision
     recover（失敗した後を決める。判定の型で返す）
         generation_failed   GenerationFailedEvent   → RetryDecision
 
@@ -228,6 +229,11 @@ class MemoryDiffEvent:
     # GeneratedEvent.run_id と同じ定義（適用の順序はapply_seqが持つ）。
     run_id: str = ""
 
+    # この記憶の更新の中で、監査（before_memory_diff）に見せた何回目の差分か
+    # （1始まり）。監査で差し戻されると、attemptはそのままでこちらが増える。
+    # toolの直接書き込みは監査しないので0。
+    review_round: int = 0
+
     @property
     def applied(self) -> bool:
         """全行が反映されたか。errorsの有無から導出する（ToolResult.successと同じ考え方）。"""
@@ -284,6 +290,51 @@ class BeforeGenerateEvent:
     model: str  # そのとき使うモデル名。切り替えた後は切り替え先が入る
     attempt: int  # 何回目の試行か（1始まり）
     step_no: int  # ReActループの何周目か（1始まり）
+
+
+@dataclass
+class BeforeMemoryDiffEvent:
+    """
+    LLMが作った記憶の差分を、記憶へ当てる直前（INITIAL_MEMORY / MEMORY_UPDATE）。
+
+    次に何をするか（tasks）と今の理解は、記憶の更新で決まる。やりすぎ・
+    早すぎる打ち切り・脱線は、どれもここに現れるので、監査はここで行う。
+    監査に要る材料（原文・今の記憶・差分）を、この時点の写しで揃えて渡す。
+    並列に動く他のエージェントが共有の記憶を書き換えても、判定している
+    差分と材料は食い違わない。
+
+    toolが返した値の直接書き込みは、監査しない（値をそのまま残すための経路）。
+    """
+
+    agent: str  # 差分を作ったAgentの名前
+    phase: Phase  # INITIAL_MEMORY か MEMORY_UPDATE
+    # 形式の誤りで差し戻した回を含めて、何回目の試行か（1始まり。
+    # MemoryDiffEvent.attemptと同じ）。監査の差し戻しでは増えない。
+    attempt: int
+    # この記憶の更新の中で、監査に見せた何回目の差分か（1始まり）。
+    # 監査で差し戻すたびに増える。差し戻しの上限はフレームワークが持たない
+    # ので、何回で通すかは監査する側がこれを見て決める。
+    review_round: int
+    step_no: int  # ReActループの何周目か（1始まり）
+    run_id: str  # どの起動（respond / execute 1回）の中か
+
+    # ---- 原文 ----
+    # 利用者とのやり取り（respond()が記録したもの。利用者の発言だけの一覧を含む）。
+    # 委譲先にとっても、本当の依頼の基準はここにある。
+    conversation: str
+    # このエージェントが受けた依頼。委譲先なら、依頼元が組み立てたもの。
+    # conversationと並べると、伝言でどこがずれたかが分かる。
+    request: str
+
+    # ---- 今の記憶（この差分を当てる前） ----
+    # エージェント自身が読んでいるのと同じ文の形。共有の記憶には
+    # conversationとrequestsも含まれる。
+    shared_memory: str
+    private_memory: str  # goals / tasks / facts / state_briefing など
+
+    # ---- 差分 ----
+    rows: list  # 当てようとしている差分そのもの
+    tool_results: str  # この差分を作らせた材料（今回の実行結果）
 
 
 # ---- recover ----

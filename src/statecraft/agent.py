@@ -34,6 +34,7 @@ from uuid import uuid4
 from .events import (
     BeforeExecuteEvent,
     BeforeGenerateEvent,
+    BeforeMemoryDiffEvent,
     ErrorEvent,
     ExecuteBlockedEvent,
     ExecutedEvent,
@@ -46,7 +47,7 @@ from .events import (
     RespondEndEvent,
     RespondStartEvent,
 )
-from .interceptor import Interceptor
+from .interceptor import Interceptor, MemoryDiffDecision
 from .invokable import Invokable
 from .llm import (
     BaseLLM,
@@ -1409,6 +1410,42 @@ class Agent:
             if task.id in executed_ids and task.status in pending
         ]
 
+    def _review_diff(
+        self,
+        *,
+        phase: Phase,
+        attempt: int,
+        review_round: int,
+        rows: list,
+        tool_results: str,
+    ) -> MemoryDiffDecision:
+        """
+        差分を当てる前に監査（before_memory_diff）へ見せる。
+
+        材料はこの時点の写しで揃えて渡す。監査が後から読みに行くと、並列に
+        動く他のエージェントが共有の記憶を書き換えた後の中身を見てしまう。
+        """
+        conversation = "\n".join(
+            f"[{e.id}] {e.text}" for e in self.shared_memory.conversation
+        )
+        return self.interceptor.check.before_memory_diff(
+            BeforeMemoryDiffEvent(
+                agent=self.name,
+                phase=phase,
+                attempt=attempt,
+                review_round=review_round,
+                step_no=self._step_no,
+                run_id=self.current_run_id,
+                conversation=conversation,
+                request=self.current_input.message if self.current_input else "",
+                shared_memory=self.shared_memory.render(),
+                private_memory=self.private_memory.render(),
+                # 監査が書き換えても、当てる差分は変わらないようにする。
+                rows=copy.deepcopy(rows),
+                tool_results=tool_results,
+            )
+        )
+
     def _update_memory(
         self,
         *,
@@ -1457,7 +1494,15 @@ class Agent:
         executed_ids = self._executed_task_ids(executed) if executed else set()
         # 0以下だとループが一度も回らず、memoryを作らないまま「更新しました」と
         # 通知してしまう。最低1回は必ず生成する。
-        for attempt in range(1, max(1, self.max_memory_retries) + 1):
+        max_attempts = max(1, self.max_memory_retries)
+        attempt = 0
+        # 監査（before_memory_diff）に見せた回数。監査の差し戻しはattemptを
+        # 消費しない。何回で通すかは監査する側が決める（上限を持つのは運用の方針）。
+        review_round = 0
+        # 形式の誤りで差し戻す時の節。監査で差し戻した後の作り直しにも載せる
+        # （直すべき行が、まだ反映されないまま残っているため）。
+        retry_section = ""
+        while attempt < max_attempts:
             response = self._generate(
                 phase,
                 tool_results=tool_results,
@@ -1467,6 +1512,46 @@ class Agent:
             )
 
             rows = _extract_rows(response.text)
+            if rows is not None:
+                # 当てる前に監査へ見せる。当てた後では取り消せない（他の
+                # エージェントが既に読んでいるかもしれない）。
+                review_round += 1
+                verdict = self._review_diff(
+                    phase=phase,
+                    attempt=attempt + 1,
+                    review_round=review_round,
+                    rows=rows,
+                    tool_results=tool_results,
+                )
+                if not verdict.approved:
+                    reason = verdict.reason or "（理由は示されていない）"
+                    # 当てなかった差分も、何を指摘されたかと一緒に流す。
+                    # 「どう脱線し、指摘を受けてどう直したか」を後から追うため。
+                    self.interceptor.notify.memory_diff(
+                        MemoryDiffEvent(
+                            agent=self.name,
+                            phase=phase,
+                            attempt=attempt + 1,
+                            rows=list(rows),
+                            errors=[DiffError("(監査)", "(差分全体)", reason)],
+                            tool_results=tool_results,
+                            step_no=self._step_no,
+                            run_id=self.current_run_id,
+                            review_round=review_round,
+                        )
+                    )
+                    extra = join_sections(
+                        base_extra,
+                        retry_section,
+                        section(
+                            "監査の指摘",
+                            "次の指摘を受けて、今回作った記憶の更新は1行も反映されていない。"
+                            "指摘を踏まえて、記憶の更新を作り直すこと。\n" + reason,
+                        ),
+                    )
+                    continue
+
+            attempt += 1
             if rows is None:
                 errors = [
                     DiffError(
@@ -1511,6 +1596,8 @@ class Agent:
                     step_no=self._step_no,
                     apply_seq=applied_seq,
                     run_id=self.current_run_id,
+                    # 配列として読めなかった差分は監査に見せていない。
+                    review_round=review_round if rows is not None else 0,
                 )
             )
 
@@ -1520,14 +1607,12 @@ class Agent:
             # 失敗内容を添えて再生成させる。通った分は適用済みなので、やり直すのは
             # 失敗した行だけ。毎回ベースから作り直すのは、前回のextraへ積み増すと
             # 修正済みの古い失敗まで提示され続けるため。
-            extra = join_sections(
-                base_extra,
-                section(
-                    "前回の更新で失敗した項目",
-                    "以下は反映されなかった。原因を確認し、修正した分のみを出力すること。\n"
-                    + "\n".join(e.render() for e in errors),
-                ),
+            retry_section = section(
+                "前回の更新で失敗した項目",
+                "以下は反映されなかった。原因を確認し、修正した分のみを出力すること。\n"
+                + "\n".join(e.render() for e in errors),
             )
+            extra = join_sections(base_extra, retry_section)
 
         # リトライを使い切って残った分と、差し戻さずに消した分。どちらも
         # このステップでは記憶に入っていないので、次の更新で1回だけ提示する。

@@ -30,6 +30,7 @@ from .config import (
 from .events import (
     BeforeExecuteEvent,
     BeforeGenerateEvent,
+    BeforeMemoryDiffEvent,
     ErrorEvent,
     ExecuteBlockedEvent,
     ExecutedEvent,
@@ -42,7 +43,13 @@ from .events import (
     RespondEndEvent,
     RespondStartEvent,
 )
-from .interceptor import ExecuteDecision, GenerateDecision, Interceptor, RetryDecision
+from .interceptor import (
+    ExecuteDecision,
+    GenerateDecision,
+    Interceptor,
+    MemoryDiffDecision,
+    RetryDecision,
+)
 from .invokable import Invokable
 from .llm import (
     AzureOpenAILLM,
@@ -72,6 +79,7 @@ __all__ = [
     "BaseLLM",
     "BeforeExecuteEvent",
     "BeforeGenerateEvent",
+    "BeforeMemoryDiffEvent",
     "ClaudeLLM",
     "ErrorEvent",
     "ExecuteBlockedEvent",
@@ -89,6 +97,7 @@ __all__ = [
     "Interceptor",
     "Invokable",
     "KnowledgeConfig",
+    "MemoryDiffDecision",
     "MemoryDiffEvent",
     "MemoryEntry",
     "MemoryUpdatedEvent",

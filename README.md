@@ -1315,6 +1315,7 @@ Orchestrator（統括）    記憶を持ち、知識の取得と全体の判断�
 | 危ない実行を止める | [実行を止める](#実行を止める--before_execute) |
 | 予算の上限を効かせる | [生成を止める・落とす](#生成を止める落とす--before_generate) |
 | コストと時間を測る | [生成を計測する](#生成を計測する--generated) |
+| やりすぎ・早すぎる打ち切り・脱線を監査する | [記憶の更新を監査する](#記憶の更新を監査する--before_memory_diff) |
 
 ```python
 from statecraft import Interceptor
@@ -1333,7 +1334,7 @@ net = MyBuilder.from_dir(ROOT, ic).build()   # コードで組む場合は Netwo
 | 窓口 | 何をするか | 返すもの | 登録が無い時 |
 |---|---|---|---|
 | `notice` | 起きたことを受け取るだけ | なし（返しても見ない） | 何も起きない |
-| `guard` | 実行・生成を止められる | 判定の型（`ExecuteDecision` / `GenerateDecision`） | 通す |
+| `guard` | 実行・生成・記憶の更新を止められる | 判定の型（`ExecuteDecision` / `GenerateDecision` / `MemoryDiffDecision`） | 通す |
 | `recover` | 失敗した後にどうするかを決める | 判定の型（`RetryDecision`） | 再試行しない |
 
 **観測だけをしたい関数は、必ず `notice` へ登録してください。** `guard` へ置くと、返し方を誤った時に実行が止まります。止められた呼び出しの引数も、`notice.execute_blocked` で受け取れます。
@@ -1346,6 +1347,7 @@ net = MyBuilder.from_dir(ROOT, ic).build()   # コードで組む場合は Netwo
 |---|---|---|---|---|
 | `before_execute` | **guard** | ツール・エージェントを実行する直前 | `BeforeExecuteEvent` | `ExecuteDecision` |
 | `before_generate` | **guard** | LLMへリクエストを投げる直前 | `BeforeGenerateEvent` | `GenerateDecision` |
+| `before_memory_diff` | **guard** | LLMが作った記憶の差分を、記憶へ当てる直前 | `BeforeMemoryDiffEvent` | `MemoryDiffDecision` |
 | `generation_failed` | **recover** | 生成がエラーで終わった時 | `GenerationFailedEvent` | `RetryDecision` |
 | `execute_start` | notice | 実行を始めた時（`before_execute` を通った後） | `ExecuteStartEvent` | — |
 | `execute_end` | notice | 実行を終えた瞬間（呼ばれた側から） | `ExecuteEndEvent` | — |
@@ -1370,7 +1372,7 @@ def log_call(event: ExecutedEvent) -> None: ...
 
 #### 項目の一覧
 
-`executed` / `memory_diff` / `generated` の項目は、それぞれの節にあります（[executed](#実行を観測する--executed) / [memory_diff](#記憶の変化を観測する--memory_diff) / [generated](#生成を計測する--generated)）。
+`executed` / `memory_diff` / `generated` / `before_memory_diff` の項目は、それぞれの節にあります（[executed](#実行を観測する--executed) / [memory_diff](#記憶の変化を観測する--memory_diff) / [generated](#生成を計測する--generated) / [before_memory_diff](#記憶の更新を監査する--before_memory_diff)）。
 
 | 型 | 項目 |
 |---|---|
@@ -1393,6 +1395,7 @@ def log_call(event: ExecutedEvent) -> None: ...
 | `ExecuteDecision` | `allowed`（許可するか）/ `reason`（拒否の理由。LLMへそのまま渡る） | `before_execute` |
 | `GenerateDecision` | `proceed`（生成するか）/ `model`（使うモデル。空文字なら元のまま） | `before_generate` |
 | `RetryDecision` | `retry`（やり直すか）/ `model`（使うモデル。空文字なら元のまま） | `generation_failed` |
+| `MemoryDiffDecision` | `approved`（当てるか）/ `reason`（差し戻す理由。LLMへそのまま渡る） | `before_memory_diff` |
 
 `GenerateDecision` と `RetryDecision` は形が同じですが、意味が違うので別の型にしてあります。
 
@@ -1578,6 +1581,70 @@ if event.phase in (Phase.ANSWER, Phase.CUTOFF_ANSWER, Phase.STALLED_ANSWER):
 
 ---
 
+### 記憶の更新を監査する — before_memory_diff
+
+LLMが作った記憶の差分を、**記憶へ当てる前に**見せます（`INITIAL_MEMORY` と `MEMORY_UPDATE`）。次に何をするか（tasks）と今の理解（state_briefing など）は、記憶の更新で決まります。やりすぎ・早すぎる打ち切り・脱線は、どれもこの差分に現れるので、監査はここで行います。
+
+差し戻すと、その差分は1行も当てずに、理由を添えて記憶の更新を作り直させます。
+
+```python
+from statecraft import BeforeMemoryDiffEvent, MemoryDiffDecision
+
+
+def review(event: BeforeMemoryDiffEvent) -> MemoryDiffDecision:
+    # 何回で通すかは、監査する側が決める
+    if event.review_round >= 3:
+        return MemoryDiffDecision(approved=True)
+
+    material = (
+        f"利用者とのやり取り:\n{event.conversation}\n\n"
+        f"このエージェントが受けた依頼:\n{event.request}\n\n"
+        f"今の記憶:\n{event.shared_memory}\n{event.private_memory}\n\n"
+        f"今回の差分:\n{event.rows}\n\n"
+        f"差分の材料:\n{event.tool_results}"
+    )
+    result = auditor.execute(kwargs={"message": material})
+    if not result.success:
+        return MemoryDiffDecision(approved=True)  # 監査できなかった時は止めない
+    verdict = json.loads(result.value)
+    if verdict.get("approved") is True:
+        return MemoryDiffDecision(approved=True)
+    return MemoryDiffDecision(approved=False, reason=verdict.get("reason", ""))
+
+
+ic.guard.before_memory_diff(review)
+```
+
+監査に要る材料は、**この時点の写しでイベントに揃っています**。監査役が Network を読みに行くと、並列に動く他のエージェントが共有の記憶を書き換えた後の中身を見てしまうためです。
+
+| 項目 | 内容 |
+|---|---|
+| `agent` / `phase` / `step_no` / `run_id` | どのエージェントの、どのphaseの、何周目の、どの起動の中の更新か |
+| `attempt` | 形式の誤りで差し戻した回を含めて何回目の試行か。監査の差し戻しでは増えない |
+| `review_round` | この更新の中で、監査に見せた何回目の差分か（1始まり）。監査で差し戻すたびに増える |
+| `conversation` | **原文。** 利用者とのやり取り（利用者の発言だけの一覧を含む） |
+| `request` | **原文。** このエージェントが受けた依頼。委譲先なら依頼元が組み立てたもの。`conversation` と並べると、伝言でどこがずれたかが分かる |
+| `shared_memory` / `private_memory` | **今の記憶**（この差分を当てる前）。エージェント自身が読んでいるのと同じ文の形 |
+| `rows` / `tool_results` | **差分**と、その材料（今回の実行結果） |
+
+| 戻り値 | 結果 |
+|---|---|
+| `MemoryDiffDecision(approved=True)` | 当てる（後ろに別の監査があれば、そちらにも尋ねる） |
+| `MemoryDiffDecision(approved=False, reason="…")` | 当てずに、**`reason` を添えて記憶の更新を作り直させる** |
+| それ以外の値・例外 | その監査を飛ばす（ログに出る） |
+
+判定は**差分全体への意見**です。行ごとの合否にしていないのは、やりすぎ・早すぎる打ち切り・脱線が、1行ではなく計画と理解の向きに現れるためです。何を基準に判定するかは、監査役のプロンプトで決めます。
+
+**差し戻しの上限は、フレームワークが持ちません。** `generation_failed` の再試行と同じく、何回で通すかは運用の方針なので、監査する側が `review_round` を見て決めます。毎回差し戻す監査を登録すると、同じ更新が作り直され続けます。形式の誤りの差し戻し（`max_memory_retries`）とは別に数えるので、監査の差し戻しでその回数は減りません。
+
+**壊れた監査は、止めずに飛ばします。** `before_execute`（判定できなければ拒否）とは向きが逆です。上限をフレームワークが持たないので、差し戻しに倒すと、壊れた監査が同じ更新を作り直させ続けます。
+
+**差し戻した差分も、`memory_diff` で流れます。** `errors` に `(監査)` と理由が入り、`applied` は `False` になります。`review_round` と合わせて、「何を指摘され、どう直したか」を後から追えます。
+
+監査役は、監査される `Network` に入れないでください（[審査役](#プロンプト攻撃を別のagentに見張らせる)と同じ理由です）。監査は直列化されないので、並列に動くエージェントの監査は同時に呼ばれます。`memory` を返したtoolによる直接の書き込みは、値をそのまま残すための経路なので監査しません。
+
+---
+
 ### API側の失敗に備える — generation_failed
 
 生成はAPI越しなので失敗します。落ち方は2種類あり、**対処が逆になります**。
@@ -1701,6 +1768,7 @@ ic.notice.memory_diff(record)
 | `step_no` | ReActループの何周目か（1始まり） |
 | `apply_seq` | 記憶へ何番目に適用されたか（1始まり） |
 | `run_id` | どの起動の中で作られたか（→ [呼び出しの木を組む](#呼び出しの木を組む--run_id)） |
+| `review_round` | 監査（`before_memory_diff`）に見せた何回目の差分か。tool による直接書き込みは 0 |
 | `applied` | 全行が反映されたか（`errors` の有無から導出。下の注意を参照） |
 
 `memory` を返したtoolによる書き込みでも発火します。その場合は `phase` が `None` で、`source_tool` にtool名が入ります。
@@ -1948,6 +2016,7 @@ pytest -v                                 # 1件ずつ名前を出す
 | `test_agent_helpers.py` | 引数の空判定、生成設定の解決、停滞の指紋など、単体で確かめられる部品 |
 | `test_tools.py` | 戻り値の契約と、型ヒントからのスキーマ生成。利用者の関数が壊れても例外を外へ出さないこと |
 | `test_interceptor.py` | 判定の既定値の向き。書き忘れ・型の違う戻り値・例外が「許可」に倒れないこと。notice へ登録した関数が実行の可否に関わらないこと |
+| `test_memory_review.py` | 記憶の更新の監査。差し戻した差分が記憶に入らないこと、原文・今の記憶・差分が揃って渡ること、上限を監査する側が持つこと |
 | `test_network.py` | 配線の検証。実行時に静かに壊れる設定ミスを構築時に落とすこと |
 | `test_config.py` | 設定ファイルの読み込み。書き間違いが静かに読めてしまわないこと |
 | `test_builder.py` | 設定からの組み立て。設定の値が Agent / Tool へ渡り、書かなかった項目は既定値になること |
@@ -1966,7 +2035,7 @@ Geminiでの1往復、委譲、初期ツール、入力/出力スキーマ、実
 
 **未検証**
 
-OpenAI / Azure OpenAI / Claude のプロバイダ実装（Azure OpenAI は、本物の SDK からローカルの代役サーバーへ送り、接続先・認証・キャッシュの区切りの扱いまで確認済み）、思考の継承（Gemini と OpenAI〔gpt-6-luna〕では、サンプルの図書館を通しで動かし、委譲・tool・記憶の更新・ReflexAgent を含めて API が受け付けることまで確認済み。Azure OpenAI は未確認。回答が良くなるかは未検証）、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）
+OpenAI / Azure OpenAI / Claude のプロバイダ実装（Azure OpenAI は、本物の SDK からローカルの代役サーバーへ送り、接続先・認証・キャッシュの区切りの扱いまで確認済み）、思考の継承（Gemini と OpenAI〔gpt-6-luna〕では、サンプルの図書館を通しで動かし、委譲・tool・記憶の更新・ReflexAgent を含めて API が受け付けることまで確認済み。Azure OpenAI は未確認。回答が良くなるかは未検証）、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）、記憶の更新の監査（before_memory_diff。FakeLLMでのみ確認）
 
 ---
 

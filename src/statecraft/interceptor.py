@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from .events import (
     BeforeExecuteEvent,
     BeforeGenerateEvent,
+    BeforeMemoryDiffEvent,
     ErrorEvent,
     ExecuteBlockedEvent,
     ExecutedEvent,
@@ -82,6 +83,21 @@ class RetryDecision:
     retry: bool
     # 再試行に使うモデル名。空文字なら元のモデルのまま。
     model: str = ""
+
+
+@dataclass
+class MemoryDiffDecision:
+    """
+    記憶の差分を当てる前の監査の結果（before_memory_diff）。
+
+    行ごとの合否ではなく、差分全体への意見にする。やりすぎ・早すぎる打ち切り・
+    脱線は、1行ではなく計画と理解の向きに現れるため。
+    """
+
+    approved: bool
+    # 差し戻す理由。LLMへそのまま渡り、これを読んで記憶の更新を作り直す。
+    # 何がずれているかを、依頼から見て書く。通した場合は読まない。
+    reason: str = ""
 
 
 def _log_wrong_type(event: str, verdict: object, expected: type, fallback: str) -> None:
@@ -163,6 +179,7 @@ class _GuardRegistry:
 
     判定の型以外を返すと止まる（安全側）。観測だけをしたい関数はnoticeへ
     登録する。拒否された呼び出しの引数も、execute_blockedで受け取れる。
+    例外はbefore_memory_diffで、壊れた監査は止めずに通す（理由はそちらに書く）。
     """
 
     def __init__(self, interceptor: "Interceptor"):
@@ -191,6 +208,23 @@ class _GuardRegistry:
         generation_failedと同じく直列化されない。
         """
         self._interceptor._register("before_generate", callback)
+
+    def before_memory_diff(
+        self, callback: Callable[[BeforeMemoryDiffEvent], MemoryDiffDecision]
+    ) -> None:
+        """
+        LLMが作った記憶の差分を、当てる前に監査する。登録が無ければ当てる。
+
+        MemoryDiffDecision(approved=False) を返すと、その差分は当てずに、理由を
+        添えて記憶の更新を作り直させる。登録順に尋ね、1つでも差し戻せばそこで決まる。
+
+        差し戻しの上限はフレームワークが持たない（generation_failedの再試行と
+        同じく、何回で通すかは運用の方針）。監査する側がreview_roundを見て決める。
+        そのため、例外と型の違う値は差し戻しではなく「通す」に倒す。差し戻しに
+        倒すと、壊れた監査が同じ更新を作り直させ続ける。
+        中でLLMを呼ぶ監査を想定するので、直列化されない。
+        """
+        self._interceptor._register("before_memory_diff", callback)
 
 
 class _RecoverRegistry:
@@ -232,6 +266,10 @@ class _CheckDispatcher:
     def before_generate(self, event: BeforeGenerateEvent) -> GenerateDecision:
         """生成の前の判定。登録が無ければ生成する。"""
         return self._interceptor._decide_generate("before_generate", event)
+
+    def before_memory_diff(self, event: BeforeMemoryDiffEvent) -> MemoryDiffDecision:
+        """記憶の差分を当てる前の監査。登録が無ければ当てる。"""
+        return self._interceptor._review_memory_diff("before_memory_diff", event)
 
     def generation_failed(self, event: GenerationFailedEvent) -> RetryDecision:
         """生成が失敗した時の再試行判定。登録が無ければ再試行しない。"""
@@ -338,8 +376,9 @@ class Interceptor:
 
     並列実行では複数のスレッドから呼ばれる。同じ種別のコールバックは1件ずつに
     直列化してあるが、順序は実行の終了順なので「前の通知の内容」には依存できない。
-    通知とbefore_executeは別のロックで、互いを待たない。before_generateと
-    generation_failedはロックを取らない（中で待つ処理を書けるようにするため）。
+    通知とbefore_executeは別のロックで、互いを待たない。before_generate・
+    before_memory_diff・generation_failedはロックを取らない（中で待つ処理や
+    LLMの呼び出しを書けるようにするため）。
     """
 
     def __init__(self):
@@ -436,6 +475,32 @@ class Interceptor:
             if verdict.model:
                 return GenerateDecision(proceed=True, model=verdict.model)
         return GenerateDecision(proceed=True)
+
+    def _review_memory_diff(
+        self, event: str, payload: BeforeMemoryDiffEvent
+    ) -> MemoryDiffDecision:
+        """
+        記憶の差分を当てる前の監査。登録順に尋ね、差し戻したものがあれば
+        そこで決まる。登録が無ければ当てる。
+
+        例外と型の違う値は、その監査を飛ばして次へ回す（ログには残す）。
+        差し戻しの上限は監査する側が持つので、ここで差し戻しに倒すと、
+        壊れた監査が同じ更新を作り直させ続ける。ロックは取らない。
+        """
+        for callback in self._listeners.get(event, []):
+            try:
+                verdict = callback(payload)
+            except Exception:
+                logger.exception(
+                    "判定コールバックが例外を送出しました: event=%s", event
+                )
+                continue
+            if not isinstance(verdict, MemoryDiffDecision):
+                _log_wrong_type(event, verdict, MemoryDiffDecision, "この監査を飛ばす")
+                continue
+            if verdict.approved is not True:
+                return MemoryDiffDecision(approved=False, reason=verdict.reason or "")
+        return MemoryDiffDecision(approved=True)
 
     def _check(self, event: str, payload: BeforeExecuteEvent) -> ExecuteDecision:
         """
