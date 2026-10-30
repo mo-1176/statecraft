@@ -13,11 +13,13 @@ import pytest
 from statecraft import (
     BeforeExecuteEvent,
     BeforeGenerateEvent,
+    BeforeMemoryDiffEvent,
     ErrorEvent,
     ExecuteDecision,
     GenerateDecision,
     GenerationFailedEvent,
     Interceptor,
+    MemoryDiffDecision,
     RespondStartEvent,
     RetryDecision,
 )
@@ -43,6 +45,23 @@ def generation_failed(
         model=model,
         attempt=1,
         error=error or RuntimeError("x"),
+    )
+
+
+def before_memory_diff() -> BeforeMemoryDiffEvent:
+    return BeforeMemoryDiffEvent(
+        agent="a",
+        phase=Phase.MEMORY_UPDATE,
+        attempt=1,
+        review_round=1,
+        step_no=1,
+        run_id="r",
+        conversation="利用者（今回の発言）: x",
+        request="x",
+        shared_memory="",
+        private_memory="",
+        rows=[],
+        tool_results="",
     )
 
 
@@ -192,6 +211,47 @@ def test_生成前の判定で例外が出たら中止する():
     i.guard.before_generate(broken)
 
     assert not i.check.before_generate(before_generate()).proceed
+
+
+# ---- guard.before_memory_diff（既定は当てる。壊れた監査は飛ばす） ----
+def test_監査の登録が無ければ当てる():
+    assert Interceptor().check.before_memory_diff(before_memory_diff()).approved
+
+
+def test_監査の差し戻しは理由ごと持ち帰られる():
+    i = Interceptor()
+    i.guard.before_memory_diff(
+        lambda e: MemoryDiffDecision(approved=False, reason="依頼から外れている")
+    )
+
+    decision = i.check.before_memory_diff(before_memory_diff())
+
+    assert not decision.approved
+    assert decision.reason == "依頼から外れている"
+
+
+def test_監査が1つでも差し戻せば差し戻す():
+    i = Interceptor()
+    i.guard.before_memory_diff(lambda e: MemoryDiffDecision(approved=True))
+    i.guard.before_memory_diff(lambda e: MemoryDiffDecision(approved=False))
+
+    assert not i.check.before_memory_diff(before_memory_diff()).approved
+
+
+def test_監査の例外と型の違う値は飛ばして通す():
+    """
+    差し戻しの上限は監査する側が持つ。ここで差し戻しに倒すと、壊れた監査が
+    同じ更新を作り直させ続ける（before_executeの「拒否に倒す」とは向きが逆）。
+    """
+    i = Interceptor()
+
+    def broken(event):
+        raise RuntimeError("監査の実装ミス")
+
+    i.guard.before_memory_diff(broken)
+    i.guard.before_memory_diff(lambda e: False)
+
+    assert i.check.before_memory_diff(before_memory_diff()).approved
 
 
 # ---- recover.generation_failed（既定は再試行しない） ----
