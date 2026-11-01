@@ -20,6 +20,7 @@ LLMの能力を引き出し、軽量モデルでも自律的に多くのタス�
 - [Tool](#tool) — 関数をエージェントが呼べるものにする
 - [Agent](#agent) — 記憶を持って多段の手順を進める
   - [初期記憶だけに渡すナレッジ](#初期記憶だけに渡すナレッジ)
+  - [最終回答だけに渡すナレッジ](#最終回答だけに渡すナレッジ)
   - [記憶](#記憶)
   - [モデルの割り当て](#モデルの割り当て)
   - [プロンプトキャッシュ](#プロンプトキャッシュ)
@@ -411,7 +412,7 @@ tools.yaml と knowledges.yaml は、使わなければ置かなくて構いま�
 | `phase_overrides` | キーは phase の小文字（`initial_memory` / `memory_update` など）。中身は `model` / `provider` / `temperature` / `max_tokens` / `thought_level` |
 | `tools` / `initial_tools` | tools.yaml のツール名 |
 | `sub_agents` | 委譲できるエージェント名（Agent の `sub_agent_names`） |
-| `knowledge` / `initial_knowledge` | knowledges.yaml のナレッジ名。書いた順につなげて渡します |
+| `knowledge` / `initial_knowledge` / `answer_knowledge` | knowledges.yaml のナレッジ名。書いた順につなげて渡します |
 
 Agent の引数のうち、`disabled` と `describe_execution` は設定ファイルでは書けません。`initial_tools` に置けるのも tools.yaml のツールだけです（エージェントは置けません）。これらが要る場合は、コードで組みます（→ [設定ファイルを使わずに組む](#設定ファイルを使わずに組む)）。
 
@@ -771,6 +772,7 @@ agents.yaml では、ほとんどを同じ名前で書きます。違うのは `
 | `sub_agent_names` | `list[str]` | 委譲先の名前。`Network` が実体へ解決する |
 | `initial_tools` | `list[Tool \| Agent]` | ループ前にシステムが実行する。並列で走る。`tools` / `sub_agents` への登録は任意 |
 | `initial_knowledge` | `str` | 初期記憶を作る時だけ渡すナレッジ（tasksの記入例など）。既定は空 |
+| `answer_knowledge` | `str` | 最終回答を作る時だけ渡すナレッジ（答え方の方針など）。既定は空 |
 | `output_schema` | `dict \| None` | 自分の最終回答に強制する形式 |
 | `max_steps` | `int` | ループの上限（既定 10）。残りの回数は、記憶を書くステップに示される |
 | `max_memory_retries` | `int` | 記憶の差分が不正だった時の再生成回数（既定 3） |
@@ -954,6 +956,22 @@ Agent(
 渡り方は初期ツールの結果と同じで、**評価される材料としてプロンプト側に載ります**（常時のルールではありません）。用途を例に限定はしていないので、その構築でだけ必要な前提や判断材料を置いても構いません。
 
 記憶を作るphaseを持たない `ReflexAgent` では一度も載りません。
+
+### 最終回答だけに渡すナレッジ
+
+`answer_knowledge` は、**最終回答を作る生成にだけ**渡されます（打ち切りや停滞で回答する時も含みます）。主な用途は**答え方の方針**です。
+
+記憶には、確かめられなかったことや調べた経緯も残します。それは次の一手を決めるのに要るからです。一方、答えでそれを全部話すと、依頼者には要らない裏側の話が増えます。記憶に何を残すかと、答えで何を話すかを分けたい時に、答え方の方針をここへ置きます。記憶を書くphaseには載らないので、記憶の書き方には影響しません。
+
+```yaml
+# config/agents.yaml
+- name: librarian
+  answer_knowledge: [answer_policy]
+```
+
+渡り方は `initial_knowledge` と同じで、プロンプト側に【この回答のためのナレッジ】として載ります。回答の前に伝える事情（実行されていないタスクなど）があれば、その前に置かれます。
+
+ループの中で答える `ReflexAgent` では載りません。
 
 ### 記憶
 
@@ -1585,7 +1603,7 @@ if event.phase in (Phase.ANSWER, Phase.CUTOFF_ANSWER, Phase.STALLED_ANSWER):
 
 LLMが作った記憶の差分を、**記憶へ当てる前に**見せます（`INITIAL_MEMORY` と `MEMORY_UPDATE`）。次に何をするか（tasks）と今の理解（state_briefing など）は、記憶の更新で決まります。やりすぎ・早すぎる打ち切り・脱線は、どれもこの差分に現れるので、監査はここで行います。
 
-差し戻すと、その差分は1行も当てずに、理由を添えて記憶の更新を作り直させます。
+差し戻すと、その差分は1行も当てずに、理由を添えて作り直させます。**作り直しは、差し戻した差分を直す形で行います。** LLMには差し戻した差分と理由を渡し、直す行だけを同じ `field` と `id` で出させます。出さなかった行は、差し戻した差分のまま当たります。実行結果の書き起こしは差し戻した差分に済んでいるので、作り直しの生成には実行結果を渡しません（指摘が次の一手のことでも、結果を読み直させないため）。
 
 ```python
 from statecraft import BeforeMemoryDiffEvent, MemoryDiffDecision
@@ -1630,7 +1648,7 @@ ic.guard.before_memory_diff(review)
 | 戻り値 | 結果 |
 |---|---|
 | `MemoryDiffDecision(approved=True)` | 当てる（後ろに別の監査があれば、そちらにも尋ねる） |
-| `MemoryDiffDecision(approved=False, reason="…")` | 当てずに、**`reason` を添えて記憶の更新を作り直させる** |
+| `MemoryDiffDecision(approved=False, reason="…")` | 当てずに、**`reason` を添えて、差し戻した差分を直させる**（直した行を重ねたものを、もう一度監査に見せる） |
 | それ以外の値・例外 | その監査を飛ばす（ログに出る） |
 
 判定は**差分全体への意見**です。行ごとの合否にしていないのは、やりすぎ・早すぎる打ち切り・脱線が、1行ではなく計画と理解の向きに現れるためです。何を基準に判定するかは、監査役のプロンプトで決めます。
@@ -1785,6 +1803,8 @@ ic.notice.memory_diff(record)
 `ignored` の行は、このイベントと `error` イベントに出ます。LLMへは次のステップのプロンプトへ1回だけ載り、そこで消えます。
 
 `errors` のうち、再生成しても直らず残った分も、同じように次のステップへ1回だけ伝わります。
+
+`errors` の再生成では、**失敗した行だけを出し直させ、実行結果は渡しません。** 通った行はすでに記憶に入っていて、書き起こしは済んでいるためです。応答が配列として読めなかった時（1行も当たっていない時）だけは、実行結果ごと作り直させます。
 
 **届く順序は、記憶へ適用された順序ではありません。** 並列に走ったエージェントの間で入れ替わります。差分を保存して後から並べ直すなら、受け取った順ではなく `apply_seq` の昇順を使ってください。
 
@@ -2035,7 +2055,7 @@ Geminiでの1往復、委譲、初期ツール、入力/出力スキーマ、実
 
 **未検証**
 
-OpenAI / Azure OpenAI / Claude のプロバイダ実装（Azure OpenAI は、本物の SDK からローカルの代役サーバーへ送り、接続先・認証・キャッシュの区切りの扱いまで確認済み）、思考の継承（Gemini と OpenAI〔gpt-6-luna〕では、サンプルの図書館を通しで動かし、委譲・tool・記憶の更新・ReflexAgent を含めて API が受け付けることまで確認済み。Azure OpenAI は未確認。回答が良くなるかは未検証）、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）、記憶の更新の監査（before_memory_diff。FakeLLMでのみ確認）
+OpenAI / Azure OpenAI / Claude のプロバイダ実装（Azure OpenAI は、本物の SDK からローカルの代役サーバーへ送り、接続先・認証・キャッシュの区切りの扱いまで確認済み）、思考の継承（Gemini と OpenAI〔gpt-6-luna〕では、サンプルの図書館を通しで動かし、委譲・tool・記憶の更新・ReflexAgent を含めて API が受け付けることまで確認済み。Azure OpenAI は未確認。回答が良くなるかは未検証）、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）、記憶の更新の監査（before_memory_diff。FakeLLMでのみ確認）、最終回答だけに渡すナレッジ（answer_knowledge。FakeLLMでのみ確認）
 
 ---
 

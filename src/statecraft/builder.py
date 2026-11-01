@@ -68,6 +68,7 @@ class NetworkBuilder:
         "sub_agents",
         "knowledge",
         "initial_knowledge",
+        "answer_knowledge",
     }
     _TOOL_TEXTS: ClassVar[set[str]] = {"summary", "usage", "evaluation", "execution_message"}
 
@@ -97,6 +98,8 @@ class NetworkBuilder:
             kwargs["knowledge"] = self._knowledge(config.knowledge)
         if config.initial_knowledge:
             kwargs["initial_knowledge"] = self._knowledge(config.initial_knowledge)
+        if config.answer_knowledge:
+            kwargs["answer_knowledge"] = self._knowledge(config.answer_knowledge)
         if config.thought_level is not None:
             kwargs["thought_level"] = self._thought_level(config.thought_level)
         if config.phase_overrides:

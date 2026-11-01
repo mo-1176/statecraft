@@ -181,8 +181,8 @@ class AgentConfig(ConfigEntry):
     """
     agents.yamlの1件。項目はAgentの同名の引数にあたる。
 
-    つながり（tools / initial_tools / sub_agents / knowledge / initial_knowledge）は
-    名前で書き、使う側であるエージェントにだけ書く。同じ関係を2か所に書くと、
+    つながり（tools / initial_tools / sub_agents / knowledge / initial_knowledge /
+    answer_knowledge）は名前で書き、使う側であるエージェントにだけ書く。同じ関係を2か所に書くと、
     片方だけ直したときに食い違う。typeはクラスを選ぶだけで、設定の形は変わらない。
 
     書かなかった項目はNoneのままにし、Agentへ渡さない。既定値をここへ写すと、
@@ -217,6 +217,7 @@ class AgentConfig(ConfigEntry):
     sub_agents: list[str] = []
     knowledge: list[str] = []
     initial_knowledge: list[str] = []
+    answer_knowledge: list[str] = []
 
 
 class NetworkConfig(BaseModel):
@@ -279,6 +280,7 @@ class NetworkConfig(BaseModel):
             ("sub_agents", self.agent_names, "agents.yaml"),
             ("knowledge", self.knowledge_names, "knowledges.yaml"),
             ("initial_knowledge", self.knowledge_names, "knowledges.yaml"),
+            ("answer_knowledge", self.knowledge_names, "knowledges.yaml"),
         )
         for agent in self.agents:
             for field, known, file_name in references:

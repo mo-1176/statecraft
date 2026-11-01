@@ -120,6 +120,27 @@ def _extract_rows(text: str) -> list | None:
     return None
 
 
+def _merge_rows(held: list, fixes: list) -> list:
+    """
+    差し戻した差分に、作り直しで出た行を重ねる。同じfieldとidの行は置き換え、
+    新しい行は後ろへ足す。
+
+    作り直しでは直す行だけを出させるので、出なかった行は差し戻した差分のまま
+    残す。形の崩れた行（dictでない）は、そのまま足して適用側の検査に任せる。
+    """
+
+    def key(row: object) -> tuple | None:
+        if isinstance(row, dict):
+            return (row.get("field"), row.get("id"))
+        return None
+
+    fixed = {key(row): row for row in fixes if key(row) is not None}
+    merged = [fixed.pop(key(row), row) if key(row) else row for row in held]
+    # 置き換えに使わなかった行は、新しく足す行
+    merged.extend(row for row in fixes if key(row) is None or key(row) in fixed)
+    return merged
+
+
 class GenerationAborted(Exception):
     """
     before_generateが生成を中止した。
@@ -447,6 +468,11 @@ class Agent:
     # 主な用途はタスクの組み立て方のfew-shot。何を書くかはREADME参照。
     # knowledgeと分けているのは載る回数が違うため（ReflexAgentでは載らない）。
     initial_knowledge: str = ""
+
+    # 最終回答を作る時だけ、promptへ載るナレッジ（任意）。
+    # 主な用途は答え方の方針。memoryに何を残すかと、答えで何を話すかを
+    # 分けるため、memoryを書くphaseには載せない（ReflexAgentでは載らない）。
+    answer_knowledge: str = ""
 
     # 委譲された時に観測側へ流す文言。Tool.execution_messageと同じ扱い。
     #   execution_message="司書が調べています..."
@@ -1051,6 +1077,11 @@ class Agent:
         """
         spec = PHASE_SPECS[phase]
         schema = self.output_schema if spec.respects_output_schema else None
+        # 答え方の方針は、事情（notice）より前に置く。事情は今回だけのもの。
+        # 作り直しの時もnoticeごと渡るので、方針も落ちない。
+        notice = join_sections(
+            section("この回答のためのナレッジ", self.answer_knowledge), notice
+        )
 
         response = self._generate(phase, response_schema=schema, extra_prompt=notice)
 
@@ -1502,16 +1533,29 @@ class Agent:
         # 形式の誤りで差し戻す時の節。監査で差し戻した後の作り直しにも載せる
         # （直すべき行が、まだ反映されないまま残っているため）。
         retry_section = ""
+        # 監査で差し戻され、当てずに持っている差分。作り直しでは、ここへ直した行
+        # だけを重ねる。全体を作り直させると、実行結果を読み直して、指摘と関係の
+        # ない書き起こしまでやり直すことになる。
+        held: list | None = None
+        # 差分を1度でも当てたか。当てた後の形式の差し戻しは、失敗した行だけを
+        # 出し直させるので、実行結果を読み直す必要がない。1行も当たっていない
+        # （配列として読めなかった）間だけ、書き起こしからやり直させる。
+        applied_once = False
         while attempt < max_attempts:
+            # 作り直しには実行結果を渡さない。書き起こしは、持っている差分か、
+            # 当てた記憶に済んでいる。
+            reread = held is None and not applied_once
             response = self._generate(
                 phase,
-                tool_results=tool_results,
-                tool_blobs=tool_blobs,
+                tool_results=tool_results if reread else "",
+                tool_blobs=tool_blobs if reread else None,
                 extra_prompt=extra,
                 response_schema=schema,
             )
 
             rows = _extract_rows(response.text)
+            if rows is not None and held is not None:
+                rows = _merge_rows(held, rows)
             if rows is not None:
                 # 当てる前に監査へ見せる。当てた後では取り消せない（他の
                 # エージェントが既に読んでいるかもしれない）。
@@ -1540,16 +1584,24 @@ class Agent:
                             review_round=review_round,
                         )
                     )
+                    held = rows
                     extra = join_sections(
                         base_extra,
                         retry_section,
                         section(
                             "監査の指摘",
-                            "次の指摘を受けて、今回作った記憶の更新は1行も反映されていない。"
-                            "指摘を踏まえて、記憶の更新を作り直すこと。\n" + reason,
+                            "次の指摘を受けて、下の差分はまだ記憶に反映されていない。\n"
+                            "指摘を踏まえて、直す行だけを同じfieldとidで出すこと。"
+                            "出さなかった行は、下の差分のまま反映される。"
+                            "実行結果の書き起こしは下の差分に済んでいるので、"
+                            "このステップでは実行結果は渡されない。\n\n"
+                            f"【指摘】\n{reason}\n\n"
+                            "【差し戻された差分】\n"
+                            + json.dumps(rows, ensure_ascii=False, indent=1),
                         ),
                     )
                     continue
+                held = None
 
             attempt += 1
             if rows is None:
@@ -1568,6 +1620,7 @@ class Agent:
                 # LLM由来の差分はidが必須なので、idの採番は起きない。
                 # apply_seq（適用順の番号）は通知へ載せるので受け取る。
                 diff = apply_diff(rows, *memories, handled_disable=spec.allows_disable)
+                applied_once = True
                 errors = diff.errors
                 ignored = diff.ignored
                 applied_seq = diff.apply_seq

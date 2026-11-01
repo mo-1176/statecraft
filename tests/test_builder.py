@@ -202,6 +202,7 @@ def test_ナレッジは書いた順につながる(tmp_path: Path):
           model: m
           knowledge: [b, a]
           initial_knowledge: [a]
+          answer_knowledge: [b]
         """,
     )
     write(
@@ -218,6 +219,7 @@ def test_ナレッジは書いた順につながる(tmp_path: Path):
 
     assert a.knowledge == "Bの中身\n\nAの中身"
     assert a.initial_knowledge == "Aの中身"
+    assert a.answer_knowledge == "Bの中身"
 
 
 def test_組み込みのproviderは登録しなくても使える():
