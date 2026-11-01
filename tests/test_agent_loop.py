@@ -294,6 +294,39 @@ def test_未実行のタスクは回答フェーズへ伝えられる(search_too
     assert "条件次第で調べる" in answer_prompt
 
 
+def test_answer_knowledgeは回答の生成にだけ載る():
+    """記憶に何を残すかと、答えで何を話すかを分けるため、記憶の生成には載せない。"""
+    llm = FakeLLM(
+        [
+            diff_response([{"field": "goals", "id": "g-1", "text": "挨拶する"}]),
+            text_response("こんにちは。"),
+        ]
+    )
+    agent = build_agent(llm, answer_knowledge="確かめた手順は話さない")
+
+    agent.respond(message="やあ")
+
+    memory_prompt, answer_prompt = llm.calls[0]["prompt"], llm.calls[1]["prompt"]
+    assert "確かめた手順は話さない" not in memory_prompt
+    assert "確かめた手順は話さない" in answer_prompt
+
+
+def test_answer_knowledgeは未実行タスクの注意と一緒に載る(search_tool):
+    llm = FakeLLM(
+        [
+            diff_response([task_row("t-1", "条件次第で調べる", "conditional", ["search_rules"])]),
+            text_response("回答"),
+        ]
+    )
+    agent = build_agent(llm, tools=[search_tool], answer_knowledge="確かめた手順は話さない")
+
+    agent.respond(message="x")
+
+    answer_prompt = llm.calls[-1]["prompt"]
+    assert "確かめた手順は話さない" in answer_prompt
+    assert "実行されていないタスク" in answer_prompt
+
+
 # ---- 記憶の差し戻し ----
 def test_不正な差分は差し戻して再生成させる():
     """1回目に存在しないプロパティを書き、2回目で直す台本。"""
@@ -332,6 +365,27 @@ def test_実行したタスクをnextのまま残すと差し戻す(search_tool)
     # 記憶の更新がやり直され、その指示に放置の理由が載っていること
     assert len(llm.calls) == 5
     assert "今回呼び出されたが" in llm.calls[3]["prompt"]
+    # 失敗した行だけを出し直させるので、実行結果は読み直させない
+    assert "貸出の規程です" in llm.calls[2]["prompt"]
+    assert "貸出の規程です" not in llm.calls[3]["prompt"]
+
+
+def test_配列として読めなかった時は実行結果ごとやり直させる(search_tool):
+    """1行も当たっていないので、書き起こしからやり直すしかない。"""
+    llm = FakeLLM(
+        [
+            diff_response([task_row("t-1", "規程を調べる", "next", ["search_rules"])]),
+            call_response("search_rules", topic="貸出"),
+            text_response("記憶を更新します。"),
+            diff_response([task_row("t-1", "規程を調べる", "done", ["search_rules"])]),
+            text_response("回答"),
+        ]
+    )
+    agent = build_agent(llm, tools=[search_tool])
+
+    agent.respond(message="x")
+
+    assert "貸出の規程です" in llm.calls[3]["prompt"]
 
 
 def test_結果を見て同じtoolで掘り直すタスクは差し戻さない(search_tool):

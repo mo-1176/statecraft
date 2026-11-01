@@ -2,8 +2,9 @@
 記憶の更新の監査（guard.before_memory_diff）の検証。
 
 監査は、差分を当てる前に見せ、差し戻したら当てずに作り直させる仕組み。
-守ることは3つ。差し戻した差分が記憶に入らないこと、監査に要る材料
-（原文・今の記憶・差分）が揃って渡ること、上限は監査する側が持つこと。
+守ることは4つ。差し戻した差分が記憶に入らないこと、監査に要る材料
+（原文・今の記憶・差分）が揃って渡ること、上限は監査する側が持つこと、
+作り直しは差し戻した差分を直す形で行い、実行結果を読み直させないこと。
 """
 
 from conftest import FakeLLM, call_response, diff_response, task_row, text_response
@@ -176,3 +177,73 @@ def test_監査が壊れていても記憶の更新は止めない():
     agent.respond(message="x")
 
     assert [g.text for g in agent.private_memory.goals] == ["目標"]
+
+
+def test_作り直しで出さなかった行は差し戻した差分のまま当たる():
+    """直す行だけを出させる。全体を出し直させると、指摘と関係ない行まで作り直しになる。"""
+
+    def reject_initial_once(event: BeforeMemoryDiffEvent) -> MemoryDiffDecision:
+        if event.phase is Phase.INITIAL_MEMORY and event.review_round == 1:
+            return MemoryDiffDecision(approved=False, reason="依頼から外れている")
+        return MemoryDiffDecision(approved=True)
+
+    interceptor = Interceptor()
+    interceptor.guard.before_memory_diff(reject_initial_once)
+    llm = FakeLLM(
+        [
+            diff_response(
+                [
+                    goal("脱線した目標"),
+                    task_row("t-1", "規程を調べる", "next", ["search_rules"]),
+                ]
+            ),
+            # 作り直しでは、目標だけを直す
+            diff_response([goal("直した目標")]),
+            call_response("search_rules", topic="貸出"),
+            diff_response([task_row("t-1", "規程を調べる", "done", ["search_rules"])]),
+            text_response("回答"),
+        ]
+    )
+    agent = build_agent(llm, interceptor)
+
+    agent.respond(message="x")
+
+    assert [g.text for g in agent.private_memory.goals] == ["直した目標"]
+    # 出さなかったタスクも当たっていて、実行まで進んでいる
+    assert llm.calls[2]["tools"]
+
+
+def test_作り直しには実行結果を渡さず差し戻した差分を渡す():
+    def reject_update_once(event: BeforeMemoryDiffEvent) -> MemoryDiffDecision:
+        if event.phase is Phase.MEMORY_UPDATE and event.review_round == 1:
+            return MemoryDiffDecision(approved=False, reason="調べすぎている")
+        return MemoryDiffDecision(approved=True)
+
+    interceptor = Interceptor()
+    interceptor.guard.before_memory_diff(reject_update_once)
+    llm = FakeLLM(
+        [
+            diff_response([task_row("t-1", "規程を調べる", "next", ["search_rules"])]),
+            call_response("search_rules", topic="貸出"),
+            diff_response(
+                [
+                    task_row("t-1", "規程を調べる", "done", ["search_rules"]),
+                    task_row("t-2", "全館の規程も調べる", "next", ["search_rules"]),
+                ]
+            ),
+            diff_response(
+                [task_row("t-2", "全館の規程も調べる", "unnecessary", ["search_rules"])]
+            ),
+            text_response("回答"),
+        ]
+    )
+    agent = build_agent(llm, interceptor)
+
+    agent.respond(message="x")
+
+    update_prompt, retry_prompt = llm.calls[2]["prompt"], llm.calls[3]["prompt"]
+    assert "貸出の規程です" in update_prompt
+    assert "貸出の規程です" not in retry_prompt
+    # 差し戻した差分と指摘は、作り直しの材料として載る
+    assert "全館の規程も調べる" in retry_prompt
+    assert "調べすぎている" in retry_prompt
