@@ -43,7 +43,7 @@ def opened(monkeypatch):
     ],
 )
 def test_エンドポイントの下のv1へ繋ぐ(opened, endpoint):
-    AzureOpenAILLM(endpoint=endpoint, api_key="azure-key")
+    _ = AzureOpenAILLM(endpoint=endpoint, api_key="azure-key").client  # 使った時点で繋ぐ
 
     assert opened == [{"api_key": "azure-key", "base_url": BASE_URL}]
 
@@ -52,7 +52,7 @@ def test_渡さなければ環境変数のエンドポイントとキーを使�
     monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", ENDPOINT)
     monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
 
-    AzureOpenAILLM()
+    _ = AzureOpenAILLM().client  # 使った時点で繋ぐ
 
     assert opened == [{"api_key": "azure-key", "base_url": BASE_URL}]
 
@@ -63,7 +63,7 @@ def test_token_providerは呼ばずに関数のまま渡す(opened):
     def token_provider() -> str:
         raise AssertionError("組み立て時に呼んではならない")
 
-    AzureOpenAILLM(endpoint=ENDPOINT, token_provider=token_provider)
+    _ = AzureOpenAILLM(endpoint=ENDPOINT, token_provider=token_provider).client  # 使った時点で繋ぐ
 
     assert opened[0]["api_key"] is token_provider
 
@@ -74,7 +74,7 @@ def test_token_providerを渡せば環境変数のキーは使わない(opened, 
     def token_provider() -> str:
         return "token"
 
-    AzureOpenAILLM(endpoint=ENDPOINT, token_provider=token_provider)
+    _ = AzureOpenAILLM(endpoint=ENDPOINT, token_provider=token_provider).client  # 使った時点で繋ぐ
 
     assert opened[0]["api_key"] is token_provider
 
@@ -90,8 +90,10 @@ def test_OpenAIのキーをAzureへ送らない(opened, monkeypatch):
     """Azureの認証情報が無いままSDKへ渡すと、SDKはOPENAI_API_KEYを読んで送ってしまう。"""
     monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
 
+    llm = AzureOpenAILLM(endpoint=ENDPOINT)
+
     with pytest.raises(ValueError, match="AZURE_OPENAI_API_KEY"):
-        AzureOpenAILLM(endpoint=ENDPOINT)
+        _ = llm.client
 
     assert opened == []
 
@@ -100,7 +102,16 @@ def test_エンドポイントが無ければOpenAIへ繋がない(opened, monke
     """接続先が無いままSDKへ渡すと、SDKはapi.openai.comへAzureのキーを送ってしまう。"""
     monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
 
+    llm = AzureOpenAILLM()
+
     with pytest.raises(ValueError, match="AZURE_OPENAI_ENDPOINT"):
-        AzureOpenAILLM()
+        _ = llm.client
+
+    assert opened == []
+
+
+def test_作っただけでは接続先も鍵も読まない(opened):
+    """設定を組み立てるだけ（テストや設定の確認）で、資格情報を要求しない。"""
+    AzureOpenAILLM()
 
     assert opened == []

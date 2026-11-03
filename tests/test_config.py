@@ -2,7 +2,7 @@
 設定ファイル（config.py）の検証。
 
 ここの要点は2つ。
-  ・YAMLとmdから、Agent / Tool へ渡せる値がそろう（文章の置き場所、差し込み口）
+  ・YAMLとmdから、Agent / Tool へ渡せる値がそろう（文章の置き場所）
   ・書き間違いは、読み込みの時点でエラーになる（静かに読めてしまわない）
 """
 
@@ -31,16 +31,13 @@ AGENTS = """
 
 TOOLS = """
 - name: search
-  type: search
-  summary: 最大{limit}件まで検索します
-  settings: {limit: 3}
+  summary: 最大3件まで検索します
   parameters:
     type: object
     properties:
       q:
         type: string
-        description: 検索語。最大{limit}件
-        pattern: "^[a-z]{2,}$"
+        description: 検索語
     required: [q]
 """
 
@@ -62,7 +59,7 @@ def root(tmp_path: Path) -> Path:
     write(tmp_path, "config/tools.yaml", TOOLS)
     write(tmp_path, "config/knowledges.yaml", KNOWLEDGES)
     write(tmp_path, "prompts/agents/scout/system_instruction.md", "調べる係")
-    write(tmp_path, "prompts/tools/search/evaluation.md", "上位{limit}件だけを見る")
+    write(tmp_path, "prompts/tools/search/evaluation.md", "上位3件だけを見る")
     write(tmp_path, "knowledge/basics.md", "基本")
     return tmp_path
 
@@ -72,7 +69,7 @@ def agent(name: str, **kw) -> AgentConfig:
 
 
 def tool(name: str, **kw) -> ToolConfig:
-    return ToolConfig(name=name, type=name, parameters={}, **kw)
+    return ToolConfig(name=name, parameters={}, **kw)
 
 
 # ---- 読み込み ----
@@ -137,37 +134,28 @@ def test_中身が空のファイルは空として扱う(root):
     assert NetworkConfig.load(root).knowledges == []
 
 
-# ---- 差し込み口 ----
-def test_差し込み口がsettingsの値で埋まる(root):
+# ---- ツールの項目 ----
+def test_ツールの文章はmdからも入る(root):
     search = NetworkConfig.load(root).tools_by_name["search"]
 
     assert search.summary == "最大3件まで検索します"
-    # mdから入った文章の差し込み口も埋まる
     assert search.evaluation == "上位3件だけを見る"
-    assert search.parameters["properties"]["q"]["description"] == "検索語。最大3件"
 
 
-def test_スキーマのdescription以外の波かっこは残る(root):
-    """patternの {2,} のように、波かっこが差し込み口ではない場所がある。"""
+def test_書かなかったツールの項目はNoneのまま(root):
+    """出どころ（MCPなど）が埋めるかどうかを、書いたかどうかで見分けるため。"""
+    write(root, "config/tools.yaml", "- name: search\n")
+
     search = NetworkConfig.load(root).tools_by_name["search"]
 
-    assert search.parameters["properties"]["q"]["pattern"] == "^[a-z]{2,}$"
+    assert search.summary is None
+    assert search.parameters is None
 
 
-def test_execution_messageの差し込み口は実行時まで残す():
-    """execution_messageの {名前} は、実行時にツールの引数で埋まる。"""
-    t = tool("x", execution_message="『{title}』を照会しています...")
-
-    t.fill_placeholders()
-
-    assert t.execution_message == "『{title}』を照会しています..."
-
-
-def test_差し込み口に入れる値が無いとエラーになる():
-    broken = tool("x", usage="最大{max_reeds}件")
-
-    with pytest.raises(ValueError, match="max_reeds"):
-        broken.fill_placeholders()
+def test_typeとsettingsはもう書けない():
+    """どの実装かは出どころが名前で決める。値は実装が持つ。"""
+    with pytest.raises(ValueError, match="settings"):
+        ToolConfig(name="x", settings={"limit": 3})  # type: ignore[call-arg]
 
 
 # ---- 書き間違い ----

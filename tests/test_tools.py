@@ -131,7 +131,7 @@ def test_before_executeが拒否すると実行されない():
 
     interceptor = Interceptor()
     interceptor.guard.before_execute(
-        lambda e: ExecuteDecision(allowed=False, reason="権限がありません")
+        lambda e: ExecuteDecision(ok=False, reason="権限がありません")
     )
 
     result = Tool(func=spy, summary="x").execute(
@@ -152,7 +152,7 @@ def test_拒否された呼び出しは引数と理由を持ってexecute_blocke
     blocked = []
     interceptor = Interceptor()
     interceptor.guard.before_execute(
-        lambda e: ExecuteDecision(allowed=False, reason="権限がありません")
+        lambda e: ExecuteDecision(ok=False, reason="権限がありません")
     )
     interceptor.notice.execute_blocked(blocked.append)
 

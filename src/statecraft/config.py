@@ -80,62 +80,25 @@ class ConfigEntry(BaseModel):
 
 class ToolConfig(ConfigEntry):
     """
-    tools.yamlの1件。
+    tools.yamlの1件。nameはLLMに見せる名前で、どの出どころ（ToolSource）の
+    ツールかは、組み立ての時にこの名前で引く（tool_sources.py）。
 
-    nameはLLMに見せる名前、typeは実装の種類（NetworkBuilder.TOOL_FACTORIESのキー）。
-    分けてあるので、同じ実装からsettingsだけ違うツールを何本でも作れる。
-
-    summary / usage / evaluationとスキーマのdescriptionにある {名前} は、settingsの
-    同じ名前の値で埋める。数字をsettingsの1か所にだけ書けば、説明文と実装の上限が
-    食い違わない。波かっこをそのまま書くときは {{ }} にする。
-    execution_messageは埋めない。その {名前} は、実行時にツールの引数で埋まる。
+    書かなかった項目はNoneのままにし、出どころに任せる。
+      ・自作のツール（LocalTools）は、parametersが必須。descriptionはそのまま
+        プロンプトになるので、型ヒントからは作らない
+      ・MCPのツール（McpTools）は、parametersを書かなければサーバーが返す
+        スキーマを使う。summaryとusageも、書かなければサーバーのdescriptionから入る
     """
 
     FILE = "tools.yaml"
     KIND = "tools"
     TEXT_FIELDS = ("usage", "evaluation", "execution_message")
-    # settingsで埋める文章
-    FILLED_FIELDS: ClassVar[tuple[str, ...]] = ("summary", "usage", "evaluation")
 
-    type: str
-    summary: str = ""
+    summary: str | None = None
     usage: str | None = None
     evaluation: str | None = None
     execution_message: str | None = None
-    settings: dict[str, Any] = {}
-    parameters: dict[str, Any]
-
-    def _after_load(self, root: Path) -> None:
-        # mdの文章にも差し込み口があるので、mdを読んだ後に埋める
-        self.fill_placeholders()
-
-    def fill_placeholders(self) -> None:
-        try:
-            for field in self.FILLED_FIELDS:
-                text = getattr(self, field)
-                if text is not None:
-                    setattr(self, field, self._fill(text))
-            self.parameters = self._fill_schema(self.parameters)
-        except KeyError as e:
-            raise ValueError(
-                f"tools/{self.name} の差し込み口 {{{e.args[0]}}} に入れる値が、settings にありません"
-            ) from e
-
-    def _fill(self, text: str) -> str:
-        return text.format(**self.settings)
-
-    def _fill_schema(self, node: Any) -> Any:
-        """descriptionだけを埋める。patternなどは波かっこを文法として使うので触らない。"""
-        if isinstance(node, dict):
-            return {
-                key: self._fill(value)
-                if key == "description" and isinstance(value, str)
-                else self._fill_schema(value)
-                for key, value in node.items()
-            }
-        if isinstance(node, list):
-            return [self._fill_schema(item) for item in node]
-        return node
+    parameters: dict[str, Any] | None = None
 
 
 class KnowledgeConfig(ConfigEntry):

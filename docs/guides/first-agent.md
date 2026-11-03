@@ -59,8 +59,7 @@ LLM に見せる定義（YAML）と、実装（Python）に分けて書きます
 
 ```yaml
 # my_app/config/tools.yaml
-- name: search_rules
-  type: search_rules          # network.py の TOOL_FACTORIES のキー
+- name: search_rules          # network.py の LocalTools に、同じ名前で関数を渡す
   summary: 社内規程を検索する
   parameters:
     type: object
@@ -83,19 +82,17 @@ def search_rules(topic: str) -> dict:
 # my_app/network.py
 from pathlib import Path
 
-from statecraft import Interceptor, Network, NetworkBuilder
+from statecraft import Interceptor, LocalTools, Network, NetworkBuilder
 
 from . import tools
 
 ROOT = Path(__file__).resolve().parent
-
-
-class MyBuilder(NetworkBuilder):
-    TOOL_FACTORIES = {"search_rules": lambda: tools.search_rules}
+# tools.yaml の名前 → ツールの関数
+TOOLS = LocalTools({"search_rules": tools.search_rules})
 
 
 def build_network(interceptor: Interceptor | None = None) -> Network:
-    return MyBuilder.from_dir(ROOT, interceptor).build()
+    return NetworkBuilder.from_dir(ROOT, interceptor, tools=[TOOLS]).build()
 ```
 
 `type` と実装の対応だけをコードに書きます。
@@ -107,7 +104,7 @@ def build_network(interceptor: Interceptor | None = None) -> Network:
 from my_app.network import build_network
 
 net = build_network()
-response = net["assistant"].respond(message="有給の申請はいつまでに出せばいい？")
+response = net.respond(agent="assistant", message="有給の申請はいつまでに出せばいい？")
 
 print(response.text)
 print(net.total_tokens())  # (入力, 出力)
@@ -152,7 +149,7 @@ ic.notice.executed(show_executed)
 ic.notice.memory_diff(show_memory)
 
 net = build_network(ic)
-response = net["assistant"].respond(message="有給の申請はいつまでに出せばいい？")
+response = net.respond(agent="assistant", message="有給の申請はいつまでに出せばいい？")
 print(response.text)
 ```
 

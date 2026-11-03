@@ -87,7 +87,6 @@ from statecraft import NetworkBuilder
 
 
 class MyBuilder(NetworkBuilder):
-    TOOL_FACTORIES = {...}
     LLM_FACTORIES = {**NetworkBuilder.LLM_FACTORIES, "my_llm": MyLLM}
 ```
 

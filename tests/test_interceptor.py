@@ -65,21 +65,21 @@ def before_memory_diff() -> BeforeMemoryDiffEvent:
     )
 
 
-ALLOW = ExecuteDecision(allowed=True)
+ALLOW = ExecuteDecision(ok=True)
 
 
 # ---- guard.before_execute（既定は拒否） ----
 def test_登録が無ければ許可する():
     verdict = Interceptor().check.before_execute(before_execute())
 
-    assert verdict.allowed
+    assert verdict.ok
 
 
 def test_許可の判定を返した時だけ許可する():
     i = Interceptor()
     i.guard.before_execute(lambda e: ALLOW)
 
-    assert i.check.before_execute(before_execute()).allowed
+    assert i.check.before_execute(before_execute()).ok
 
 
 def test_Noneを返すと拒否になる():
@@ -87,7 +87,7 @@ def test_Noneを返すと拒否になる():
     i = Interceptor()
     i.guard.before_execute(lambda e: None)
 
-    assert not i.check.before_execute(before_execute()).allowed
+    assert not i.check.before_execute(before_execute()).ok
 
 
 def test_判定の型でなければTrueでも拒否になる():
@@ -95,18 +95,18 @@ def test_判定の型でなければTrueでも拒否になる():
     i = Interceptor()
     i.guard.before_execute(lambda e: True)
 
-    assert not i.check.before_execute(before_execute()).allowed
+    assert not i.check.before_execute(before_execute()).ok
 
 
 def test_拒否の理由は持ち帰られる():
     i = Interceptor()
     i.guard.before_execute(
-        lambda e: ExecuteDecision(allowed=False, reason="館長の承認が要ります")
+        lambda e: ExecuteDecision(ok=False, reason="館長の承認が要ります")
     )
 
     verdict = i.check.before_execute(before_execute())
 
-    assert not verdict.allowed
+    assert not verdict.ok
     assert verdict.reason == "館長の承認が要ります"
 
 
@@ -119,7 +119,7 @@ def test_コールバックの例外は拒否になる():
     i.guard.before_execute(broken)
     verdict = i.check.before_execute(before_execute())
 
-    assert not verdict.allowed
+    assert not verdict.ok
     # 例外の内容を理由にしない（実装の不具合が外へ出る）
     assert verdict.reason == ""
 
@@ -127,15 +127,15 @@ def test_コールバックの例外は拒否になる():
 def test_全員が許可しなければ拒否になる():
     i = Interceptor()
     i.guard.before_execute(lambda e: ALLOW)
-    i.guard.before_execute(lambda e: ExecuteDecision(allowed=False))
+    i.guard.before_execute(lambda e: ExecuteDecision(ok=False))
 
-    assert not i.check.before_execute(before_execute()).allowed
+    assert not i.check.before_execute(before_execute()).ok
 
 
 def test_拒否が決まった後は後続を呼ばない():
     i = Interceptor()
     reached = []
-    i.guard.before_execute(lambda e: ExecuteDecision(allowed=False))
+    i.guard.before_execute(lambda e: ExecuteDecision(ok=False))
     i.guard.before_execute(lambda e: reached.append(1) or ALLOW)
 
     i.check.before_execute(before_execute())
@@ -163,42 +163,42 @@ def test_登録が無ければ生成する():
     """未登録の利用側が動かなくなるのを避けるため、こちらの既定は通す。"""
     decision = Interceptor().check.before_generate(before_generate())
 
-    assert decision.proceed
+    assert decision.ok
 
 
 def test_中止の判定を返すと生成を中止する():
     i = Interceptor()
-    i.guard.before_generate(lambda e: GenerateDecision(proceed=False))
+    i.guard.before_generate(lambda e: GenerateDecision(ok=False))
 
-    assert not i.check.before_generate(before_generate()).proceed
+    assert not i.check.before_generate(before_generate()).ok
 
 
 def test_モデル名を付けるとそのモデルへ差し替わる():
     i = Interceptor()
     i.guard.before_generate(
-        lambda e: GenerateDecision(proceed=True, model="gemini-3.1-flash-lite")
+        lambda e: GenerateDecision(ok=True, model="gemini-3.1-flash-lite")
     )
 
     decision = i.check.before_generate(before_generate("pro"))
 
-    assert decision.proceed
+    assert decision.ok
     assert decision.model == "gemini-3.1-flash-lite"
 
 
 def test_モデル名の無い許可は次の判定へ回る():
     """予算の門と時間帯の門を別々に登録した時、前の門が通しても後ろの門が止められる。"""
     i = Interceptor()
-    i.guard.before_generate(lambda e: GenerateDecision(proceed=True))
-    i.guard.before_generate(lambda e: GenerateDecision(proceed=False))
+    i.guard.before_generate(lambda e: GenerateDecision(ok=True))
+    i.guard.before_generate(lambda e: GenerateDecision(ok=False))
 
-    assert not i.check.before_generate(before_generate()).proceed
+    assert not i.check.before_generate(before_generate()).ok
 
 
 def test_生成前の判定が型でなければ中止する():
     i = Interceptor()
     i.guard.before_generate(lambda e: True)
 
-    assert not i.check.before_generate(before_generate()).proceed
+    assert not i.check.before_generate(before_generate()).ok
 
 
 def test_生成前の判定で例外が出たら中止する():
@@ -210,32 +210,32 @@ def test_生成前の判定で例外が出たら中止する():
 
     i.guard.before_generate(broken)
 
-    assert not i.check.before_generate(before_generate()).proceed
+    assert not i.check.before_generate(before_generate()).ok
 
 
 # ---- guard.before_memory_diff（既定は当てる。壊れた監査は飛ばす） ----
 def test_監査の登録が無ければ当てる():
-    assert Interceptor().check.before_memory_diff(before_memory_diff()).approved
+    assert Interceptor().check.before_memory_diff(before_memory_diff()).ok
 
 
 def test_監査の差し戻しは理由ごと持ち帰られる():
     i = Interceptor()
     i.guard.before_memory_diff(
-        lambda e: MemoryDiffDecision(approved=False, reason="依頼から外れている")
+        lambda e: MemoryDiffDecision(ok=False, reason="依頼から外れている")
     )
 
     decision = i.check.before_memory_diff(before_memory_diff())
 
-    assert not decision.approved
+    assert not decision.ok
     assert decision.reason == "依頼から外れている"
 
 
 def test_監査が1つでも差し戻せば差し戻す():
     i = Interceptor()
-    i.guard.before_memory_diff(lambda e: MemoryDiffDecision(approved=True))
-    i.guard.before_memory_diff(lambda e: MemoryDiffDecision(approved=False))
+    i.guard.before_memory_diff(lambda e: MemoryDiffDecision(ok=True))
+    i.guard.before_memory_diff(lambda e: MemoryDiffDecision(ok=False))
 
-    assert not i.check.before_memory_diff(before_memory_diff()).approved
+    assert not i.check.before_memory_diff(before_memory_diff()).ok
 
 
 def test_監査の例外と型の違う値は飛ばして通す():
@@ -251,7 +251,7 @@ def test_監査の例外と型の違う値は飛ばして通す():
     i.guard.before_memory_diff(broken)
     i.guard.before_memory_diff(lambda e: False)
 
-    assert i.check.before_memory_diff(before_memory_diff()).approved
+    assert i.check.before_memory_diff(before_memory_diff()).ok
 
 
 # ---- recover.generation_failed（既定は再試行しない） ----
@@ -259,39 +259,39 @@ def test_登録が無ければ再試行しない():
     """何回試すか・どれだけ待つかは運用の方針なので、フレームワークは決めない。"""
     decision = Interceptor().check.generation_failed(generation_failed())
 
-    assert not decision.retry
+    assert not decision.ok
 
 
 def test_再試行の判定で同じモデルのまま再試行する():
     i = Interceptor()
-    i.recover.generation_failed(lambda e: RetryDecision(retry=True))
+    i.recover.generation_failed(lambda e: RetryDecision(ok=True))
 
     decision = i.check.generation_failed(generation_failed())
 
-    assert decision.retry
+    assert decision.ok
     assert decision.model == ""
 
 
 def test_モデル名を付けると別モデルでの再試行になる():
     """枠を使い切ったモデルは待っても同じエラーが返るため。"""
     i = Interceptor()
-    i.recover.generation_failed(lambda e: RetryDecision(retry=True, model="flash-lite"))
+    i.recover.generation_failed(lambda e: RetryDecision(ok=True, model="flash-lite"))
 
     decision = i.check.generation_failed(generation_failed("pro"))
 
-    assert decision.retry
+    assert decision.ok
     assert decision.model == "flash-lite"
 
 
 def test_再試行しない判定は次の登録へ回る():
     """待って直る失敗と、モデルを変えれば直る失敗を、別々の関数で扱えるようにするため。"""
     i = Interceptor()
-    i.recover.generation_failed(lambda e: RetryDecision(retry=False))
-    i.recover.generation_failed(lambda e: RetryDecision(retry=True, model="flash-lite"))
+    i.recover.generation_failed(lambda e: RetryDecision(ok=False))
+    i.recover.generation_failed(lambda e: RetryDecision(ok=True, model="flash-lite"))
 
     decision = i.check.generation_failed(generation_failed())
 
-    assert decision.retry
+    assert decision.ok
     assert decision.model == "flash-lite"
 
 
@@ -299,7 +299,7 @@ def test_再試行の判定が型でなければ再試行しない():
     i = Interceptor()
     i.recover.generation_failed(lambda e: True)
 
-    assert not i.check.generation_failed(generation_failed()).retry
+    assert not i.check.generation_failed(generation_failed()).ok
 
 
 def test_再試行の判定で例外が出たら諦める():
@@ -311,7 +311,7 @@ def test_再試行の判定で例外が出たら諦める():
 
     i.recover.generation_failed(broken)
 
-    assert not i.check.generation_failed(generation_failed()).retry
+    assert not i.check.generation_failed(generation_failed()).ok
 
 
 def test_再試行の判定には元の例外が渡る():
@@ -320,7 +320,7 @@ def test_再試行の判定には元の例外が渡る():
 
     def decide(event):
         seen.append(event.error)
-        return RetryDecision(retry=False)
+        return RetryDecision(ok=False)
 
     i.recover.generation_failed(decide)
     original = RuntimeError("429 Too Many Requests")
@@ -369,7 +369,7 @@ def test_通知へ登録した関数は実行の可否に関わらない():
     i.notice.execute_blocked(lambda e: False)
     i.notice.execute_start(lambda e: None)
 
-    assert i.check.before_execute(before_execute()).allowed
+    assert i.check.before_execute(before_execute()).ok
 
 
 def test_登録が無い通知は何もしない():

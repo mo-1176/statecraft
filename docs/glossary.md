@@ -27,7 +27,7 @@ statecraft の文書とコードに出てくる、独自の言葉と、意味を
 | **統括（orchestrator）** | 記憶を持ち、知識の取得と全体の判断を担う |
 | **専門家（specialist）** | 渡された材料で、専門性や創造性が要る作業だけをする。知識は持たない |
 | **委譲** | エージェントが別のエージェントを呼ぶこと。呼ばれた側から見ると `execute()` での起動になる |
-| **審査役・監査役** | Interceptor から呼ぶ、外に置いたエージェント。監視される側の Network には入れない（→ [concepts/network-placement.md](concepts/network-placement.md)） |
+| **審査役・監査役** | Interceptor から呼ぶ、外に置いたエージェント。監視される側の Network には入れない（→ [concepts/network-placement.md](concepts/network-placement.md)）。監査役は、Network の `enable_auditor` で組み込みのものも使える（→ [reference/network.md](reference/network.md#監査役を付ける--enable_auditor)） |
 
 ## 1回の応答の中
 
@@ -96,4 +96,5 @@ statecraft の文書とコードに出てくる、独自の言葉と、意味を
 | **recover** | 生成が失敗した後に、再試行するかを決める窓口 |
 | **判定の型** | `ExecuteDecision` / `GenerateDecision` / `MemoryDiffDecision` / `RetryDecision`。guard と recover はこの型で返す |
 | **review_round** | 記憶の更新を監査に見せた何回目か。監査で差し戻すたびに増える |
+| **rejections** | 記憶の更新の中で、監査が差し戻した理由（古い順）。差分が通ると空に戻る |
 | **attempt** | 何回目の試行か。形式の誤りで差し戻した回を含む |

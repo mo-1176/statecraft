@@ -37,12 +37,14 @@ import base64
 import json
 import mimetypes
 import os
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
 
+from .events import FailureKind
 from .tools import Tool
 from .utils import with_timing
 
@@ -533,7 +535,55 @@ class BaseLLM(ABC):
     モデル名は保持せず、generate()の引数として毎回受け取る（どのモデルを
     使うかはAgentとphase_overridesが決める）。
     そのためインスタンスはプロバイダの数だけあればよい。
+
+    SDKのクライアント（client）は、最初に使う時に_connect()で作る。作った時点で
+    作ると、設定を組み立てるだけ（テストや設定の確認）でも、APIキーや接続先が
+    要ることになる。キーの誤りに気づくのは、その分だけ最初の生成まで遅れる。
     """
+
+    _client: Any = None
+
+    @property
+    def client(self) -> Any:
+        if self._client is None:
+            # 並列の生成が同時に最初の1回を迎えても、クライアントは1つだけ作る。
+            with _CLIENT_LOCK:
+                if self._client is None:
+                    self._client = self._connect()
+        return self._client
+
+    @client.setter
+    def client(self, value: Any) -> None:
+        # 作ったクライアントを直接渡す使い方（テストの代役、自作のLLM）も残す。
+        self._client = value
+
+    def _connect(self) -> Any:
+        """SDKのクライアントを作る。clientを使うプロバイダが実装する。"""
+        raise NotImplementedError(f"{type(self).__name__}は_connect()を実装していません。")
+
+    def classify_error(self, error: Exception) -> FailureKind:
+        """
+        生成の失敗を、再試行の判定に使う3つ（FailureKind）に分ける。
+
+        各社のSDKの例外が持つ状態コード（OpenAI・Claudeはstatus_code、Geminiは
+        code）と、接続・タイムアウトの例外の型名で見る。SDKの例外の型を読み込まずに
+        済むので、使わないプロバイダのSDKが無くても動く。見分け方が合わない
+        自作のLLMは、これを上書きする。
+        """
+        status = getattr(error, "status_code", None)
+        if not isinstance(status, int):
+            status = getattr(error, "code", None)
+        if status == 429:
+            return "rate_limit"
+        # 529はClaudeの過負荷（overloaded_error）
+        if isinstance(status, int) and 500 <= status <= 599:
+            return "unavailable"
+        name = type(error).__name__
+        if isinstance(error, (TimeoutError, ConnectionError)) or (
+            "Timeout" in name or "Connection" in name
+        ):
+            return "unavailable"
+        return "other"
 
     @abstractmethod
     def generate(
@@ -563,6 +613,9 @@ class BaseLLM(ABC):
     ) -> LLMResponse:
         pass
 
+
+# クライアントを作る時だけ取る。作るのはプロバイダごとに1回なので、1つで足りる。
+_CLIENT_LOCK = threading.Lock()
 
 _CARRY_UNSUPPORTED = (
     "思考の継承（carry_thoughts）は、今はGeminiLLMとOpenAILLMだけが対応しています。"
@@ -596,14 +649,20 @@ class GeminiLLM(BaseLLM):
         # 各段階を何トークンとみなすかは、フレームワークではなく利用側が決める。
         # 渡されなかった段階については上限を指定せず、モデルの動的思考に任せる。
         self._thinking_budgets = thinking_budgets or {}
-        if use_vertex:
-            if not project_id:
-                raise ValueError("Vertex AI を使用する場合は project_id が必須です。")
-            self.client = genai.Client(
-                vertexai=True, project=project_id, location=location
+        # 渡された引数だけで分かる誤りは、ここで落とす。
+        if use_vertex and not project_id:
+            raise ValueError("Vertex AI を使用する場合は project_id が必須です。")
+        self._api_key = api_key
+        self._project_id = project_id
+        self._location = location
+        self._use_vertex = use_vertex
+
+    def _connect(self) -> Any:
+        if self._use_vertex:
+            return genai.Client(
+                vertexai=True, project=self._project_id, location=self._location
             )
-        else:
-            self.client = genai.Client(api_key=api_key)
+        return genai.Client(api_key=self._api_key)
 
     def _build_thinking_config(self, thought_level: ThoughtLevel | None):
         """
@@ -927,9 +986,11 @@ class OpenAILLM(BaseLLM):
         # Noneなら、SDKの既定（環境変数OPENAI_BASE_URL → api.openai.com）へ繋ぐ。
         base_url: str | None = None,
     ):
-        openai = _require("openai", "openai")
-        self.client = openai.OpenAI(api_key=api_key, base_url=base_url)
-        self._bad_request = openai.BadRequestError
+        # SDKが入っているかは、ここで確かめる（入っていないのは設定の誤り）。
+        self._openai = _require("openai", "openai")
+        self._api_key = api_key
+        self._base_url = base_url
+        self._bad_request = self._openai.BadRequestError
         # キャッシュの区切りを断ったモデル。GPT-5.6より前のモデルは区切りを
         # 受け付けず400になる。対応表は持たず、断られたモデルだけを覚えて、
         # 以降は区切り無しで送る。
@@ -938,6 +999,9 @@ class OpenAILLM(BaseLLM):
         # 出力のスキーマを指示文で、toolの引数をstrict無しで送る。
         self._without_structured_output: set[str] = set()
         self._without_strict_tools: set[str] = set()
+
+    def _connect(self) -> Any:
+        return self._openai.OpenAI(api_key=self._api_key, base_url=self._base_url)
 
     def _developer_message(self, blocks: list[str], breakpoints: bool) -> dict:
         """
@@ -1366,22 +1430,30 @@ class AzureOpenAILLM(OpenAILLM):
         api_key: str | None = None,
         token_provider: Callable[[], str] | None = None,
     ):
+        if api_key and token_provider:
+            raise ValueError(
+                "api_keyとtoken_providerは、どちらか1つだけを渡してください。"
+            )
+        super().__init__()
+        self._endpoint = endpoint
+        self._azure_key = api_key
+        self._token_provider = token_provider
+
+    def _connect(self) -> Any:
         # 接続先と鍵は、ここで必ず決めてから渡す。SDKへNoneを渡すと
         # OPENAI_BASE_URL / OPENAI_API_KEY へ戻り、Azureの鍵がOpenAIへ、
         # OpenAIの鍵がAzureへ送られてしまう。
-        endpoint = endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT")
+        endpoint = self._endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT")
         if not endpoint:
             raise ValueError(
                 "Azure OpenAIのエンドポイントがありません。endpointを渡すか、"
                 "環境変数AZURE_OPENAI_ENDPOINTを設定してください"
                 "（例: https://<リソース名>.openai.azure.com）。"
             )
-        if api_key and token_provider:
-            raise ValueError(
-                "api_keyとtoken_providerは、どちらか1つだけを渡してください。"
-            )
         credential = (
-            token_provider or api_key or os.environ.get("AZURE_OPENAI_API_KEY")
+            self._token_provider
+            or self._azure_key
+            or os.environ.get("AZURE_OPENAI_API_KEY")
         )
         if not credential:
             raise ValueError(
@@ -1391,14 +1463,17 @@ class AzureOpenAILLM(OpenAILLM):
         # v1 APIは、エンドポイントの下の /openai/v1/ にある。
         # ポータルからパスごと写した場合も、二重に付けない。
         base_url = endpoint.rstrip("/").removesuffix("/openai/v1") + "/openai/v1/"
-        super().__init__(api_key=credential, base_url=base_url)
+        return self._openai.OpenAI(api_key=credential, base_url=base_url)
 
 
 # ---- 4. Claude クラス ----
 class ClaudeLLM(BaseLLM):
     def __init__(self, *, api_key: str | None = None):
-        Anthropic = _require("anthropic", "anthropic").Anthropic
-        self.client = Anthropic(api_key=api_key)
+        self._anthropic = _require("anthropic", "anthropic").Anthropic
+        self._api_key = api_key
+
+    def _connect(self) -> Any:
+        return self._anthropic(api_key=self._api_key)
 
     def _format_tools(self, tools: list[Any]) -> list[dict]:
         formatted = []

@@ -547,7 +547,7 @@ def test_無効化されたagentは委譲を断る():
 def test_委譲はbefore_executeで止められる():
     interceptor = Interceptor()
     interceptor.guard.before_execute(
-        lambda e: ExecuteDecision(allowed=False, reason="この依頼は受けられません")
+        lambda e: ExecuteDecision(ok=False, reason="この依頼は受けられません")
     )
 
     agent = build_agent(FakeLLM())
@@ -748,7 +748,7 @@ def test_before_generateで中止すると例外になる():
     from statecraft import GenerationAborted
 
     interceptor = Interceptor()
-    interceptor.guard.before_generate(lambda e: GenerateDecision(proceed=False))
+    interceptor.guard.before_generate(lambda e: GenerateDecision(ok=False))
 
     agent = build_agent(FakeLLM([text_response("x")]), interceptor=interceptor)
 
@@ -760,7 +760,7 @@ def test_before_generateはモデルを差し替えられる():
     """走行中の状態を見て軽いモデルへ落とす用途。"""
     interceptor = Interceptor()
     interceptor.guard.before_generate(
-        lambda e: GenerateDecision(proceed=True, model="flash-lite")
+        lambda e: GenerateDecision(ok=True, model="flash-lite")
     )
 
     llm = FakeLLM([diff_response([]), text_response("ok")])
@@ -777,7 +777,7 @@ def test_生成の失敗は再試行できる():
 
     def retry_once(event):
         attempts.append(event.attempt)
-        return RetryDecision(retry=event.attempt == 1)
+        return RetryDecision(ok=event.attempt == 1)
 
     interceptor.recover.generation_failed(retry_once)
 
@@ -810,7 +810,7 @@ def test_生成イベントは失敗した試行でも流れる():
     events = []
     interceptor = Interceptor()
     interceptor.notice.generated(events.append)
-    interceptor.recover.generation_failed(lambda e: RetryDecision(retry=e.attempt == 1))
+    interceptor.recover.generation_failed(lambda e: RetryDecision(ok=e.attempt == 1))
 
     llm = FakeLLM([RuntimeError("失敗"), diff_response([]), text_response("ok")])
     agent = build_agent(llm, interceptor=interceptor)

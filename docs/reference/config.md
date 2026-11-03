@@ -47,12 +47,10 @@
 | 項目 | 中身 |
 |---|---|
 | `name` | LLM に見せるツール名 |
-| `type` | 実装の種類。`TOOL_FACTORIES` のキー |
-| `settings` | 実装に渡す値。説明文の `{名前}` も、ここの値で埋まる |
-| `parameters` | 引数の JSON Schema。型ヒントからは作らず、書いたものをそのまま使う（`SchemaTool` になる） |
-| `summary` / `usage` / `evaluation` / `execution_message` | Tool の同じ名前の項目 |
+| `parameters` | 引数の JSON Schema。自作のツールでは必須で、型ヒントからは作らず、書いたものをそのまま使う（`SchemaTool` になる）。MCP のツールは、書かなければサーバーのスキーマを使う |
+| `summary` / `usage` / `evaluation` / `execution_message` | Tool の同じ名前の項目。MCP のツールは、`summary` と `usage` を書かなければサーバーの description から入る |
 
-`name` と `type` が分かれているので、同じ実装から `settings` だけ違うツールを何本でも作れます。`execution_message` の `{名前}` は埋めずに残し、実行時にツールの引数で埋まります。
+どの実装のツールかは書きません。組み立てる時に渡す出どころ（下）が、名前で引きます。上限のような値は、ツールの実装が持ちます。`execution_message` の `{名前}` は、実行時にツールの引数で埋まります。
 
 ## knowledges.yaml
 
@@ -70,24 +68,28 @@
 ## 組み立て
 
 ```python
-from statecraft import NetworkBuilder
+from statecraft import LocalTools, McpTools, NetworkBuilder
+
+net = NetworkBuilder.from_dir(
+    ROOT,
+    interceptor,
+    tools=[
+        LocalTools({"search_rules": tools.search_rules}),            # 自作のツール
+        McpTools("inventory", url="http://inventory:8000/mcp"),      # MCP サーバーのツール
+    ],
+).build()
 
 
+# 提供元を足す・繋ぎ方を変える時だけ、子クラスで LLM の対応表を上書きする（同じ名前なら上書き）
 class MyBuilder(NetworkBuilder):
-    # type → ツールの関数を返すもの
-    TOOL_FACTORIES = {
-        "search_rules": lambda: tools.search_rules,      # settings を持たないもの
-        "sample_tool": tools.make_sample_tool,           # settings をキーワード引数で受け取るもの
-    }
-    # 提供元を足す・繋ぎ方を変える時だけ（同じ名前なら上書き）
     LLM_FACTORIES = {**NetworkBuilder.LLM_FACTORIES, "azure_openai": make_azure_llm}
-
-
-net = MyBuilder.from_dir(ROOT, interceptor).build()
 ```
 
+- tools.yaml の名前ごとに、その名前を持っている出どころがツールを作ります。どの出どころにも無い名前と、2つ以上の出どころにある名前は、組み立ての時点でエラーになります。
+- `McpTools` のツールを tools.yaml に書いた Network を組み立てる時は、サーバーに繋がる必要があります（ツールの一覧はプロセスの間、使い回します）。
+
 - `from_dir` は呼ぶたびに設定を読み直します。
-- YAML に関数の場所（モジュール名）を書く形にしていないのは、設定を書き換えられる人が、登録されていない関数を組み立て時に呼べないようにするためです。
+- YAML に関数の場所（モジュール名）を書く形にしていないのは、設定を書き換えられる人が、渡されていない関数を組み立て時に呼べないようにするためです。
 - API キーは YAML に書かず、環境変数に置きます。
 
 ---
@@ -100,8 +102,9 @@ YAML は書き間違えても読めてしまうので、次のものは読み込
 - 同じ名前のエージェント・ツール・ナレッジが2つ以上ある
 - `tools` / `sub_agents` / `knowledge` などに書いた名前が、指す先に無い
 - 同じ文章が YAML と md の両方にある
-- `{名前}` に入れる値が `settings` に無い
 - ナレッジの `file` が無い
-- `type` / `provider` が対応表に無い、`settings` が実装の引数と合わない
+- `provider` が対応表に無い
+- ツールの名前が、どの出どころにも無い・2つ以上の出どころにある
+- 自作のツールに `parameters` が無い
 
 これに加えて、Network を作る時の配線の検証が走ります（→ [network.md](network.md#構築時に落とすもの)）。

@@ -57,7 +57,7 @@ class ExecuteDecision:
     返すかどうかは拒否する側が選べる（審査基準を伝えると回避される）。
     """
 
-    allowed: bool
+    ok: bool
     # 拒否した理由。空文字なら理由を伝えない拒否。LLMへそのまま渡る。
     # 許可した場合は読まない。
     reason: str = ""
@@ -67,7 +67,7 @@ class ExecuteDecision:
 class GenerateDecision:
     """生成の前の判定の結果（before_generate）。RetryDecisionと形は同じだが意味が違う。"""
 
-    proceed: bool
+    ok: bool
     # 生成に使うモデル名。空文字なら元のモデルのまま。
     model: str = ""
 
@@ -80,7 +80,7 @@ class RetryDecision:
     枠を使い切ったモデルは待っても同じエラーが返るため、モデル名を返せる。
     """
 
-    retry: bool
+    ok: bool
     # 再試行に使うモデル名。空文字なら元のモデルのまま。
     model: str = ""
 
@@ -94,7 +94,7 @@ class MemoryDiffDecision:
     脱線は、1行ではなく計画と理解の向きに現れるため。
     """
 
-    approved: bool
+    ok: bool
     # 差し戻す理由。LLMへそのまま渡り、これを読んで記憶の更新を作り直す。
     # 何がずれているかを、依頼から見て書く。通した場合は読まない。
     reason: str = ""
@@ -191,7 +191,7 @@ class _GuardRegistry:
         """
         実行してよいかを判定する。
 
-        登録された全てが ExecuteDecision(allowed=True) を返した時だけ実行される。
+        登録された全てが ExecuteDecision(ok=True) を返した時だけ実行される。
         それ以外（返し忘れ・型の違う値・例外）はすべて拒否になる。
         """
         self._interceptor._register("before_execute", callback)
@@ -215,7 +215,7 @@ class _GuardRegistry:
         """
         LLMが作った記憶の差分を、当てる前に監査する。登録が無ければ当てる。
 
-        MemoryDiffDecision(approved=False) を返すと、その差分は当てずに、理由を
+        MemoryDiffDecision(ok=False) を返すと、その差分は当てずに、理由を
         添えて記憶の更新を作り直させる。登録順に尋ね、1つでも差し戻せばそこで決まる。
 
         差し戻しの上限はフレームワークが持たない（generation_failedの再試行と
@@ -392,6 +392,9 @@ class Interceptor:
         self.recover = _RecoverRegistry(self)
         self.check = _CheckDispatcher(self)
         self.notify = _NotifyDispatcher(self)
+        # Networkに配線されると入る。イベントを受け取って、その時点の状態
+        # （NetworkState）を返す。配る直前に呼び、event.networkへ入れる（_stamp）。
+        self._network_state: Callable[[object], object] | None = None
 
     @property
     def has_listeners(self) -> bool:
@@ -402,6 +405,27 @@ class Interceptor:
     def _register(self, event: str, callback: Callable) -> None:
         self._listeners.setdefault(event, []).append(callback)
 
+    def _attach_state(self, state: Callable[[object], object]) -> None:
+        """
+        Networkが配線の時に呼ぶ。同じinterceptorを2つのNetworkへ渡すと、
+        後から渡した方の状態が付く。
+        """
+        self._network_state = state
+
+    def _stamp(self, payload: object) -> None:
+        """
+        配る直前に、その時点のネットワークの状態を付ける。
+
+        状態の組み立てが壊れても、イベントは配る（観測のための値で、
+        観測される側の実行を止めない）。
+        """
+        if self._network_state is None:
+            return
+        try:
+            payload.network = self._network_state(payload)  # type: ignore[attr-defined]
+        except Exception:
+            logger.exception("ネットワークの状態を作れませんでした")
+
     def _notify(self, event: str, payload: object) -> None:
         """
         通知を発火する。
@@ -410,6 +434,7 @@ class Interceptor:
         止めない）。黙って消すと原因が追えないため、ログには残す。
         """
         with self._notify_lock:
+            self._stamp(payload)
             for callback in self._listeners.get(event, []):
                 try:
                     callback(payload)
@@ -422,13 +447,14 @@ class Interceptor:
         self, event: str, payload: GenerationFailedEvent
     ) -> RetryDecision:
         """
-        失敗した後にどうするかの判定。登録順に尋ね、RetryDecision(retry=True)を
+        失敗した後にどうするかの判定。登録順に尋ね、RetryDecision(ok=True)を
         返したものがあればそこで決まる。それ以外は次の登録へ回し、例外と
         登録が無い場合は再試行しない。
 
         直列化しない（待つ処理がコールバックの中に書かれるため、直列化すると
         他の実行が無関係な待ち時間まで待たされる）。
         """
+        self._stamp(payload)
         for callback in self._listeners.get(event, []):
             try:
                 verdict = callback(payload)
@@ -437,27 +463,28 @@ class Interceptor:
                     "判定コールバックが例外を送出しました: event=%s", event
                 )
                 # 再試行として扱うと、コールバックの不具合が無限の再試行になる。
-                return RetryDecision(retry=False)
+                return RetryDecision(ok=False)
             if not isinstance(verdict, RetryDecision):
                 _log_wrong_type(
                     event, verdict, RetryDecision, "再試行しない（次の登録へ回す）"
                 )
                 continue
-            if verdict.retry is True:
-                return RetryDecision(retry=True, model=verdict.model or "")
-        return RetryDecision(retry=False)
+            if verdict.ok is True:
+                return RetryDecision(ok=True, model=verdict.model or "")
+        return RetryDecision(ok=False)
 
     def _decide_generate(
         self, event: str, payload: BeforeGenerateEvent
     ) -> GenerateDecision:
         """
-        生成の前の判定。登録順に尋ね、GenerateDecision(proceed=True)なら次の登録へ
+        生成の前の判定。登録順に尋ね、GenerateDecision(ok=True)なら次の登録へ
         回す。モデル名が付いていればそこで決まる。中止・型の違う値・例外は
         そこで中止する。
 
         _decide_retryと形は同じだが既定が逆で、登録が無ければ生成する
         （未登録の利用側が動かなくなるのを避ける）。ロックは取らない。
         """
+        self._stamp(payload)
         for callback in self._listeners.get(event, []):
             try:
                 verdict = callback(payload)
@@ -466,15 +493,15 @@ class Interceptor:
                     "判定コールバックが例外を送出しました: event=%s", event
                 )
                 # 「生成してよい」と解釈すると、予算の門が不具合で開く。
-                return GenerateDecision(proceed=False)
+                return GenerateDecision(ok=False)
             if not isinstance(verdict, GenerateDecision):
                 _log_wrong_type(event, verdict, GenerateDecision, "中止")
-                return GenerateDecision(proceed=False)
-            if verdict.proceed is not True:
-                return GenerateDecision(proceed=False)
+                return GenerateDecision(ok=False)
+            if verdict.ok is not True:
+                return GenerateDecision(ok=False)
             if verdict.model:
-                return GenerateDecision(proceed=True, model=verdict.model)
-        return GenerateDecision(proceed=True)
+                return GenerateDecision(ok=True, model=verdict.model)
+        return GenerateDecision(ok=True)
 
     def _review_memory_diff(
         self, event: str, payload: BeforeMemoryDiffEvent
@@ -487,6 +514,7 @@ class Interceptor:
         差し戻しの上限は監査する側が持つので、ここで差し戻しに倒すと、
         壊れた監査が同じ更新を作り直させ続ける。ロックは取らない。
         """
+        self._stamp(payload)
         for callback in self._listeners.get(event, []):
             try:
                 verdict = callback(payload)
@@ -498,19 +526,20 @@ class Interceptor:
             if not isinstance(verdict, MemoryDiffDecision):
                 _log_wrong_type(event, verdict, MemoryDiffDecision, "この監査を飛ばす")
                 continue
-            if verdict.approved is not True:
-                return MemoryDiffDecision(approved=False, reason=verdict.reason or "")
-        return MemoryDiffDecision(approved=True)
+            if verdict.ok is not True:
+                return MemoryDiffDecision(ok=False, reason=verdict.reason or "")
+        return MemoryDiffDecision(ok=True)
 
     def _check(self, event: str, payload: BeforeExecuteEvent) -> ExecuteDecision:
         """
-        拒否権のある判定。ExecuteDecision(allowed=True)を返したものだけ許可し、
+        拒否権のある判定。ExecuteDecision(ok=True)を返したものだけ許可し、
         返し忘れ・型の違う値・例外はすべて拒否（許可と解釈すると権限確認の
         失敗が通る）。拒否の理由は、返された判定からそのまま持ち帰る。
 
         判定だけのロックを取るので、人の承認を待つあいだも通知は流れ続ける。
         """
         with self._check_lock:
+            self._stamp(payload)
             for callback in self._listeners.get(event, []):
                 try:
                     verdict = callback(payload)
@@ -519,10 +548,10 @@ class Interceptor:
                         "判定コールバックが例外を送出しました: event=%s", event
                     )
                     # 例外の内容は理由にしない（実装の不具合が外へ出る）。
-                    return ExecuteDecision(allowed=False)
+                    return ExecuteDecision(ok=False)
                 if not isinstance(verdict, ExecuteDecision):
                     _log_wrong_type(event, verdict, ExecuteDecision, "拒否")
-                    return ExecuteDecision(allowed=False)
-                if verdict.allowed is not True:
-                    return ExecuteDecision(allowed=False, reason=verdict.reason or "")
-            return ExecuteDecision(allowed=True)
+                    return ExecuteDecision(ok=False)
+                if verdict.ok is not True:
+                    return ExecuteDecision(ok=False, reason=verdict.reason or "")
+            return ExecuteDecision(ok=True)

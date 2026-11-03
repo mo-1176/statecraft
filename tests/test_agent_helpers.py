@@ -124,6 +124,14 @@ def test_上書きは対象のphaseにだけ効く(agent):
     assert agent.resolve_generation(Phase.FUNCTION_CALL).model == "default-model"
 
 
+@pytest.mark.parametrize("phase", [Phase.CUTOFF_ANSWER, Phase.STALLED_ANSWER])
+def test_打ち切りや停滞で答える時もANSWERの上書きを使う(agent, phase):
+    agent.model = "default-model"
+    agent.phase_overrides = {Phase.ANSWER: GenerationConfig(model="pro")}
+
+    assert agent.resolve_generation(phase).model == "pro"
+
+
 # ---- _matches_output_schema ----
 def test_JSONとして読めなければ不一致(agent):
     agent.output_schema = {"type": "object"}
@@ -334,3 +342,56 @@ def test_resetはshared_memoryを消さない(agent):
     agent.reset()
 
     assert len(agent.shared_memory.facts) == 1
+
+
+# ---- 生成の失敗の分類（BaseLLM.classify_error） ----
+class StatusError(Exception):
+    """OpenAI・ClaudeのSDKの例外と同じく、status_codeを持つ。"""
+
+    def __init__(self, status_code: int):
+        super().__init__(f"Error code: {status_code}")
+        self.status_code = status_code
+
+
+class CodeError(Exception):
+    """GeminiのSDKの例外と同じく、codeを持つ。"""
+
+    def __init__(self, code: int):
+        super().__init__(f"{code} RESOURCE_EXHAUSTED")
+        self.code = code
+
+
+class APIConnectionError(Exception):
+    """接続の失敗。状態コードを持たず、型名で見分ける。"""
+
+
+@pytest.mark.parametrize(
+    ("error", "kind"),
+    [
+        (StatusError(429), "rate_limit"),
+        (CodeError(429), "rate_limit"),
+        (StatusError(503), "unavailable"),
+        (CodeError(500), "unavailable"),
+        (StatusError(529), "unavailable"),  # Claudeの過負荷
+        (APIConnectionError("切れた"), "unavailable"),
+        (TimeoutError(), "unavailable"),
+        (StatusError(400), "other"),
+        (ValueError("スキーマの誤り"), "other"),
+    ],
+)
+def test_失敗は状態コードと型名で3つに分ける(error, kind):
+    assert FakeLLM().classify_error(error) == kind
+
+
+def test_失敗のイベントに種類と詳しい文が載る():
+    seen = []
+    agent = Agent(
+        name="librarian", summary="調べる", llm=FakeLLM([StatusError(429)]), model="m"
+    )
+    agent.interceptor.recover.generation_failed(seen.append)
+
+    with pytest.raises(StatusError):
+        agent.respond(message="x")
+
+    assert seen[0].kind == "rate_limit"
+    assert seen[0].message == "StatusError: Error code: 429"

@@ -6,10 +6,11 @@ Network の検証。
 """
 
 import pytest
-from conftest import FakeLLM
+from conftest import FakeLLM, diff_response, text_response
 
 from statecraft import (
     Agent,
+    ErrorEvent,
     GenerationConfig,
     Interceptor,
     MemoryEntry,
@@ -76,6 +77,15 @@ def test_配線を受けていない実体を委譲先にすると落ちる():
 
 
 # ---- phase_overrides の検証 ----
+@pytest.mark.parametrize("phase", [Phase.CUTOFF_ANSWER, Phase.STALLED_ANSWER])
+def test_打ち切りや停滞の回答は上書きできない(phase):
+    """答えの設定はANSWERの1か所。2か所に割れると、片方だけ直して食い違う。"""
+    agent = make_agent("a", phase_overrides={phase: GenerationConfig(model="pro")})
+
+    with pytest.raises(ValueError, match="ANSWERの設定が使われます"):
+        Network(agents=[agent])
+
+
 def test_llmだけ上書きしてmodelを忘れると落ちる():
     """別プロバイダのモデル名を送ることになり、APIは原因を教えてくれない。"""
     agent = make_agent(
@@ -214,14 +224,16 @@ def test_共通のinterceptorが配られる():
     assert a.interceptor is interceptor
 
 
-def test_個別に登録済みのinterceptorは尊重される():
+def test_個別に登録したinterceptorもNetworkのものに差し替える():
+    """残すと、そのAgentにだけNetworkの観測や費用の上限が黙って効かなくなる。"""
     own = Interceptor()
     own.notice.error(lambda e: None)
     a = make_agent("a", interceptor=own)
+    interceptor = Interceptor()
 
-    Network(agents=[a], interceptor=Interceptor())
+    Network(agents=[a], interceptor=interceptor)
 
-    assert a.interceptor is own
+    assert a.interceptor is interceptor
 
 
 def test_二度構築しても配線が壊れない():
@@ -267,3 +279,113 @@ def test_木構造なら通る():
     root = make_agent("root", sub_agent_names=["mid_a", "mid_b"])
 
     Network(agents=[root, mid_a, mid_b, leaf])  # 落ちないこと
+
+
+# ---- respond ----
+def test_Networkのrespondは監査役も含めた依頼全体のトークンを返す():
+    """窓口の分だけを返すと、委譲先や監査役の消費が抜けて、費用が小さく見える。"""
+    llm = FakeLLM(
+        [
+            diff_response([{"field": "goals", "id": "g-1", "text": "目標"}]),
+            text_response("回答", input_tokens=10, output_tokens=1),
+        ]
+    )
+    judge = FakeLLM(
+        [text_response('{"approved": true, "reason": ""}', input_tokens=100, output_tokens=5)]
+    )
+    net = Network(
+        agents=[Agent(name="front", summary="窓口", llm=llm, model="m")],
+        enable_auditor={"llm": judge, "model": "j"},
+    )
+
+    response = net.respond(agent="front", message="x")
+
+    assert response.text == "回答"
+    assert (response.input_tokens, response.output_tokens) == (110, 6)
+
+
+# ---- イベントに付く、その時点のネットワークの状態 ----
+def stateful_network(**kw) -> tuple[Network, list]:
+    """front 1体のNetwork。届いたgeneratedのイベントを順に残す。"""
+    llm = FakeLLM(
+        [
+            diff_response([{"field": "goals", "id": "g-1", "text": "貸出規程を答える"}]),
+            text_response("回答", input_tokens=10, output_tokens=2, cached_tokens=4),
+        ]
+    )
+    seen: list = []
+    net = Network(agents=[Agent(name="front", summary="窓口", llm=llm, model="m")], **kw)
+    net.interceptor.notice.generated(seen.append)
+    return net, seen
+
+
+def test_イベントに記憶と消費とステップごとの時間が載る():
+    net, seen = stateful_network()
+
+    net.respond(agent="front", message="貸出規程を教えて")
+
+    initial, answer = seen
+    front = answer.network.agents["front"]
+    # 記憶は、エージェントが読んでいるのと同じ文の形
+    assert "貸出規程を答える" in front.memory
+    assert "貸出規程を教えて" in answer.network.memory
+    # 消費は、そのイベントの生成の分まで入っている
+    assert (front.input_tokens, front.output_tokens, front.cached_tokens) == (10, 2, 4)
+    assert answer.network.input_tokens == 10
+    # 時間は、起動とステップごとに、phaseごとの秒数で持つ
+    (step,) = front.steps
+    assert step.step_no == 1
+    assert set(step.seconds) == {Phase.INITIAL_MEMORY, Phase.ANSWER}
+    assert front.seconds == pytest.approx(sum(step.seconds.values()))
+    assert answer.network.elapsed > 0
+    # 最初の生成の時点では、まだ記憶は無い
+    assert "貸出規程を答える" not in initial.network.agents["front"].memory
+
+
+def test_状態は写しなので後の生成で変わらない():
+    net, seen = stateful_network()
+
+    net.respond(agent="front", message="x")
+
+    initial, _ = seen
+    assert initial.network.agents["front"].input_tokens == 0
+    assert list(initial.network.agents["front"].steps[0].seconds) == [Phase.INITIAL_MEMORY]
+
+
+def test_監査役の消費も状態に入る():
+    judge = FakeLLM(
+        [text_response('{"approved": true, "reason": ""}', input_tokens=100, output_tokens=5)]
+    )
+    net, seen = stateful_network(enable_auditor={"llm": judge, "model": "j"})
+
+    net.respond(agent="front", message="x")
+
+    auditor = seen[-1].network.agents["auditor"]
+    assert (auditor.input_tokens, auditor.output_tokens) == (100, 5)
+    assert auditor.memory == ""
+    assert seen[-1].network.input_tokens == 110
+
+
+def test_resetで状態の積み上げも消える():
+    net, _ = stateful_network()
+    net.respond(agent="front", message="x")
+
+    errors: list = []
+    net.interceptor.notice.error(errors.append)
+
+    net.reset()
+    net.interceptor.notify.error(ErrorEvent(source="x", message="y"))
+
+    assert errors[0].network.agents["front"].input_tokens == 0
+    assert errors[0].network.agents["front"].steps == []
+    assert errors[0].network.elapsed == 0.0
+
+
+def test_Networkに入れずに動かすと状態は付かない():
+    seen: list = []
+    agent = ReflexAgent(name="a", summary="s", llm=FakeLLM([text_response("回答")]), model="m")
+    agent.interceptor.notice.generated(seen.append)
+
+    agent.respond(message="x")
+
+    assert seen[0].network is None

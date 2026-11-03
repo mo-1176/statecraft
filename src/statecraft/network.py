@@ -1,6 +1,10 @@
 import copy
+import threading
+import time
 
-from .agent import Agent, ReflexAgent
+from .agent import Agent, AgentResponse, ReflexAgent
+from .auditor import AUDITOR_NAME, Auditor, AuditorSettings
+from .events import AgentState, GeneratedEvent, NetworkState, StepTime
 from .interceptor import Interceptor
 from .memory import MemoryEntry, SharedMemory
 from .prompts import Phase
@@ -11,7 +15,7 @@ class Network:
     1リクエスト分のAgent群の入れ物。
 
         net = Network(agents=[front, librarian])
-        response = net["front"].respond(message="...")
+        response = net.respond(agent="front", message="...")
 
     構築時にSharedMemoryを1つ作って全Agentへ配るため、インスタンスの寿命が
     セッションの寿命になる。Agent実体を使い回す場合はreset()を呼ぶ。
@@ -23,6 +27,8 @@ class Network:
       3. interceptorの既定値を配る
       4. Toolインスタンスを複製する（無効化が他のAgentへ波及しないように）
       5. 配線の誤りを構築時に落とす（存在しない委譲先、循環、初期toolの引数不整合）
+      6. enable_auditorを渡せば、監査役を全Agentの記憶の更新へ繋ぐ（auditor.py）
+      7. どのイベントにも、その時点のネットワークの状態（NetworkState）を付ける
 
     llmは配らない。接続先はAgentごとに違うのが前提のため。
     """
@@ -33,6 +39,7 @@ class Network:
         agents: list[Agent],
         interceptor: Interceptor | None = None,
         preload: dict[str, list[str]] | None = None,
+        enable_auditor: AuditorSettings | None = None,
     ):
         if not agents:
             raise ValueError("agentsを1つ以上指定してください")
@@ -48,10 +55,25 @@ class Network:
                 raise ValueError(f"Agent名が重複しています: {agent.name}")
             self.agents[agent.name] = agent
 
+        # 生成ごとの消費と時間。generatedのイベントから数える（監査役の分も
+        # 同じinterceptorを通るので、ここで一緒に数えられる）。
+        self._usage: dict[str, AgentState] = {}
+        self._usage_lock = threading.Lock()
+        # net.respond()を始めた時刻。状態のelapsedはここから数える。
+        self._started: float | None = None
+        self.interceptor._attach_state(self._state)
+
         self._wire()
         self._resolve_sub_agents()
         self._detect_cycles()
         self._preload(preload or {})
+
+        self._auditor: Auditor | None = None
+        if enable_auditor is not None:
+            self._auditor = Auditor(enable_auditor, self.agents, self.interceptor)
+            # 全Agentが同じinterceptorを使うので、1回繋げば全員の記憶の更新に効く
+            # （記憶を持たないReflexAgentでは呼ばれない）。
+            self.interceptor.guard.before_memory_diff(self._auditor.review)
 
     # ---- 配線 ----
     def _wire(self) -> None:
@@ -66,14 +88,22 @@ class Network:
                 agent._source_tools = agent.tools
             agent.tools = [copy.copy(t) for t in agent._source_tools]
 
-            # Network共通のinterceptorを配る。個別に登録済みならそちらを尊重する。
-            if not agent.interceptor.has_listeners:
-                agent.interceptor = self.interceptor
+            # interceptorはNetworkのもの。Agentが持っているのは、単体で動かす時と
+            # 配線の都合のため。個別の登録を残すと、そのAgentにだけNetworkの
+            # 観測や費用の上限が黙って効かなくなるので、必ず差し替える。
+            agent.interceptor = self.interceptor
 
             # llmだけ差し替えてmodelを書き忘れると、別プロバイダのモデル名を
             # 送ることになる。APIは「そんなモデルは無い」しか返さず原因が
             # 見えないため、構築時に確かめる。
             for phase, override in agent.phase_overrides.items():
+                # 打ち切り・停滞で答える時は、ANSWERの上書きが使われる
+                # （resolve_generation）。別に書けると、答えの設定が2か所に割れる。
+                if phase in (Phase.CUTOFF_ANSWER, Phase.STALLED_ANSWER):
+                    raise ValueError(
+                        f"{agent.name}のphase_overrides[{phase.name}]は書けません。"
+                        f"打ち切りや停滞で答える時も、ANSWERの設定が使われます。"
+                    )
                 if override.llm is not None and override.model is None:
                     raise ValueError(
                         f"{agent.name}のphase_overrides[{phase.name}]がllmだけを"
@@ -262,10 +292,102 @@ class Network:
 
         for agent in self.agents.values():
             agent.reset()
+        if self._auditor is not None:
+            self._auditor.reset()
+        with self._usage_lock:
+            self._usage = {}
+        self._started = None
 
         # 新しい共有記憶と、_source_toolsから複製し直したtoolを配る
         # （設定としてのdisabledだけが残る）。
         self._wire()
+
+    def respond(
+        self,
+        *,
+        agent: str,
+        message: str,
+        history: list[dict] | None = None,
+        blobs: list[dict] | None = None,
+    ) -> AgentResponse:
+        """
+        利用者からの依頼を、名前で指したエージェント（窓口）へ渡す。
+
+            response = net.respond(agent="front", message="...", history=[...])
+
+        Agent.respond()と違い、トークン数は委譲先と監査役を含む、この1回の依頼の
+        全体を返す。利用者が知りたいのは「この依頼でいくら使ったか」で、各Agentが
+        自分の分だけを数えているのは、二重に数えないための集計の都合だから。
+
+        全体の増えた分で数えるので、同じNetworkで同時に2つの依頼を走らせると
+        混ざる（共有の記憶も混ざるので、そもそも同時には使わない）。
+        """
+        self._started = time.perf_counter()
+        before_in, before_out = self.total_tokens()
+        response = self.get(agent).respond(message=message, history=history, blobs=blobs)
+        after_in, after_out = self.total_tokens()
+        return AgentResponse(
+            text=response.text,
+            steps=response.steps,
+            input_tokens=after_in - before_in,
+            output_tokens=after_out - before_out,
+        )
+
+    # ---- イベントに付ける状態 ----
+    def _state(self, event: object) -> NetworkState:
+        """
+        interceptorがイベントを配る直前に呼ぶ。generatedなら先に数えてから、
+        その時点の写しを返す（その生成の分まで入った状態を、そのイベントで見せる）。
+        """
+        with self._usage_lock:
+            if isinstance(event, GeneratedEvent):
+                self._count(event)
+            agents = {}
+            names = [*self.agents, *([AUDITOR_NAME] if self._auditor else [])]
+            for name in [*names, *(n for n in self._usage if n not in names)]:
+                used = self._usage.get(name) or AgentState()
+                agent = self.agents.get(name)
+                agents[name] = AgentState(
+                    # ReflexAgentは記憶を使わないので、空の見出しを見せない
+                    memory=""
+                    if agent is None or isinstance(agent, ReflexAgent)
+                    else agent.private_memory.render(),
+                    input_tokens=used.input_tokens,
+                    output_tokens=used.output_tokens,
+                    cached_tokens=used.cached_tokens,
+                    cache_write_tokens=used.cache_write_tokens,
+                    seconds=used.seconds,
+                    steps=[
+                        StepTime(s.run_id, s.step_no, dict(s.seconds)) for s in used.steps
+                    ],
+                )
+        return NetworkState(
+            memory=self.shared_memory.render(),
+            elapsed=time.perf_counter() - self._started if self._started else 0.0,
+            input_tokens=sum(a.input_tokens for a in agents.values()),
+            output_tokens=sum(a.output_tokens for a in agents.values()),
+            cached_tokens=sum(a.cached_tokens for a in agents.values()),
+            cache_write_tokens=sum(a.cache_write_tokens for a in agents.values()),
+            agents=agents,
+        )
+
+    def _count(self, e: GeneratedEvent) -> None:
+        """生成1回分を、そのエージェントの消費とステップの時間へ積む。"""
+        used = self._usage.setdefault(e.agent, AgentState())
+        used.input_tokens += e.input_tokens
+        used.output_tokens += e.output_tokens
+        used.cached_tokens += e.cached_tokens
+        used.cache_write_tokens += e.cache_write_tokens
+        used.seconds += e.elapsed
+        # 同じ起動の同じステップなら同じ行へ積む。委譲で2回起動されると
+        # ステップの番号が1から振り直されるので、起動（run_id）でも分ける。
+        if not used.steps or (used.steps[-1].run_id, used.steps[-1].step_no) != (
+            e.run_id,
+            e.step_no,
+        ):
+            used.steps.append(StepTime(run_id=e.run_id, step_no=e.step_no))
+        step = used.steps[-1]
+        step.seconds[e.phase] = step.seconds.get(e.phase, 0.0) + e.elapsed
 
     def get(self, name: str) -> Agent:
         if name not in self.agents:
@@ -280,15 +402,26 @@ class Network:
         セッション全体の入力・出力トークン数。
 
         各Agentは自分の消費分だけを数えるため、単純な合計で二重計上が起きない。
+        監査役を有効にしていれば、その消費も含む。
         """
+        usage = self.token_usage().values()
         return (
-            sum(a.total_input_tokens for a in self.agents.values()),
-            sum(a.total_output_tokens for a in self.agents.values()),
+            sum(input_tokens for input_tokens, _ in usage),
+            sum(output_tokens for _, output_tokens in usage),
         )
 
     def token_usage(self) -> dict[str, tuple[int, int]]:
-        """Agentごとのトークン消費の内訳。どのAgentが重いかを見るためのもの。"""
-        return {
+        """
+        Agentごとのトークン消費の内訳。どのAgentが重いかを見るためのもの。
+        監査役を有効にしていれば、その消費は auditor として入る。
+        """
+        usage = {
             name: (a.total_input_tokens, a.total_output_tokens)
             for name, a in self.agents.items()
         }
+        if self._auditor is not None:
+            usage[AUDITOR_NAME] = (
+                self._auditor.total_input_tokens,
+                self._auditor.total_output_tokens,
+            )
+        return usage

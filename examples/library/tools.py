@@ -6,7 +6,6 @@ LLMに見せる説明（summary / usage / evaluation）と引数のスキーマ�
 """
 
 import time
-from collections.abc import Callable
 
 RULES = """
 【貸出】
@@ -110,15 +109,10 @@ def is_open_hours() -> bool:
     return 9 <= time.localtime().tm_hour < 20
 
 
-def make_sample_tool(*, max_results: int) -> Callable[[str], dict]:
-    """
-    config/tools.yaml の sample_tool（全項目の見本）の実装。
+# 見本のツールが一度に返す件数。上限のような値は、ツールの実装が持つ。
+SAMPLE_MAX_RESULTS = 3
 
-    settings を持つツールは、settings をキーワード引数で受け取り、ツールの関数を
-    返す形で書く。図書館のツールは settings を持たないので、この形はここにしか無い。
-    """
 
-    def sample_tool(topic: str) -> dict:
-        return {"value": f"「{topic}」についての見本の結果（最大{max_results}件）"}
-
-    return sample_tool
+def sample_tool(topic: str) -> dict:
+    """config/tools.yaml の sample_tool（全項目の見本）の実装。"""
+    return {"value": f"「{topic}」についての見本の結果（最大{SAMPLE_MAX_RESULTS}件）"}

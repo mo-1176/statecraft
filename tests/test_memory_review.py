@@ -44,8 +44,8 @@ def reject_first(reason: str = "依頼から外れている"):
 
     def review(event: BeforeMemoryDiffEvent) -> MemoryDiffDecision:
         if event.review_round == 1:
-            return MemoryDiffDecision(approved=False, reason=reason)
-        return MemoryDiffDecision(approved=True)
+            return MemoryDiffDecision(ok=False, reason=reason)
+        return MemoryDiffDecision(ok=True)
 
     return review
 
@@ -75,7 +75,7 @@ def test_監査には原文と今の記憶と差分が揃って渡る():
 
     def review(event: BeforeMemoryDiffEvent) -> MemoryDiffDecision:
         seen.append(event)
-        return MemoryDiffDecision(approved=True)
+        return MemoryDiffDecision(ok=True)
 
     interceptor = Interceptor()
     interceptor.guard.before_memory_diff(review)
@@ -115,7 +115,7 @@ def test_監査の差し戻しは形式の差し戻しの回数を使わない()
 
     def reject_twice(event: BeforeMemoryDiffEvent) -> MemoryDiffDecision:
         return MemoryDiffDecision(
-            approved=event.review_round >= 3, reason="まだずれている"
+            ok=event.review_round >= 3, reason="まだずれている"
         )
 
     interceptor = Interceptor()
@@ -133,6 +133,43 @@ def test_監査の差し戻しは形式の差し戻しの回数を使わない()
     agent.respond(message="x")
 
     assert [g.text for g in agent.private_memory.goals] == ["3回目"]
+
+
+def test_前に差し戻した理由が次の監査に載り_通ったら空に戻る():
+    """監査する側が理由を覚えておかなくても、前の指摘と並べて判定できるように。"""
+    seen: list[BeforeMemoryDiffEvent] = []
+
+    def review(event: BeforeMemoryDiffEvent) -> MemoryDiffDecision:
+        seen.append(event)
+        if event.phase is Phase.INITIAL_MEMORY and event.review_round == 1:
+            return MemoryDiffDecision(ok=False, reason="依頼から外れている")
+        return MemoryDiffDecision(ok=True)
+
+    interceptor = Interceptor()
+    interceptor.guard.before_memory_diff(review)
+    llm = FakeLLM(
+        [
+            diff_response(
+                [
+                    goal("脱線した目標"),
+                    task_row("t-1", "規程を調べる", "next", ["search_rules"]),
+                ]
+            ),
+            diff_response([goal("直した目標")]),
+            call_response("search_rules", topic="貸出"),
+            diff_response([task_row("t-1", "規程を調べる", "done", ["search_rules"])]),
+            text_response("回答"),
+        ]
+    )
+    agent = build_agent(llm, interceptor)
+
+    agent.respond(message="x")
+
+    first, retried, update = seen
+    assert first.rejections == []
+    assert retried.rejections == ["依頼から外れている"]
+    # 別の記憶の更新には持ち越さない
+    assert update.rejections == []
 
 
 def test_差し戻した差分も記憶の差分イベントで流れる():
@@ -184,8 +221,8 @@ def test_作り直しで出さなかった行は差し戻した差分のまま�
 
     def reject_initial_once(event: BeforeMemoryDiffEvent) -> MemoryDiffDecision:
         if event.phase is Phase.INITIAL_MEMORY and event.review_round == 1:
-            return MemoryDiffDecision(approved=False, reason="依頼から外れている")
-        return MemoryDiffDecision(approved=True)
+            return MemoryDiffDecision(ok=False, reason="依頼から外れている")
+        return MemoryDiffDecision(ok=True)
 
     interceptor = Interceptor()
     interceptor.guard.before_memory_diff(reject_initial_once)
@@ -216,8 +253,8 @@ def test_作り直しで出さなかった行は差し戻した差分のまま�
 def test_作り直しには実行結果を渡さず差し戻した差分を渡す():
     def reject_update_once(event: BeforeMemoryDiffEvent) -> MemoryDiffDecision:
         if event.phase is Phase.MEMORY_UPDATE and event.review_round == 1:
-            return MemoryDiffDecision(approved=False, reason="調べすぎている")
-        return MemoryDiffDecision(approved=True)
+            return MemoryDiffDecision(ok=False, reason="調べすぎている")
+        return MemoryDiffDecision(ok=True)
 
     interceptor = Interceptor()
     interceptor.guard.before_memory_diff(reject_update_once)
