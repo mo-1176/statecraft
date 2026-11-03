@@ -215,15 +215,15 @@ my-app/
 | 順 | 入れ替えるもの | 中身 |
 |---|---|---|
 | 1 | `config/agents.yaml` | エージェントと、そのつながり（`tools` / `sub_agents` / `knowledge`） |
-| 2 | `config/tools.yaml` | ツールの説明と引数のスキーマ。`type` はツールの実装の名前 |
+| 2 | `config/tools.yaml` | ツールの説明と引数のスキーマ |
 | 3 | `tools.py` | ツールの実装。ただの関数で、`{"value": ...}` の辞書を返す |
-| 4 | `network.py` の `TOOL_FACTORIES` | `type` → ツールの関数を返すもの |
+| 4 | `network.py` の `LIBRARY_TOOLS` | tools.yaml の名前 → ツールの関数（`LocalTools`） |
 | 5 | `prompts/`、`knowledge/`、`config/knowledges.yaml` | 長い文章。`prompts/<agents か tools>/<名前>/<項目>.md` に置けば、YAML から指さなくても読まれる |
 | 6 | `observers.py` の `Guard` と `guard/` | 実行前の判定。図書館の規則なので、自分の題材の規則に書き換えるか、消す |
 
 エージェントとツールを足すときは、`config/agents.yaml` の末尾の `sample_agent`、`config/tools.yaml` の末尾の `sample_tool` をコピーします。書ける項目が全部埋めてあるので、要らない項目を消して中身を書き換えるだけで済み、項目名の綴りも間違えません。見本も毎回読み込まれて検証されているので、見本の項目名が古くなっていれば起動時にエラーになります。
 
-見本は残しておいて構いません（誰からも呼ばれません）。消すなら、`tools.py` の `make_sample_tool` と、`network.py` の `TOOL_FACTORIES` の `sample_tool` の行も消します。
+見本は残しておいて構いません（誰からも呼ばれません）。消すなら、`tools.py` の `sample_tool` と、`network.py` の `LIBRARY_TOOLS` の `sample_tool` の行も消します。
 
 書き方は [設定ファイルから組み立てる](#設定ファイルから組み立てる) にあります。設定を書き間違えると、組み立ての時点で、何がどこで違うかをまとめてエラーにします。
 
@@ -271,8 +271,7 @@ main.py
 
 ```yaml
 # my_app/config/tools.yaml
-- name: search_rules
-  type: search_rules          # network.py の TOOL_FACTORIES のキー
+- name: search_rules          # network.py の LocalTools に、同じ名前で関数を渡す
   summary: 社内規程を検索する
   parameters:
     type: object
@@ -296,19 +295,16 @@ def search_rules(topic: str) -> dict:
 # my_app/network.py
 from pathlib import Path
 
-from statecraft import Network, NetworkBuilder
+from statecraft import LocalTools, Network, NetworkBuilder
 
 from . import tools
 
 ROOT = Path(__file__).resolve().parent
-
-
-class MyBuilder(NetworkBuilder):
-    TOOL_FACTORIES = {"search_rules": lambda: tools.search_rules}
+TOOLS = LocalTools({"search_rules": tools.search_rules})
 
 
 def build_network() -> Network:
-    return MyBuilder.from_dir(ROOT).build()
+    return NetworkBuilder.from_dir(ROOT, tools=[TOOLS]).build()
 ```
 
 ```python
@@ -316,7 +312,7 @@ def build_network() -> Network:
 from my_app.network import build_network
 
 net = build_network()
-response = net["assistant"].respond(message="有給の申請はいつまでに出せばいい？")
+response = net.respond(agent="assistant", message="有給の申請はいつまでに出せばいい？")
 
 print(response.text)
 print(net.total_tokens())  # (入力, 出力)
@@ -423,8 +419,7 @@ Agent の引数のうち、`disabled` と `describe_execution` は設定ファ�
 書ける項目を全部並べた見本は、サンプルの tools.yaml の末尾の `sample_tool` にあります。
 
 ```yaml
-- name: check_stock
-  type: check_stock             # 実装の種類。network.py の TOOL_FACTORIES のキー
+- name: check_stock             # 実装は、組み立てる時に渡す出どころ（LocalTools など）が名前で引く
   summary: 書名から所在と貸出状況を調べる
   execution_message: 『{title}』の所蔵状況を照会しています...
   parameters:
@@ -437,36 +432,10 @@ Agent の引数のうち、`disabled` と `describe_execution` は設定ファ�
 | 項目 | 中身 |
 |---|---|
 | `name` | LLM に見せるツール名 |
-| `type` | 実装の種類。`TOOL_FACTORIES` のキー |
-| `settings` | 実装に渡す値。文章の差し込み口にも使います |
-| `parameters` | 引数の JSON Schema。型ヒントからは作らず、書いたものをそのまま使います |
-| `summary` / `usage` / `evaluation` / `execution_message` | Tool の同名の項目（→ [summary / usage / evaluation](#summary--usage--evaluation)） |
+| `parameters` | 引数の JSON Schema。自作のツールでは必須で、型ヒントからは作らず、書いたものをそのまま使います。MCP のツールは、書かなければサーバーが返すスキーマを使います |
+| `summary` / `usage` / `evaluation` / `execution_message` | Tool の同名の項目（→ [summary / usage / evaluation](#summary--usage--evaluation)）。MCP のツールは、`summary` と `usage` を書かなければサーバーの description から入ります |
 
-#### settings — 同じ実装から別のツールを作る
-
-`name` と `type` が分かれているので、同じ実装から `settings` だけ違うツールを何本でも作れます。サンプルでは見本の `sample_tool` だけが `settings` を使っています。
-
-```yaml
-- name: sample_tool
-  type: sample_tool
-  settings:
-    max_results: 3
-  summary: 見本のツール。最大{max_results}件を返す
-  execution_message: 「{topic}」を調べています...
-  parameters:
-    type: object
-    properties:
-      topic:
-        type: string
-        description: 何について調べるか。結果は最大{max_results}件
-    required: [topic]
-```
-
-`summary` / `usage` / `evaluation` とスキーマの `description` にある `{名前}` は、`settings` の同じ名前の値で埋まります。数字を `settings` の1か所に書けば、説明文と実装の上限が食い違いません。波かっこをそのまま書くときは `{{ }}` にしてください。`execution_message` の `{名前}` は埋めずに残し、実行時にツールの引数で埋まります（[進捗メッセージ](#進捗メッセージ)）。
-
-`{名前}` を含む文は、`{type: string, description: ...}` のような1行の形（YAML のフロー形式）に入れないでください。波かっこが YAML の文法として読まれ、読み込みの時点でエラーになります。上の `topic` のように1行に1項目で書きます。
-
-`settings` は、実装を作る関数へキーワード引数で渡ります（→ [組み立てる](#組み立てる)）。
+どの実装のツールかは、tools.yaml には書きません。組み立てる時に渡すツールの出どころ（→ [組み立てる](#組み立てる)）が、名前で引きます。上限のような値は、ツールの実装が持ちます。
 
 ### 長い文章は Markdown に置く
 
@@ -496,51 +465,48 @@ prompts/
 
 ### 組み立てる
 
-ツールの関数は、`NetworkBuilder` の子クラスで `type` と対応させます。サンプルの `network.py` です。
+ツールは、**出どころ**を並べて `from_dir` に渡します。tools.yaml の名前ごとに、その名前を持っている出どころがツールを作ります。サンプルの `network.py` です。
 
 ```python
 from pathlib import Path
 
-from statecraft import Interceptor, Network, NetworkBuilder
+from statecraft import Interceptor, LocalTools, Network, NetworkBuilder
 
 from . import tools
 
 ROOT = Path(__file__).resolve().parent
 
-
-class LibraryBuilder(NetworkBuilder):
-    # type → ツールの関数を返すもの
-    TOOL_FACTORIES = {
-        "search_rules": lambda: tools.search_rules,
-        "fetch_member_status": lambda: tools.fetch_member_status,
-        "check_stock": lambda: tools.check_stock,
-        "issue_reservation": lambda: tools.issue_reservation,
-        "send_overdue_notice": lambda: tools.send_overdue_notice,
-        "sample_tool": tools.make_sample_tool,   # settings を受け取るもの
+# tools.yaml の名前 → ツールの関数
+LIBRARY_TOOLS = LocalTools(
+    {
+        "search_rules": tools.search_rules,
+        "fetch_member_status": tools.fetch_member_status,
+        "check_stock": tools.check_stock,
+        "issue_reservation": tools.issue_reservation,
+        "send_overdue_notice": tools.send_overdue_notice,
+        "sample_tool": tools.sample_tool,
     }
+)
 
 
 def build_network(interceptor: Interceptor) -> Network:
-    return LibraryBuilder.from_dir(ROOT, interceptor).build()
+    return NetworkBuilder.from_dir(ROOT, interceptor, tools=[LIBRARY_TOOLS]).build()
 
 
 net = build_network(interceptor)
-response = net["front"].respond(message="...")
+response = net.respond(agent="front", message="...")
 ```
 
-`TOOL_FACTORIES` の値は「ツールの関数を返すもの」です。`settings` を持たないツールは、関数をそのまま返す `lambda` で足ります。`settings` を持つツールは、キーワード引数で受け取って関数を返します（サンプルの `tools.py` の `make_sample_tool`）。
+| 出どころ | 何のツールか | tools.yaml に書くもの |
+|---|---|---|
+| `LocalTools({名前: 関数})` | 自作の関数 | 文章と `parameters`（必須） |
+| `McpTools(名前, url=..., headers=...)` | MCP サーバー1台分のツール（→ [MCP のツールを使う](docs/guides/mcp-tools.md)） | 名前だけでよい。`summary` / `usage` / `parameters` は、書かなければサーバーから入る |
 
-```python
-def make_sample_tool(*, max_results: int) -> Callable[[str], dict]:
-    def sample_tool(topic: str) -> dict:
-        return {"value": f"「{topic}」についての見本の結果（最大{max_results}件）"}
-
-    return sample_tool
-```
+自作と MCP を並べて渡せます。どの出どころにも無い名前と、2つ以上の出どころにある名前は、組み立ての時点でエラーになります。上限のような値は、ツールの実装が持ちます（tools.yaml には書きません）。
 
 `from_dir` は呼ぶたびに設定を読み直します。サンプルはリクエストごとに組み立てるので、`config/` や `prompts/` を直すと、次のリクエストから効きます。
 
-YAML に関数の場所（モジュール名）を書く形にしていないのは、設定を書き換えられる人が、登録されていない関数を組み立て時に呼べないようにするためです。
+YAML に関数の場所（モジュール名）を書く形にしていないのは、設定を書き換えられる人が、渡されていない関数を組み立て時に呼べないようにするためです。
 
 `provider` の `gemini` / `openai` / `claude` / `azure_openai` は最初から登録されています。API キーは YAML に書かず、環境変数（`GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`）に置いてください。各 SDK がそこから読みます。
 
@@ -563,7 +529,6 @@ def make_azure_llm() -> AzureOpenAILLM:
 
 
 class LibraryBuilder(NetworkBuilder):
-    TOOL_FACTORIES = {...}   # 上と同じ
     LLM_FACTORIES = {**NetworkBuilder.LLM_FACTORIES, "azure_openai": make_azure_llm}
 ```
 
@@ -577,9 +542,10 @@ YAML は書き間違えても読めてしまうので、次のものは読み込
 - 同じ名前のエージェント・ツール・ナレッジが2つ以上ある
 - `tools` / `sub_agents` / `knowledge` などに書いた名前が、指す先のファイルに無い
 - 同じ文章が YAML と md の両方にある
-- `{名前}` に入れる値が `settings` に無い
 - ナレッジの `file` が無い
-- `type` / `provider` が対応表に無い、`settings` が実装の引数と合わない
+- `provider` が対応表に無い
+- ツールの名前が、どの出どころにも無い・2つ以上の出どころにある
+- 自作のツールに `parameters` が無い
 
 ---
 
@@ -631,7 +597,7 @@ return {"value": "ok", "blob": [...]}  # ✗ キーの綴り違い（blobs のs�
 
 `Tool` の引数で並べています。`Agent` と同じ3つに分かれます。
 
-tools.yaml では、`summary` / `usage` / `evaluation` / `execution_message` を同じ名前で書きます。`func` は `type`（と `settings`）から作られ、`param_descriptions` の代わりに `parameters` の各 `description` を書きます。`expose_error_details` / `disabled` / `describe_execution` は設定ファイルでは書けません。
+tools.yaml では、`summary` / `usage` / `evaluation` / `execution_message` を同じ名前で書きます。`func` は組み立てる時に渡す出どころ（`LocalTools` など）が名前で引き、`param_descriptions` の代わりに `parameters` の各 `description` を書きます。`expose_error_details` / `disabled` / `describe_execution` は設定ファイルでは書けません。
 
 **① このツール自身の振る舞い**
 
@@ -1129,7 +1095,7 @@ Agent(
 | `INITIAL_MEMORY` | 初期方針を決める役割の為、安易に下位モデルを選ばない。few-shot形式の場合下位モデルで構わない|
 | `FUNCTION_CALL` | `tasks` に書かれた対象を呼ぶだけなら軽くて足りる。SQL生成など引数の品質が要る場合は上げる |
 | `MEMORY_UPDATE` | **前の理解と新しい結果を統合する。** ここが軽いと項目が落ちる |
-| `ANSWER` | 文章を作る場合は上位。`output_schema` で状態だけ返す場合は軽くてよい |
+| `ANSWER` | 文章を作る場合は上位。`output_schema` で状態だけ返す場合は軽くてよい。打ち切り（`CUTOFF_ANSWER`）や停滞（`STALLED_ANSWER`）で答える時も、この設定が使われる（その2つは上書きに書けない） |
 
 どのphaseが重いかは構成で変わるので、`generated` イベントで実測してから決めてください。
 
@@ -1232,14 +1198,17 @@ Claude と、GPT-5.6 以降の OpenAI は、**区切りまでが丸ごと一致�
 設定ファイルからは `NetworkBuilder` の `build()` で作られます。コードで組む場合は、`Agent` を並べて直接作ります。
 
 ```python
-net = LibraryBuilder.from_dir(ROOT, interceptor).build()   # 設定ファイルから
+net = NetworkBuilder.from_dir(ROOT, interceptor, tools=[LIBRARY_TOOLS]).build()   # 設定ファイルから
 net = Network(agents=[front, librarian], interceptor=ic)   # コードで組む場合
 
+net.respond(agent="front", message="...")  # 利用者からの依頼。トークン数は委譲先と監査役を含む全体
 net.get("front")  # net["front"] でも同じ
 net.total_tokens()  # (入力, 出力)
 net.token_usage()  # {"front": (入力, 出力), ...}
 net.shared_memory  # 全Agentが共有する記憶の実体
 ```
+
+`enable_auditor` を渡すと、組み込みの監査役が記憶の更新を監査します（→ [組み込みの監査役を使う](#組み込みの監査役を使う--enable_auditor)）。
 
 **配線の誤りは、構築した時点でエラーになります。** 実行してから気付くことにはなりません。
 
@@ -1247,6 +1216,7 @@ net.shared_memory  # 全Agentが共有する記憶の実体
 - 循環参照がある
 - `initial_tools` の引数名が `input_schema` と一致しない、同じ対象が重複している、または置いたagentが `agents` に無い
 - `phase_overrides` で `llm`（設定ファイルでは `provider`）だけを上書きして `model` を書き忘れている
+- `phase_overrides` に `CUTOFF_ANSWER` / `STALLED_ANSWER` を書いている（答える時はいつも `ANSWER` の設定を使う）
 
 ### Agentを使い回す — reset()
 
@@ -1254,7 +1224,7 @@ Agentをモジュールレベルで定義してプロセスを生かし続ける
 
 ```python
 net.reset()
-net["front"].respond(message=...)
+net.respond(agent="front", message=...)
 ```
 
 | 消えるもの | 残るもの |
@@ -1392,6 +1362,27 @@ def log_call(event: ExecutedEvent) -> None: ...
 
 `executed` / `memory_diff` / `generated` / `before_memory_diff` の項目は、それぞれの節にあります（[executed](#実行を観測する--executed) / [memory_diff](#記憶の変化を観測する--memory_diff) / [generated](#生成を計測する--generated) / [before_memory_diff](#記憶の更新を監査する--before_memory_diff)）。
 
+### どのイベントにも付く、その時点の状態 — event.network
+
+Network に入れて動かすと、どのイベントにも `network`（`NetworkState`）が付きます。観測する側が Network の中を読みに行かなくて済むようにするためのものです。イベントが起きた瞬間の写しなので、並列に動く他のエージェントが後から書き換えても、受け取った値は変わりません。Agent を単体で動かした時は `None` です。
+
+| 項目 | 中身 |
+|---|---|
+| `memory` | 共有の記憶。エージェントが読んでいるのと同じ文の形 |
+| `elapsed` | `net.respond()` を始めてからの秒数 |
+| `input_tokens` / `output_tokens` / `cached_tokens` / `cache_write_tokens` | 全体の合計（監査役を含む） |
+| `agents["名前"]` | エージェントごとの `AgentState`（監査役は `auditor`） |
+
+`AgentState` には、そのエージェント自身の記憶（`memory`。記憶を持たない ReflexAgent と監査役は空）、トークン、生成にかかった時間の合計（`seconds`）、ステップごとの時間（`steps`）が入ります。`steps` は起動とステップの順に並ぶ `StepTime` で、`seconds` に phase ごとの秒数を持ちます（作り直しと失敗した試行の時間も含みます）。
+
+```python
+def on_generated(e: GeneratedEvent) -> None:
+    for step in e.network.agents["scout"].steps:
+        print(step.step_no, {phase.value: round(s, 1) for phase, s in step.seconds.items()})
+        # 1 {'initial_memory': 3.2, 'function_call': 1.1}
+        # 2 {'memory_update': 4.0, 'function_call': 0.9}
+```
+
 | 型 | 項目 |
 |---|---|
 | `BeforeExecuteEvent` | `name`（呼ばれようとしているtool / agentの名前）/ `kwargs`（それへ渡される引数。LLMが埋めた値） |
@@ -1410,12 +1401,14 @@ def log_call(event: ExecutedEvent) -> None: ...
 
 | 型 | 項目 | 返すイベント |
 |---|---|---|
-| `ExecuteDecision` | `allowed`（許可するか）/ `reason`（拒否の理由。LLMへそのまま渡る） | `before_execute` |
-| `GenerateDecision` | `proceed`（生成するか）/ `model`（使うモデル。空文字なら元のまま） | `before_generate` |
-| `RetryDecision` | `retry`（やり直すか）/ `model`（使うモデル。空文字なら元のまま） | `generation_failed` |
-| `MemoryDiffDecision` | `approved`（当てるか）/ `reason`（差し戻す理由。LLMへそのまま渡る） | `before_memory_diff` |
+| `ExecuteDecision` | `ok`（許可するか）/ `reason`（拒否の理由。LLMへそのまま渡る） | `before_execute` |
+| `GenerateDecision` | `ok`（生成するか）/ `model`（使うモデル。空文字なら元のまま） | `before_generate` |
+| `RetryDecision` | `ok`（やり直すか）/ `model`（使うモデル。空文字なら元のまま） | `generation_failed` |
+| `MemoryDiffDecision` | `ok`（当てるか）/ `reason`（差し戻す理由。LLMへそのまま渡る） | `before_memory_diff` |
 
 `GenerateDecision` と `RetryDecision` は形が同じですが、意味が違うので別の型にしてあります。
+
+「はい」の項目は、どの型も `ok` です（以前は `allowed` / `proceed` / `retry` / `approved` と型ごとに違い、書き間違えると、その場では気づけないまま安全側に倒れていました）。`ok=False` の時に何が起きるか（止める／差し戻す／後ろの登録へ回す）は窓口ごとに違うので、上の表と各節を見てください。
 
 ---
 
@@ -1430,25 +1423,25 @@ def guard(event: BeforeExecuteEvent) -> ExecuteDecision:
 
     # ツール名で止める
     if name == "send_mail":
-        return ExecuteDecision(allowed=False, reason="外部への送信はこの環境では実行できません。")
+        return ExecuteDecision(ok=False, reason="外部への送信はこの環境では実行できません。")
 
     # 引数の内容で止める
     if name == "issue_ticket":
         if not kwargs.get("member_id", "").startswith("M-"):
             return ExecuteDecision(
-                allowed=False,
+                ok=False,
                 reason="受け取った会員番号は正しい形式ではありません。利用者から取得してください。",
             )
 
     # 外部の状態で止める
     if name == "delete_record" and not is_business_hours():
-        return ExecuteDecision(allowed=False, reason="営業時間外のため実行できません。")
+        return ExecuteDecision(ok=False, reason="営業時間外のため実行できません。")
 
     # 理由を伝えたくない場合
     if name == "check_stock" and kwargs.get("title") in RESTRICTED:
-        return ExecuteDecision(allowed=False)
+        return ExecuteDecision(ok=False)
 
-    return ExecuteDecision(allowed=True)
+    return ExecuteDecision(ok=True)
 
 
 ic.guard.before_execute(guard)
@@ -1456,9 +1449,9 @@ ic.guard.before_execute(guard)
 
 | 戻り値 | 結果 |
 |---|---|
-| `ExecuteDecision(allowed=True)` | 許可 |
-| `ExecuteDecision(allowed=False, reason="…")` | 拒否。**`reason` が理由としてLLMへ渡る** |
-| `ExecuteDecision(allowed=False)` | 拒否。理由は渡らない |
+| `ExecuteDecision(ok=True)` | 許可 |
+| `ExecuteDecision(ok=False, reason="…")` | 拒否。**`reason` が理由としてLLMへ渡る** |
+| `ExecuteDecision(ok=False)` | 拒否。理由は渡らない |
 | それ以外（`True` / `None` / 戻り値なし）・例外 | 拒否。理由は渡らない（型の違う値はログに出る） |
 
 **判定できなかったものが「許可」として通ることはありません。**
@@ -1515,9 +1508,9 @@ def guard(event: BeforeExecuteEvent) -> ExecuteDecision:
             kwargs={"message": f"次の実行を審査せよ: {event.name} {event.kwargs}"}
         )
         if not result.success:
-            return ExecuteDecision(allowed=False)  # 審査できなかったものは通さない
-        return ExecuteDecision(allowed=json.loads(result.value).get("allowed") is True)
-    return ExecuteDecision(allowed=True)
+            return ExecuteDecision(ok=False)  # 審査できなかったものは通さない
+        return ExecuteDecision(ok=json.loads(result.value).get("allowed") is True)
+    return ExecuteDecision(ok=True)
 ```
 
 **審査するAgentは `Network` に渡しません。** 渡すと3つの問題が起きます。
@@ -1569,10 +1562,10 @@ from statecraft import BeforeGenerateEvent, GenerateDecision
 def budget(event: BeforeGenerateEvent) -> GenerateDecision:
     spent = net.total_tokens()[0]
     if spent >= 100_000:
-        return GenerateDecision(proceed=False)  # 中止
+        return GenerateDecision(ok=False)  # 中止
     if spent >= 50_000:
-        return GenerateDecision(proceed=True, model="gemini-3.5-flash-lite")  # 軽いモデルへ落とす
-    return GenerateDecision(proceed=True)
+        return GenerateDecision(ok=True, model="gemini-3.5-flash-lite")  # 軽いモデルへ落とす
+    return GenerateDecision(ok=True)
 
 
 ic.guard.before_generate(budget)
@@ -1580,9 +1573,9 @@ ic.guard.before_generate(budget)
 
 | 戻り値 | 結果 |
 |---|---|
-| `GenerateDecision(proceed=True)` | そのまま生成する（後ろに別の判定があれば、そちらにも尋ねる） |
-| `GenerateDecision(proceed=True, model="…")` | **そのモデル**で生成する（ここで決まる） |
-| `GenerateDecision(proceed=False)`・それ以外の値・例外 | 中止する（`GenerationAborted` が飛ぶ） |
+| `GenerateDecision(ok=True)` | そのまま生成する（後ろに別の判定があれば、そちらにも尋ねる） |
+| `GenerateDecision(ok=True, model="…")` | **そのモデル**で生成する（ここで決まる） |
+| `GenerateDecision(ok=False)`・それ以外の値・例外 | 中止する（`GenerationAborted` が飛ぶ） |
 
 **登録しなければ、そのまま生成します。** `before_execute` と同じ向きです。
 
@@ -1594,7 +1587,7 @@ ic.guard.before_generate(budget)
 
 ```python
 if event.phase in (Phase.ANSWER, Phase.CUTOFF_ANSWER, Phase.STALLED_ANSWER):
-    return GenerateDecision(proceed=True)
+    return GenerateDecision(ok=True)
 ```
 
 ---
@@ -1612,7 +1605,7 @@ from statecraft import BeforeMemoryDiffEvent, MemoryDiffDecision
 def review(event: BeforeMemoryDiffEvent) -> MemoryDiffDecision:
     # 何回で通すかは、監査する側が決める
     if event.review_round >= 3:
-        return MemoryDiffDecision(approved=True)
+        return MemoryDiffDecision(ok=True)
 
     material = (
         f"利用者とのやり取り:\n{event.conversation}\n\n"
@@ -1623,11 +1616,11 @@ def review(event: BeforeMemoryDiffEvent) -> MemoryDiffDecision:
     )
     result = auditor.execute(kwargs={"message": material})
     if not result.success:
-        return MemoryDiffDecision(approved=True)  # 監査できなかった時は止めない
+        return MemoryDiffDecision(ok=True)  # 監査できなかった時は止めない
     verdict = json.loads(result.value)
     if verdict.get("approved") is True:
-        return MemoryDiffDecision(approved=True)
-    return MemoryDiffDecision(approved=False, reason=verdict.get("reason", ""))
+        return MemoryDiffDecision(ok=True)
+    return MemoryDiffDecision(ok=False, reason=verdict.get("reason", ""))
 
 
 ic.guard.before_memory_diff(review)
@@ -1644,16 +1637,17 @@ ic.guard.before_memory_diff(review)
 | `request` | **原文。** このエージェントが受けた依頼。委譲先なら依頼元が組み立てたもの。`conversation` と並べると、伝言でどこがずれたかが分かる |
 | `shared_memory` / `private_memory` | **今の記憶**（この差分を当てる前）。エージェント自身が読んでいるのと同じ文の形 |
 | `rows` / `tool_results` | **差分**と、その材料（今回の実行結果） |
+| `rejections` | この更新の中で、監査が差し戻した理由（古い順）。差分が通ると空に戻る。作り直された差分を、前の指摘と並べて判定するためのもの |
 
 | 戻り値 | 結果 |
 |---|---|
-| `MemoryDiffDecision(approved=True)` | 当てる（後ろに別の監査があれば、そちらにも尋ねる） |
-| `MemoryDiffDecision(approved=False, reason="…")` | 当てずに、**`reason` を添えて、差し戻した差分を直させる**（直した行を重ねたものを、もう一度監査に見せる） |
+| `MemoryDiffDecision(ok=True)` | 当てる（後ろに別の監査があれば、そちらにも尋ねる） |
+| `MemoryDiffDecision(ok=False, reason="…")` | 当てずに、**`reason` を添えて、差し戻した差分を直させる**（直した行を重ねたものを、もう一度監査に見せる） |
 | それ以外の値・例外 | その監査を飛ばす（ログに出る） |
 
 判定は**差分全体への意見**です。行ごとの合否にしていないのは、やりすぎ・早すぎる打ち切り・脱線が、1行ではなく計画と理解の向きに現れるためです。何を基準に判定するかは、監査役のプロンプトで決めます。
 
-**差し戻しの上限は、フレームワークが持ちません。** `generation_failed` の再試行と同じく、何回で通すかは運用の方針なので、監査する側が `review_round` を見て決めます。毎回差し戻す監査を登録すると、同じ更新が作り直され続けます。形式の誤りの差し戻し（`max_memory_retries`）とは別に数えるので、監査の差し戻しでその回数は減りません。
+**差し戻しの上限は、フレームワークが持ちません。** `generation_failed` の再試行と同じく、何回で通すかは運用の方針なので、監査する側が `review_round` を見て決めます。毎回差し戻す監査を登録すると、同じ更新が作り直され続けます。形式の誤りの差し戻し（`max_memory_retries`）とは別に数えるので、監査の差し戻しでその回数は減りません。（組み込みの監査役は、自分の上限を持っています。→ [組み込みの監査役を使う](#組み込みの監査役を使う--enable_auditor)）
 
 **壊れた監査は、止めずに飛ばします。** `before_execute`（判定できなければ拒否）とは向きが逆です。上限をフレームワークが持たないので、差し戻しに倒すと、壊れた監査が同じ更新を作り直させ続けます。
 
@@ -1661,16 +1655,41 @@ ic.guard.before_memory_diff(review)
 
 監査役は、監査される `Network` に入れないでください（[審査役](#プロンプト攻撃を別のagentに見張らせる)と同じ理由です）。監査は直列化されないので、並列に動くエージェントの監査は同時に呼ばれます。`memory` を返したtoolによる直接の書き込みは、値をそのまま残すための経路なので監査しません。
 
+#### 組み込みの監査役を使う — enable_auditor
+
+監査を自分で書かなくても、`Network` を作るときに `enable_auditor` を渡せば、組み込みの監査役が、記憶を持つ全エージェントの差分を監査します。渡さなければ監査しません。
+
+```python
+network = Network(
+    agents=[front, librarian],
+    enable_auditor={
+        "llm": OpenAILLM(),
+        "model": "gpt-6-luna",
+        "thought_level": ThoughtLevel.LOW,   # 任意
+        "system_instruction": "…",           # 任意。既定のプロンプトの後ろにそのまま付く
+    },
+)
+network = NetworkBuilder.from_dir(ROOT, tools=[LIBRARY_TOOLS]).build(enable_auditor={...})   # 設定ファイルからでも同じ
+```
+
+- 見るのは、その更新に現れた思考が利用者の今の問いへ向かっているかと、不要な先回りをしていないかの2つです（既定のプロンプトは `statecraft/auditor.py` の `AUDITOR_INSTRUCTION`）。材料は上の表の項目と、そのエージェントのナレッジ・使える tool と委譲先です。tool の結果は渡しません。監査するのは向きで、事実の照合ではないためです。
+- 2回差し戻したら、次の差分は監査せずに通します。監査役が失敗した時、判定を読めなかった時も通します。
+- 監査役は監査のたびに作り直すので、並列に動くエージェントの監査を待たせません。監査役の生成も `Network` の Interceptor を通るので、費用の上限や観測がそのまま効き、消費は `token_usage()` に `auditor` として入ります（そのため `auditor` という名前のエージェントとは並べられません）。
+- 上限や材料を変えたい時は、これを使わずに自分の監査を `before_memory_diff` へ登録します。組み込みの監査役と並べることもできます。
+
 ---
 
 ### API側の失敗に備える — generation_failed
 
 生成はAPI越しなので失敗します。落ち方は2種類あり、**対処が逆になります**。
 
-| 落ち方 | 例 | 復活するか | 対処 |
-|---|---|---|---|
-| 一時的な過負荷 | `503 UNAVAILABLE` | 待てば通る | 待って同じモデルで再試行 |
-| 枠の使い切り | `429 RESOURCE_EXHAUSTED` | **その日は復活しない** | 別のモデルへ逃がす |
+| 落ち方 | `event.kind` | 例 | 復活するか | 対処 |
+|---|---|---|---|---|
+| 一時的な過負荷 | `"unavailable"` | `503 UNAVAILABLE`、接続の失敗、タイムアウト | 待てば通る | 待って同じモデルで再試行 |
+| 枠の使い切り | `"rate_limit"` | `429 RESOURCE_EXHAUSTED` | **その日は復活しない** | 別のモデルへ逃がす |
+| それ以外 | `"other"` | 引数やスキーマの誤り | やり直しても同じ | 再試行しない。中身は `event.message` で確かめる |
+
+`kind` は接続（`BaseLLM.classify_error`）が、例外の状態コードと型名から決めます。どのプロバイダでも同じ3つで見分けられるので、例外の文字列を調べる必要はありません。`message` には、例外の型名とプロバイダが返した本文が入ります。見分け方が合わない自作の LLM は、`classify_error` を上書きしてください。
 
 `429` はレスポンスに `retryDelay: 29s` が入っていても、それが1日あたりの上限であれば待っても同じエラーが返ります。同じモデルで何度やり直しても越えられません。
 
@@ -1678,9 +1697,9 @@ ic.guard.before_memory_diff(review)
 
 | 戻り値 | 意味 |
 |---|---|
-| `RetryDecision(retry=True)` | 同じモデルで再試行する |
-| `RetryDecision(retry=True, model="…")` | **そのモデル**で再試行する |
-| `RetryDecision(retry=False)`・それ以外の値 | この関数は再試行しない（後ろに別の登録があれば、そちらに尋ねる） |
+| `RetryDecision(ok=True)` | 同じモデルで再試行する |
+| `RetryDecision(ok=True, model="…")` | **そのモデル**で再試行する |
+| `RetryDecision(ok=False)`・それ以外の値 | この関数は再試行しない（後ろに別の登録があれば、そちらに尋ねる） |
 | 例外 | 諦める（後ろの登録にも尋ねない） |
 
 待つ場合は、コールバックの中で待ちます。何秒待つか、何回試すか、どのモデルへ逃がすかは、フレームワークが持ちません。
@@ -1690,22 +1709,20 @@ from statecraft import GenerationFailedEvent, RetryDecision
 
 
 def retry_on_overload(event: GenerationFailedEvent) -> RetryDecision:
-    text = str(event.error)
-
     # 枠を使い切った場合は待っても同じエラーが返る。モデルを変える
-    if "RESOURCE_EXHAUSTED" in text and event.model != "gemini-3.5-flash-lite":
-        return RetryDecision(retry=True, model="gemini-3.5-flash-lite")
+    if event.kind == "rate_limit" and event.model != "gemini-3.5-flash-lite":
+        return RetryDecision(ok=True, model="gemini-3.5-flash-lite")
 
     # 一時的な過負荷なら、待てば同じモデルで通る
-    if "503" in text and event.attempt < 3:
+    if event.kind == "unavailable" and event.attempt < 3:
         time.sleep(2.0 * event.attempt)
-        return RetryDecision(retry=True)
+        return RetryDecision(ok=True)
 
     # 記憶を作るphaseは、軽いモデルへ落とすより諦めた方がよい場合もある
     if event.phase in (Phase.INITIAL_MEMORY, Phase.MEMORY_UPDATE):
-        return RetryDecision(retry=False)
+        return RetryDecision(ok=False)
 
-    return RetryDecision(retry=False)
+    return RetryDecision(ok=False)
 
 
 ic.recover.generation_failed(retry_on_overload)
@@ -1900,11 +1917,27 @@ ic.notice.execute_start(lambda event: send_to_frontend(event.message))
 | `ic.on.（上記以外）(cb)` | `ic.notice.（同じ名前）(cb)` |
 | `def guard(*, name, kwargs)` | `def guard(event)`（`event.name` / `event.kwargs`） |
 | `lambda message: ...` | `lambda event: ...`（文は `event.message`） |
-| `return True` / `return "理由"`（before_execute） | `ExecuteDecision(allowed=True)` / `ExecuteDecision(allowed=False, reason="理由")` |
-| `return True` / `return "モデル名"`（before_generate） | `GenerateDecision(proceed=True)` / `GenerateDecision(proceed=True, model="モデル名")` |
-| `return True` / `return "モデル名"`（generation_failed） | `RetryDecision(retry=True)` / `RetryDecision(retry=True, model="モデル名")` |
+| `return True` / `return "理由"`（before_execute） | `ExecuteDecision(ok=True)` / `ExecuteDecision(ok=False, reason="理由")` |
+| `return True` / `return "モデル名"`（before_generate） | `GenerateDecision(ok=True)` / `GenerateDecision(ok=True, model="モデル名")` |
+| `return True` / `return "モデル名"`（generation_failed） | `RetryDecision(ok=True)` / `RetryDecision(ok=True, model="モデル名")` |
 | 観測のために `before_execute` へ登録して `return True` | `notice.execute_start` と `notice.execute_blocked` へ登録する |
 | `ExecuteEvent` / `GenerationEvent` / `CheckResult` | `ExecutedEvent` / `GeneratedEvent` / `ExecuteDecision` |
+
+### 0.7.0 での書き換え（0.6 からの移行）
+
+| 0.6 まで | 0.7.0 から |
+|---|---|
+| `ExecuteDecision(allowed=…)` / `GenerateDecision(proceed=…)` / `RetryDecision(retry=…)` / `MemoryDiffDecision(approved=…)` | どれも `ok=…` |
+| `class MyBuilder(NetworkBuilder): TOOL_FACTORIES = {...}` | `NetworkBuilder.from_dir(root, tools=[LocalTools({...}), McpTools(...)])` |
+| tools.yaml の `type` / `settings` と、説明文の `{名前}`（settings の値で埋まる） | 書かない。上限のような値はツールの実装が持ち、説明文には数字を直接書く |
+| 使う側で書いていた MCP の Adapter | `McpTools`（`pip install "statecraft[mcp]"`） |
+| `net["front"].respond(...)`（トークン数は窓口の分だけ） | `net.respond(agent="front", ...)`（委譲先と監査役を含む全体）。`agent.respond()` も残る |
+| `phase_overrides` の `cutoff_answer` / `stalled_answer` | 書けない。`answer` の設定が使われる |
+| Agent に個別に登録した Interceptor が残る | Network のものに必ず差し替わる |
+| 例外の文字列で 429 / 503 を見分ける | `GenerationFailedEvent.kind`（`rate_limit` / `unavailable` / `other`）と `message` |
+| 観測のために Network の中（記憶など）を読みに行く | どのイベントにも付く `event.network`（その時点の状態） |
+| 使う側で書いていた監査役 | `Network(enable_auditor={"llm": …, "model": …})` |
+| `build()` するだけで API キーが要る | 最初の生成まで要らない |
 
 ---
 
@@ -1944,7 +1977,7 @@ front = Agent(
 )
 
 net = Network(agents=[front, worker])
-response = front.respond(message="就業規則の有給の項目を教えて")
+response = net.respond(agent="front", message="就業規則の有給の項目を教えて")
 
 print(response.text)
 print(net.total_tokens())  # (入力, 出力)
@@ -2037,6 +2070,8 @@ pytest -v                                 # 1件ずつ名前を出す
 | `test_tools.py` | 戻り値の契約と、型ヒントからのスキーマ生成。利用者の関数が壊れても例外を外へ出さないこと |
 | `test_interceptor.py` | 判定の既定値の向き。書き忘れ・型の違う戻り値・例外が「許可」に倒れないこと。notice へ登録した関数が実行の可否に関わらないこと |
 | `test_memory_review.py` | 記憶の更新の監査。差し戻した差分が記憶に入らないこと、原文・今の記憶・差分が揃って渡ること、上限を監査する側が持つこと |
+| `test_builder.py` のツールの出どころ | 自作と MCP のツールが名前で作られること、無い名前・重なった名前・自作の parameters 抜けを組み立て時に落とすこと、MCP の説明とスキーマがサーバーから入り、書いた項目が優先されること |
+| `test_auditor.py` | 組み込みの監査役。材料にナレッジと手段が入りtoolの結果が入らないこと、前の指摘が同じ更新の次の監査にだけ載ること、上限・失敗・読めない判定で通すこと、設定の誤りを構築時に落とすこと |
 | `test_network.py` | 配線の検証。実行時に静かに壊れる設定ミスを構築時に落とすこと |
 | `test_config.py` | 設定ファイルの読み込み。書き間違いが静かに読めてしまわないこと |
 | `test_builder.py` | 設定からの組み立て。設定の値が Agent / Tool へ渡り、書かなかった項目は既定値になること |
@@ -2055,7 +2090,7 @@ Geminiでの1往復、委譲、初期ツール、入力/出力スキーマ、実
 
 **未検証**
 
-OpenAI / Azure OpenAI / Claude のプロバイダ実装（Azure OpenAI は、本物の SDK からローカルの代役サーバーへ送り、接続先・認証・キャッシュの区切りの扱いまで確認済み）、思考の継承（Gemini と OpenAI〔gpt-6-luna〕では、サンプルの図書館を通しで動かし、委譲・tool・記憶の更新・ReflexAgent を含めて API が受け付けることまで確認済み。Azure OpenAI は未確認。回答が良くなるかは未検証）、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）、記憶の更新の監査（before_memory_diff。FakeLLMでのみ確認）、最終回答だけに渡すナレッジ（answer_knowledge。FakeLLMでのみ確認）
+OpenAI / Azure OpenAI / Claude のプロバイダ実装（Azure OpenAI は、本物の SDK からローカルの代役サーバーへ送り、接続先・認証・キャッシュの区切りの扱いまで確認済み）、思考の継承（Gemini と OpenAI〔gpt-6-luna〕では、サンプルの図書館を通しで動かし、委譲・tool・記憶の更新・ReflexAgent を含めて API が受け付けることまで確認済み。Azure OpenAI は未確認。回答が良くなるかは未検証）、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）、記憶の更新の監査（before_memory_diff。FakeLLMでのみ確認）、組み込みの監査役（enable_auditor。FakeLLMでのみ確認）、MCPサーバーのツール（McpTools。偽のサーバーでのみ確認。接続の部分は plugin-scout で mcp 2.3.0 の見本のサーバーに対して確認した時のもの）、最終回答だけに渡すナレッジ（answer_knowledge。FakeLLMでのみ確認）
 
 ---
 

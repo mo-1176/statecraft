@@ -198,7 +198,7 @@ class Tool:
             verdict = interceptor.check.before_execute(
                 BeforeExecuteEvent(name=tool_name, kwargs=kwargs)
             )
-            if not verdict.allowed:
+            if not verdict.ok:
                 # 理由をそのままLLMへ返す。「ブロックされました」だけだと、
                 # 止められた側が原因を探して追加の実行を始める。
                 detail = f" 理由: {verdict.reason}" if verdict.reason else ""

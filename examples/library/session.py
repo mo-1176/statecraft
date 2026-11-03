@@ -55,8 +55,8 @@ class LibrarySession:
         self.carry_over.apply(net)
 
         # respond が人間からの入口。会話履歴や添付もここで受け取る。
-        #   net["front"].respond(message=..., history=[...], blobs=[...])
-        response = net["front"].respond(message=message, history=self.history)
+        #   net.respond(agent="front", message=..., history=[...], blobs=[...])
+        response = net.respond(agent="front", message=message, history=self.history)
         reply = Reply.parse(response.text)
 
         # 会話履歴には、利用者に見せた本文だけを残す

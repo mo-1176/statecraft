@@ -3,13 +3,14 @@ NetworkBuilder（設定 → Network の組み立て）の検証。
 
 ここの要点は2つ。
   ・設定の値が、Agent / Tool の同名の引数へ渡る（書かなかった項目はAgentの既定値）
-  ・名前から実装を引く対応表は使う側が埋め、引けなければ組み立ての時点でエラーになる
+  ・ツールは渡された出どころ（LocalTools / McpTools）が名前で作り、作れなければ組み立ての時点でエラーになる
 """
 
 import textwrap
 from collections.abc import Callable
 from dataclasses import fields
 from pathlib import Path
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
@@ -24,6 +25,8 @@ from statecraft import (
     GeminiLLM,
     GenerationConfig,
     Interceptor,
+    LocalTools,
+    McpTools,
     Network,
     NetworkBuilder,
     NetworkConfig,
@@ -33,20 +36,15 @@ from statecraft import (
     ThoughtLevel,
     ToolConfig,
 )
+from statecraft.mcp import McpServer
 
 
-def make_echo(*, prefix: str):
-    """settingsを受け取って、ツールの関数を返す（対応表に入れるもの）。"""
-
-    def echo(text: str) -> dict:
-        return {"value": prefix + text}
-
-    return echo
+def echo(text: str) -> dict:
+    return {"value": "!" + text}
 
 
 class Builder(NetworkBuilder):
-    # 使う側が埋める対応表。type / provider の名前 → 実体を作るもの
-    TOOL_FACTORIES: ClassVar[dict[str, Callable[..., Callable]]] = {"echo": make_echo}
+    # provider の名前 → LLMを作るもの
     LLM_FACTORIES: ClassVar[dict[str, Callable[[], BaseLLM]]] = {
         "fake": FakeLLM,
         "other": FakeLLM,
@@ -65,13 +63,15 @@ def agent(name: str, **kw) -> AgentConfig:
 
 
 def echo_tool(name: str, **kw) -> ToolConfig:
-    kw.setdefault("settings", {"prefix": "!"})
-    return ToolConfig(name=name, type="echo", parameters=ECHO_SCHEMA, **kw)
+    kw.setdefault("parameters", ECHO_SCHEMA)
+    return ToolConfig(name=name, **kw)
 
 
-def build(*agents: AgentConfig, tools=(), interceptor=None) -> Network:
+def build(*agents: AgentConfig, tools=(), interceptor=None, sources=None) -> Network:
     config = NetworkConfig(agents=list(agents), tools=list(tools))
-    return Builder(config, interceptor).build()
+    if sources is None:
+        sources = [LocalTools({t.name: echo for t in tools})]
+    return Builder(config, interceptor, tools=sources).build()
 
 
 # ---- 設定の値が渡る ----
@@ -109,19 +109,12 @@ def test_思考の継承は設定で止められる():
 
 
 def test_ツール名は設定のnameになる():
-    """同じtypeから、settingsだけ変えた別のツールを作れる。"""
-    net = build(
-        agent("a", tools=["loud", "quiet"]),
-        tools=[
-            echo_tool("loud", settings={"prefix": "!"}),
-            echo_tool("quiet", settings={"prefix": "…"}),
-        ],
-    )
+    """同じ関数でも、tools.yamlの名前ごとに別のツールになる。"""
+    net = build(agent("a", tools=["loud", "quiet"]), tools=[echo_tool("loud"), echo_tool("quiet")])
 
     loud, quiet = net["a"].tools
     assert [loud.name, quiet.name] == ["loud", "quiet"]
     assert loud.func(text="x") == {"value": "!x"}
-    assert quiet.func(text="x") == {"value": "…x"}
 
 
 def test_ツールの文章とスキーマが設定から入る():
@@ -223,12 +216,7 @@ def test_ナレッジは書いた順につながる(tmp_path: Path):
 
 
 def test_組み込みのproviderは登録しなくても使える():
-    """子クラスがツールの対応表だけを埋めても、LLMの対応表は既定のまま残る。"""
-
-    class ToolsOnly(NetworkBuilder):
-        TOOL_FACTORIES: ClassVar[dict[str, Callable[..., Callable]]] = {"echo": make_echo}
-
-    assert ToolsOnly.LLM_FACTORIES == {
+    assert NetworkBuilder.LLM_FACTORIES == {
         "gemini": GeminiLLM,
         "openai": OpenAILLM,
         "claude": ClaudeLLM,
@@ -244,13 +232,96 @@ def test_interceptorがNetworkに渡る():
     assert net.interceptor is interceptor
 
 
-# ---- 対応表から引けない ----
-def test_知らないtypeはエラーになる():
-    with pytest.raises(ValueError, match="no_such_type"):
+# ---- ツールの出どころ ----
+def test_どの出どころにも無い名前はエラーになる():
+    with pytest.raises(ValueError, match="出どころがありません"):
+        build(agent("a", tools=["x"]), tools=[echo_tool("x")], sources=[LocalTools({})])
+
+
+def test_複数の出どころにある名前はエラーになる():
+    with pytest.raises(ValueError, match="複数の出どころ"):
         build(
             agent("a", tools=["x"]),
-            tools=[ToolConfig(name="x", type="no_such_type", parameters={})],
+            tools=[echo_tool("x")],
+            sources=[LocalTools({"x": echo}), LocalTools({"x": echo})],
         )
+
+
+def test_自作のツールはparametersが要る():
+    """description はそのままプロンプトになるので、型ヒントからは作らない。"""
+    with pytest.raises(ValueError, match="parameters"):
+        build(agent("a", tools=["x"]), tools=[ToolConfig(name="x")])
+
+
+class FakeServer:
+    """McpServerの代わり。ツールの一覧と、呼ばれた引数を持つ。"""
+
+    def __init__(self) -> None:
+        self.called: list[tuple[str, dict]] = []
+
+    def tools(self) -> dict:
+        schema = {"type": "object", "properties": {"q": {"type": "string"}}}
+        return {
+            "search_items": SimpleNamespace(
+                name="search_items",
+                description="在庫を検索します。\n品番でも書名でも引けます。",
+                input_schema=schema,
+            )
+        }
+
+    def call(self, tool: str, arguments: dict):
+        self.called.append((tool, arguments))
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="3件")],
+            structured_content=None,
+            is_error=tool == "broken",
+        )
+
+
+@pytest.fixture
+def mcp_server(monkeypatch) -> FakeServer:
+    server = FakeServer()
+    monkeypatch.setattr(McpServer, "get", classmethod(lambda cls, url, headers: server))
+    return server
+
+
+def test_MCPのツールは名前だけ書けばサーバーから埋まる(mcp_server):
+    net = build(
+        agent("a", tools=["search_items"]),
+        tools=[ToolConfig(name="search_items")],
+        sources=[McpTools("inventory", url="http://inventory/mcp")],
+    )
+
+    tool = net["a"].tools[0]
+    assert tool.summary == "在庫を検索します。"
+    assert tool.usage == "品番でも書名でも引けます。"
+    assert tool.to_declaration()["parameters"]["properties"] == {"q": {"type": "string"}}
+    assert tool.func(q="x") == {"value": "3件"}
+    assert mcp_server.called == [("search_items", {"q": "x"})]
+
+
+def test_MCPのツールも書いた項目はtools_yamlが優先される(mcp_server):
+    net = build(
+        agent("a", tools=["search_items"]),
+        tools=[ToolConfig(name="search_items", summary="在庫を引く", evaluation="件数だけ見る")],
+        sources=[McpTools("inventory", url="http://inventory/mcp")],
+    )
+
+    tool = net["a"].tools[0]
+    assert tool.summary == "在庫を引く"
+    assert tool.evaluation == "件数だけ見る"
+    # 書かなかったusageはサーバーから
+    assert tool.usage == "品番でも書名でも引けます。"
+
+
+def test_自作とMCPのツールを並べて使える(mcp_server):
+    net = build(
+        agent("a", tools=["echo", "search_items"]),
+        tools=[echo_tool("echo"), ToolConfig(name="search_items")],
+        sources=[LocalTools({"echo": echo}), McpTools("inventory", url="http://inventory/mcp")],
+    )
+
+    assert [t.name for t in net["a"].tools] == ["echo", "search_items"]
 
 
 def test_知らないproviderはエラーになる():
@@ -258,10 +329,3 @@ def test_知らないproviderはエラーになる():
         build(AgentConfig(name="a", summary="s", provider="no_such_provider", model="m"))
 
 
-def test_settingsが実装の引数と合わないとエラーになる():
-    """どのツールの設定が悪いのかを、エラーの文に出す。"""
-    with pytest.raises(ValueError, match="loud"):
-        build(
-            agent("a", tools=["loud"]),
-            tools=[echo_tool("loud", settings={"prefx": "!"})],
-        )

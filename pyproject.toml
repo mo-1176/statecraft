@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "statecraft"
-version = "0.6.1"
+version = "0.7.0"
 description = "記憶を構造として扱うマルチエージェントフレームワーク"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -57,8 +57,10 @@ dependencies = [
 gemini = ["google-genai>=1.51.0"]
 openai = ["openai>=2.45.0"]
 claude = ["anthropic>=0.78.0"]
+# MCPサーバーのツールを使う（McpTools）
+mcp = ["mcp>=2.3.0"]
 all = [
-    "statecraft[gemini,openai,claude]",
+    "statecraft[gemini,openai,claude,mcp]",
 ]
 # テストを動かすためだけの依存。LLMのAPIは呼ばないので、SDKは要らない。
 dev = ["pytest>=8.0"]

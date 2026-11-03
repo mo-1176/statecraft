@@ -40,6 +40,7 @@ from .events import (
     ExecutedEvent,
     ExecuteEndEvent,
     ExecuteStartEvent,
+    FailureKind,
     GeneratedEvent,
     GenerationFailedEvent,
     MemoryDiffEvent,
@@ -180,13 +181,13 @@ class RunInput:
 
 @dataclass
 class AgentResponse:
-    """respond()の戻り値。"""
+    """Agent.respond() と Network.respond() の戻り値。"""
 
     text: str
     steps: int = 0  # 実際に回ったループ回数
 
-    # このAgent自身が消費したトークン。委譲先が消費した分は含まない
-    # （どのAgentが重いかを個別に測るため）。合計はNetwork.total_tokens()。
+    # 消費したトークン。Network.respond()では、委譲先と監査役を含むこの依頼の全体。
+    # Agent.respond()では、このAgent自身の分だけ（単体で動かす時やテスト向け）。
     input_tokens: int = 0
     output_tokens: int = 0
 
@@ -577,6 +578,10 @@ class Agent:
         `o.temperature or self.temperature` と書くと temperature=0 が偽と
         判定されて既定値に差し替わるため、必ず is None で判定する。
         """
+        # 打ち切り・停滞で答える時も「答える生成」なので、ANSWERの上書きを使う
+        # （3つの違いはループの終わり方と指示文だけで、利用者が分けて書く理由が無い）。
+        if phase in (Phase.CUTOFF_ANSWER, Phase.STALLED_ANSWER):
+            phase = Phase.ANSWER
         o = self.phase_overrides.get(phase) or GenerationConfig()
         return ResolvedGeneration(
             model=o.model if o.model is not None else self.model,
@@ -793,6 +798,17 @@ class Agent:
             return format_message(self.execution_message, kwargs)
         return f"{self.name}へ委譲しました。"
 
+    @staticmethod
+    def _classify_failure(llm: BaseLLM, error: Exception) -> FailureKind:
+        """
+        失敗の種類を接続に尋ねる。自作のLLMが上書きした分類が壊れていても、
+        再試行の判定までは止めない（分からない失敗として扱う）。
+        """
+        try:
+            return llm.classify_error(error)
+        except Exception:  # noqa: BLE001
+            return "other"
+
     def _notify_error(self, message: str) -> None:
         """errorイベントを流す。異常を見つけたのは常に自分なので、呼ぶ側は文言だけ渡す。"""
         self.interceptor.notify.error(ErrorEvent(source=self.name, message=message))
@@ -824,7 +840,7 @@ class Agent:
             verdict = interceptor.check.before_execute(
                 BeforeExecuteEvent(name=self.name, kwargs=kwargs)
             )
-            if not verdict.allowed:
+            if not verdict.ok:
                 # Tool.executeと同じ扱い。理由があれば依頼元へそのまま返す。
                 detail = f" 理由: {verdict.reason}" if verdict.reason else ""
                 interceptor.notify.execute_blocked(
@@ -1255,7 +1271,7 @@ class Agent:
                     step_no=self._step_no,
                 )
             )
-            if not gate.proceed:
+            if not gate.ok:
                 raise GenerationAborted(
                     f"{self.name}の{phase.value}の生成が中止されました。"
                 )
@@ -1307,9 +1323,11 @@ class Agent:
                         model=model,
                         attempt=attempt,
                         error=e,
+                        kind=self._classify_failure(cfg.llm, e),
+                        message=f"{type(e).__name__}: {e}",
                     )
                 )
-                if not decision.retry:
+                if not decision.ok:
                     raise
                 # モデル名が返った場合はそれに差し替える（枠を使い切ったモデルは
                 # 待っても同じエラーが返る）。
@@ -1449,6 +1467,7 @@ class Agent:
         review_round: int,
         rows: list,
         tool_results: str,
+        rejections: list[str],
     ) -> MemoryDiffDecision:
         """
         差分を当てる前に監査（before_memory_diff）へ見せる。
@@ -1474,6 +1493,7 @@ class Agent:
                 # 監査が書き換えても、当てる差分は変わらないようにする。
                 rows=copy.deepcopy(rows),
                 tool_results=tool_results,
+                rejections=list(rejections),
             )
         )
 
@@ -1530,6 +1550,9 @@ class Agent:
         # 監査（before_memory_diff）に見せた回数。監査の差し戻しはattemptを
         # 消費しない。何回で通すかは監査する側が決める（上限を持つのは運用の方針）。
         review_round = 0
+        # 監査が差し戻した理由。作り直した差分を監査へ見せる時に添える。
+        # 通ったら空に戻す（通った後の差分は、前の指摘を受けて直したものではない）。
+        rejections: list[str] = []
         # 形式の誤りで差し戻す時の節。監査で差し戻した後の作り直しにも載せる
         # （直すべき行が、まだ反映されないまま残っているため）。
         retry_section = ""
@@ -1566,9 +1589,11 @@ class Agent:
                     review_round=review_round,
                     rows=rows,
                     tool_results=tool_results,
+                    rejections=rejections,
                 )
-                if not verdict.approved:
+                if not verdict.ok:
                     reason = verdict.reason or "（理由は示されていない）"
+                    rejections.append(reason)
                     # 当てなかった差分も、何を指摘されたかと一緒に流す。
                     # 「どう脱線し、指摘を受けてどう直したか」を後から追うため。
                     self.interceptor.notify.memory_diff(
@@ -1602,6 +1627,7 @@ class Agent:
                     )
                     continue
                 held = None
+                rejections.clear()
 
             attempt += 1
             if rows is None:

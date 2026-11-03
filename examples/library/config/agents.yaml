@@ -211,9 +211,7 @@
       temperature: 0.2
       max_tokens: 65535
       thought_level: low
-    answer: {model: gemini-3.5-flash-lite}
-    cutoff_answer: {model: gemini-3.5-flash-lite}    # max_steps を使い切った時の回答
-    stalled_answer: {model: gemini-3.5-flash-lite}   # 停滞して打ち切った時の回答
+    answer: {model: gemini-3.5-flash-lite}   # 打ち切りや停滞で答える時も、この設定が使われる
   output_schema:                # 自分の最終回答の形（JSON Schema）
     type: object
     properties:

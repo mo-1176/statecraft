@@ -28,9 +28,59 @@ messageを持つものは、人が読む1行をそこへ入れる（文言はtoo
 """
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from .prompts import Phase
+
+# 生成の失敗の種類。どのプロバイダでも同じ3つで見分けられるよう、接続（BaseLLM）が分ける。
+#   rate_limit  … 枠を使い切った（429）。待っても同じなら、別のモデルへ逃がす
+#   unavailable … 一時的に使えない（5xx、接続の失敗、タイムアウト）。待てば通ることが多い
+#   other       … それ以外（引数やスキーマの誤りなど）。やり直しても同じ結果になる
+FailureKind = Literal["rate_limit", "unavailable", "other"]
+
+
+# ---- どのイベントにも付く、その時点のネットワークの状態 ----
+# Networkに配線されたinterceptorが、イベントを配る直前に写しを作って event.network へ
+# 入れる。観測する側がNetworkの中（記憶の持ち方や、どのAgentがどこにいるか）を
+# 読みに行かなくて済むようにするため。写しなので、並列に動く他のエージェントが
+# 後から書き換えても、受け取った値は変わらない。Agentを単体で動かした時はNone。
+@dataclass
+class StepTime:
+    """1つの起動の、1ステップの中で、phaseごとに生成にかかった秒数。"""
+
+    run_id: str  # どの起動（respond / execute 1回）の中か
+    step_no: int  # ReActループの何周目か（1始まり。INITIAL_MEMORYも1）
+    # phaseごとの秒数の合計。作り直し（形式の誤り・監査の差し戻し）と、
+    # 失敗した試行の時間も含む
+    seconds: dict[Phase, float] = field(default_factory=dict)
+
+
+@dataclass
+class AgentState:
+    """1体のエージェント（監査役を含む）の、その時点の状態。"""
+
+    # そのエージェント自身の記憶。エージェントが読んでいるのと同じ文の形。
+    # 記憶を持たないもの（ReflexAgent、監査役）は空
+    memory: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0  # input_tokensのうち、キャッシュから読まれた分
+    cache_write_tokens: int = 0  # input_tokensのうち、キャッシュへ書き込んだ分
+    seconds: float = 0.0  # 生成にかかった時間の合計
+    steps: list[StepTime] = field(default_factory=list)  # 起動とステップの順
+
+
+@dataclass
+class NetworkState:
+    """ネットワーク全体の、その時点の状態。"""
+
+    memory: str = ""  # 共有の記憶。エージェントが読んでいるのと同じ文の形
+    elapsed: float = 0.0  # net.respond()を始めてからの秒数。始める前は0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
+    cache_write_tokens: int = 0
+    agents: dict[str, AgentState] = field(default_factory=dict)  # 名前ごと
 
 
 # ---- notice: 応答（respondの境界） ----
@@ -40,6 +90,8 @@ class RespondStartEvent:
 
     agent: str  # 応答するAgentの名前
     message: str  # 表示用の1行
+    # その時点のネットワークの状態（NetworkState）。Agentを単体で動かした時はNone
+    network: NetworkState | None = None
 
 
 @dataclass
@@ -48,6 +100,8 @@ class RespondEndEvent:
 
     agent: str  # 応答したAgentの名前
     message: str  # 表示用の1行
+    # その時点のネットワークの状態（NetworkState）。Agentを単体で動かした時はNone
+    network: NetworkState | None = None
 
 
 # ---- notice: 実行（tool / agent 共通） ----
@@ -66,6 +120,8 @@ class ExecuteStartEvent:
     # execution_message / describe_executionが組み立てた表示用の1行。
     # 利用者の画面へ出すのは、message系のうちこれだけを想定している。
     message: str
+    # その時点のネットワークの状態（NetworkState）。Agentを単体で動かした時はNone
+    network: NetworkState | None = None
 
 
 @dataclass
@@ -80,6 +136,8 @@ class ExecuteEndEvent:
     name: str  # 実行したtool / agentの名前
     success: bool  # 成功したか。失敗の中身はerrorイベントで流れる
     message: str  # 表示用の1行
+    # その時点のネットワークの状態（NetworkState）。Agentを単体で動かした時はNone
+    network: NetworkState | None = None
 
 
 @dataclass
@@ -97,6 +155,8 @@ class ExecuteBlockedEvent:
     # 無効化による停止では空文字。
     reason: str
     message: str  # 表示用の1行
+    # その時点のネットワークの状態（NetworkState）。Agentを単体で動かした時はNone
+    network: NetworkState | None = None
 
 
 @dataclass
@@ -138,6 +198,8 @@ class ExecutedEvent:
     def success(self) -> bool:
         """成功したか。errorの有無から導出する（ToolResult.successと同じ考え方）。"""
         return not self.error
+    # その時点のネットワークの状態（NetworkState）。Agentを単体で動かした時はNone
+    network: NetworkState | None = None
 
 
 # ---- notice: 生成 ----
@@ -188,6 +250,8 @@ class GeneratedEvent:
     # 思考の要約。carry_thoughtsの時だけ入る（それ以外は要求しないので空）。
     # 継承した思考は次の判断に効くのに中身が見えないため、ここで観測する。
     thoughts: str = ""
+    # その時点のネットワークの状態（NetworkState）。Agentを単体で動かした時はNone
+    network: NetworkState | None = None
 
 
 # ---- notice: 記憶 ----
@@ -238,6 +302,8 @@ class MemoryDiffEvent:
     def applied(self) -> bool:
         """全行が反映されたか。errorsの有無から導出する（ToolResult.successと同じ考え方）。"""
         return not self.errors
+    # その時点のネットワークの状態（NetworkState）。Agentを単体で動かした時はNone
+    network: NetworkState | None = None
 
 
 @dataclass
@@ -250,6 +316,8 @@ class MemoryUpdatedEvent:
 
     agent: str  # 記憶を更新したAgentの名前
     message: str  # 表示用の1行。何を更新・無効化したかが入る
+    # その時点のネットワークの状態（NetworkState）。Agentを単体で動かした時はNone
+    network: NetworkState | None = None
 
 
 # ---- notice: 異常 ----
@@ -264,6 +332,8 @@ class ErrorEvent:
 
     source: str  # 異常を見つけたtool / agentの名前
     message: str  # 何が起きたか。人が読む文
+    # その時点のネットワークの状態（NetworkState）。Agentを単体で動かした時はNone
+    network: NetworkState | None = None
 
 
 # ---- guard ----
@@ -276,6 +346,8 @@ class BeforeExecuteEvent:
 
     name: str  # 呼ばれようとしているtool / agentの名前
     kwargs: dict  # それへ渡される引数。LLMが埋めた値
+    # その時点のネットワークの状態（NetworkState）。Agentを単体で動かした時はNone
+    network: NetworkState | None = None
 
 
 @dataclass
@@ -290,6 +362,8 @@ class BeforeGenerateEvent:
     model: str  # そのとき使うモデル名。切り替えた後は切り替え先が入る
     attempt: int  # 何回目の試行か（1始まり）
     step_no: int  # ReActループの何周目か（1始まり）
+    # その時点のネットワークの状態（NetworkState）。Agentを単体で動かした時はNone
+    network: NetworkState | None = None
 
 
 @dataclass
@@ -336,6 +410,13 @@ class BeforeMemoryDiffEvent:
     rows: list  # 当てようとしている差分そのもの
     tool_results: str  # この差分を作らせた材料（今回の実行結果）
 
+    # この記憶の更新の中で、監査が差し戻した理由（古い順）。差分が通ると空に戻る。
+    # 作り直された差分を、前の指摘と並べて判定するためのもの。並べないと、
+    # 自分の指摘に従って直された差分を、指摘を知らないまま逆向きに差し戻しかねない。
+    rejections: list[str] = field(default_factory=list)
+    # その時点のネットワークの状態（NetworkState）。Agentを単体で動かした時はNone
+    network: NetworkState | None = None
+
 
 # ---- recover ----
 @dataclass
@@ -347,3 +428,10 @@ class GenerationFailedEvent:
     model: str  # その回に実際に使ったモデル名。切り替えた後は切り替え先が入る
     attempt: int  # 何回目の試行か（1始まり）
     error: Exception  # 起きた例外そのもの
+    # 失敗の種類（FailureKind）。再試行するかの判定は、例外の文字列ではなくこれで見る。
+    kind: FailureKind = "other"
+    # 人が読む1行。例外の型名と、プロバイダが返した本文（状態コードや理由）を含む。
+    # otherの中身を確かめるためのもの。
+    message: str = ""
+    # その時点のネットワークの状態（NetworkState）。Agentを単体で動かした時はNone
+    network: NetworkState | None = None

@@ -105,8 +105,8 @@ examples/
     guard/                        審査役（compliance）の設定。図書館とは別のネットワーク
       config/agents.yaml
       prompts/agents/compliance/system_instruction.md
-    tools.py                      ツールの実装（ダミーのデータ）と、見本の実装（make_sample_tool）
-    network.py                    組み立て（type とツールの実装の対応）
+    tools.py                      ツールの実装（ダミーのデータ）と、見本の実装（sample_tool）
+    network.py                    組み立て（tools.yaml の名前とツールの実装の対応。LocalTools）
     observers.py                  interceptor に登録するもの（審査、表示、計測、再試行）
     carry_over.py                 次のターンへ引き継ぐ記憶
     session.py                    1つの会話（ターンごとにNetworkを作る）
@@ -635,7 +635,7 @@ setattr(net.shared_memory, name, [MemoryEntry(id=r["id"], text=r["text"]) for r 
 def ask(self, message: str) -> Reply:
     net = build_network(build_interceptor(self.cost))
     self.carry_over.apply(net)
-    response = net["front"].respond(message=message, history=self.history)
+    response = net.respond(agent="front", message=message, history=self.history)
     ...
     self.carry_over = CarryOver.capture(net)
 ```
@@ -741,11 +741,11 @@ knowledgeは常にプロンプトの中に流し込まれるので、細かい�
 | 入れ替えるもの | 中身 |
 |---|---|
 | `config/agents.yaml` | エージェントと、そのつながり（`tools` / `sub_agents` / `knowledge`） |
-| `config/tools.yaml` | ツールの説明と引数のスキーマ。`type` はツールの実装の名前 |
+| `config/tools.yaml` | ツールの説明と引数のスキーマ |
 | `config/knowledges.yaml` と `knowledge/` | 複数のエージェントで使う文書 |
 | `prompts/` | 長い文章。`prompts/<agents か tools>/<名前>/<項目>.md` に置けば、YAML から指さなくても読まれる |
 | `tools.py` | ツールの実装 |
-| `network.py` の `TOOL_FACTORIES` | `type` → ツールの関数を返すもの。settings はキーワード引数で渡る |
+| `network.py` の `LIBRARY_TOOLS` | tools.yaml の名前 → ツールの関数（`LocalTools`） |
 | `observers.py` | 実行前の判定と観測。要らなければ `Interceptor()` だけでも動く |
 
 エージェントとツールを足すときは、`config/agents.yaml` の `sample_agent` と `config/tools.yaml` の `sample_tool` をコピーします。書ける項目が全部埋めてあり、見本自体も毎回読み込まれて検証されているので、項目名の綴りを間違えません。

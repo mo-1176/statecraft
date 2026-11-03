@@ -1,13 +1,16 @@
 """
 設定（NetworkConfig）からNetworkを組み立てる。
 
-ツールの関数は使う側のものなので、typeから実装を作る対応表は子クラスで埋める。
+ツールは使う側のものなので、出どころ（ToolSource）を並べて渡す。tools.yamlの
+名前ごとに、それを持っている出どころがツールを作る（tool_sources.py）。
 
-    class MyBuilder(NetworkBuilder):
-        # type → settingsを受け取り、ツールの関数を返すもの
-        TOOL_FACTORIES = {"web_search": make_search}
-
-    net = MyBuilder.from_dir("path/to/root").build()
+    net = NetworkBuilder.from_dir(
+        "path/to/root",
+        tools=[
+            LocalTools({"web_search": web_search}),        # 自作のツール
+            McpTools("inventory", url="http://...:8000/mcp"),  # MCPサーバーのツール
+        ],
+    ).build()
 
 LLMは組み込みのプロバイダ（gemini / openai / claude / azure_openai）を最初から
 登録してある。APIキーは環境変数から読む。それ以外のプロバイダを使うときや、
@@ -15,15 +18,16 @@ LLMは組み込みのプロバイダ（gemini / openai / claude / azure_openai�
 
     LLM_FACTORIES = {**NetworkBuilder.LLM_FACTORIES, "azure_openai": make_azure}
 
-YAMLに関数の場所（モジュール名）を書かせず対応表にしているのは、設定を
-書き換えられる人が、登録されていない関数を組み立て時に呼べないようにするため。
+YAMLに関数の場所（モジュール名）を書かせず、出どころに名前で尋ねる形にしているのは、
+設定を書き換えられる人が、渡されていない関数を組み立て時に呼べないようにするため。
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import ClassVar, Self, TypeVar
 
 from .agent import Agent, GenerationConfig, ReflexAgent
+from .auditor import AuditorSettings
 from .config import AgentConfig, GenerationOverride, NetworkConfig, ThoughtLevelName
 from .interceptor import Interceptor
 from .llm import (
@@ -35,13 +39,13 @@ from .llm import (
     ThoughtLevel,
 )
 from .network import Network
-from .tools import SchemaTool
+from .tool_sources import ToolSource
+from .tools import Tool
 
 T = TypeVar("T")
 
 
 class NetworkBuilder:
-    TOOL_FACTORIES: ClassVar[dict[str, Callable[..., Callable]]] = {}
     # api_keyを渡さなければ、SDKが環境変数（GEMINI_API_KEY / OPENAI_API_KEY /
     # ANTHROPIC_API_KEY）から読む。azure_openaiは接続先も要るので、
     # AzureOpenAILLMがAZURE_OPENAI_ENDPOINTとAZURE_OPENAI_API_KEYから読む。
@@ -70,22 +74,37 @@ class NetworkBuilder:
         "initial_knowledge",
         "answer_knowledge",
     }
-    _TOOL_TEXTS: ClassVar[set[str]] = {"summary", "usage", "evaluation", "execution_message"}
 
-    def __init__(self, config: NetworkConfig, interceptor: Interceptor | None = None) -> None:
+    def __init__(
+        self,
+        config: NetworkConfig,
+        interceptor: Interceptor | None = None,
+        *,
+        tools: Sequence[ToolSource] = (),
+    ) -> None:
         self.config = config
         self.interceptor = interceptor
+        self.tools = list(tools)
         # providerごとに1つ作り、同じproviderのエージェントで共有する
         self._llms: dict[str, BaseLLM] = {}
 
     @classmethod
-    def from_dir(cls, root: Path | str, interceptor: Interceptor | None = None) -> Self:
-        """root の下の設定を読み込んだビルダーを返す。"""
-        return cls(NetworkConfig.load(root), interceptor)
+    def from_dir(
+        cls,
+        root: Path | str,
+        interceptor: Interceptor | None = None,
+        *,
+        tools: Sequence[ToolSource] = (),
+    ) -> Self:
+        """root の下の設定を読み込んだビルダーを返す。toolsはツールの出どころ。"""
+        return cls(NetworkConfig.load(root), interceptor, tools=tools)
 
-    def build(self) -> Network:
+    def build(self, enable_auditor: AuditorSettings | None = None) -> Network:
+        """enable_auditorは、そのままNetworkへ渡す（監査役の設定。省けば監査しない）。"""
         agents = [self._agent(config) for config in self.config.agents]
-        return Network(agents=agents, interceptor=self.interceptor)
+        return Network(
+            agents=agents, interceptor=self.interceptor, enable_auditor=enable_auditor
+        )
 
     def _agent(self, config: AgentConfig) -> Agent:
         # Noneは書かなかった項目。渡さずにAgentの既定値を使う
@@ -109,19 +128,22 @@ class NetworkBuilder:
             }
         return self.AGENT_CLASSES[config.type](**kwargs)
 
-    def _tool(self, name: str) -> SchemaTool:
+    def _tool(self, name: str) -> Tool:
         config = self.config.tools_by_name[name]
-        factory = self._lookup(
-            self.TOOL_FACTORIES, "TOOL_FACTORIES", config.type, f"tools/{config.name} の type"
-        )
-        try:
-            func = factory(**config.settings)
-        except TypeError as e:
+        owners = [source for source in self.tools if source.has(name)]
+        if not owners:
+            given = ", ".join(map(repr, self.tools)) or "なし"
             raise ValueError(
-                f"tools/{config.name} の settings が、{config.type} の引数と合いません: {e}"
-            ) from e
-        texts = config.model_dump(include=self._TOOL_TEXTS, exclude_none=True)
-        return SchemaTool(func=func, tool_name=config.name, parameters=config.parameters, **texts)
+                f"tools/{name} を作れる出どころがありません（渡された出どころ: {given}）。"
+                "自作のツールなら LocalTools に、MCPのツールなら McpTools のサーバーに"
+                "あるか確かめてください"
+            )
+        if len(owners) > 1:
+            raise ValueError(
+                f"tools/{name} が、複数の出どころにあります: {', '.join(map(repr, owners))}。"
+                "どちらのツールを使うか決められないので、名前を分けてください"
+            )
+        return owners[0].make(config)
 
     def _llm(self, provider: str) -> BaseLLM:
         if provider not in self._llms:

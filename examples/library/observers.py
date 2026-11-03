@@ -36,7 +36,7 @@ class Guard:
     """
     実行の直前に呼ばれ、拒否できる（guard.before_execute）。
 
-    ExecuteDecision(allowed=True) を返した場合のみ許可される（返し忘れ・
+    ExecuteDecision(ok=True) を返した場合のみ許可される（返し忘れ・
     型の違う値・例外はすべて拒否）。拒否に reason を付けると、理由として
     実行側へ返る。理由そのものが審査基準になるものは付けない。
     ずっと使わせないなら Tool.disabled を使う。
@@ -63,7 +63,7 @@ class Guard:
             # 「なぜ使えないか」を返す。返さないと、LLMは条件を変えて
             # 何度も呼び直そうとする（このtoolは何をしても通らない）。
             return ExecuteDecision(
-                allowed=False,
+                ok=False,
                 reason="外部への送信を伴うため、この環境では実行できません。別の手段を検討してください。",
             )
 
@@ -75,7 +75,7 @@ class Guard:
                 # 形式を教えると、その形式に合わせて値を作られる
                 # （「M- で始まる」と返したら「12345」を「M-12345」にされた）。
                 return ExecuteDecision(
-                    allowed=False,
+                    ok=False,
                     reason=(
                         f"受け取った会員番号（{member_id!r}）は正しい形式ではありません。"
                         "利用者から正しい会員番号を取得してください。"
@@ -86,7 +86,7 @@ class Guard:
         # ③ 外部の状態で止める — 開館時間外は予約の登録を受け付けない
         if name == "issue_reservation" and not tools.is_open_hours():
             return ExecuteDecision(
-                allowed=False,
+                ok=False,
                 reason="開館時間外のため、予約の登録を受け付けられません。開館時間は9時から20時です。",
             )
 
@@ -95,15 +95,15 @@ class Guard:
         # 判定が必要なものだけに絞る。全toolに掛けると実行のたびに生成が1回増える。
         # ここは理由を付けない（理由が審査基準そのものなので伝えない）。
         if name in self.NEEDS_COMPLIANCE:
-            return ExecuteDecision(allowed=self.judge_execution(name, kwargs))
+            return ExecuteDecision(ok=self.judge_execution(name, kwargs))
 
         # ⑤ 依頼の内容を審査して止める — 委譲の引数そのものを見る。
         # before_execute は tool と agent の両方で発火するので、「委譲してよいか」
         # も同じ機構で審査できる。ここも理由は返さない（審査基準に当たる）。
         if name in self.NEEDS_REQUEST_AUDIT:
-            return ExecuteDecision(allowed=self.judge_request(name, kwargs))
+            return ExecuteDecision(ok=self.judge_request(name, kwargs))
 
-        return ExecuteDecision(allowed=True)
+        return ExecuteDecision(ok=True)
 
     def judge_execution(self, name: str, kwargs: dict) -> bool:
         """操作の審査。規程に反しないかを見る。"""
@@ -397,24 +397,24 @@ def retry_on_overload(event: GenerationFailedEvent) -> RetryDecision:
     フレームワークが決めない。
     """
     agent, phase, model, attempt = event.agent, event.phase, event.model, event.attempt
-    text = str(event.error)
 
     # 枠を使い切った場合は、待っても同じエラーが返る。同じ条件での
     # やり直しでは越えられないので、既定のモデルへ逃がす。
-    if ("429" in text or "RESOURCE_EXHAUSTED" in text) and model != FALLBACK_MODEL:
+    if event.kind == "rate_limit" and model != FALLBACK_MODEL:
         print(f"  [再試行] {agent} / {phase.value} / 枠切れのため {FALLBACK_MODEL} でやり直します。")
-        return RetryDecision(retry=True, model=FALLBACK_MODEL)
+        return RetryDecision(ok=True, model=FALLBACK_MODEL)
 
     # 一時的な過負荷なら、待てば同じモデルで通ることが多い。
     # 引数の不正やスキーマの誤りは何度やっても同じ結果になるので対象外。
-    temporary = "503" in text or "UNAVAILABLE" in text
-    if not temporary or attempt >= 3:
-        return RetryDecision(retry=False)
+    if event.kind != "unavailable" or attempt >= 3:
+        if event.kind == "other":
+            print(f"  [再試行しない] {agent} / {phase.value} / {event.message}")
+        return RetryDecision(ok=False)
 
     wait = 2.0 * attempt  # 待つのはこちらの仕事。回を追うごとに延ばす
     print(f"  [再試行] {agent} / {phase.value} / {attempt}回目が失敗。{wait:.0f}秒待って再試行します。")
     time.sleep(wait)
-    return RetryDecision(retry=True)
+    return RetryDecision(ok=True)
 
 
 def build_interceptor(cost: CostMeter) -> Interceptor:
