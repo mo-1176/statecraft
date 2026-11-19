@@ -79,7 +79,7 @@ front（librarian へ依頼を送る側）が見るもの
 |---|---|---|
 | `value` | `str` | **必須。** LLM へ返す結果 |
 | `blobs` | `list[dict]` | LLM へ見せる添付。`[{"data": bytes, "mime_type": str}, ...]` |
-| `memory` | `dict[str, list[str]]` | 記憶へ直接書く内容。`{"vars": ["受付番号: ..."]}` |
+| `memory` | `dict[str, list[str \| dict]]` | 記憶へ直接書く内容。`{"vars": ["受付番号: ..."]}`。項目は本文の文字列か、記憶の差分の行と同じ形のオブジェクト（`{"id": ..., "text": ...}`。`tasks` なら `status` / `target_names` も）。オブジェクトは `id` を省けば採番、指定すれば同じ `id` の項目を差し替える。`tasks` だけを書いた場合は `value` を隠さない |
 
 形が違う場合（辞書でない、`value` が無い、キーの綴り違い）は、そのツールの実行が失敗したものとして扱い、何がおかしいかを LLM へ返します。
 

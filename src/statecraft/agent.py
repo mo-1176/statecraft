@@ -276,7 +276,14 @@ class ToolHistoryEntry:
 
     # toolが返したmemoryによって、結果が既に記憶へ記録済みかどうか。
     # 記録済みなら履歴側では中身を繰り返さない（同じ内容を二重に載せない）。
+    # tasksだけを書いた場合はFalse。tasksは結果の中身ではなく次の指示なので、
+    # 書いても結果を記録したことにはならない（隠すと、評価する生成に値が届かない）。
     written_to_memory: bool = False
+
+    # toolが返したmemoryで、このtoolが書いたtasksのid。実行済みのタスクの放置を
+    # 差し戻す検査（_executed_task_ids）から外すために持つ。toolが「同じtoolを
+    # もう一度」と立てたタスクを、実行済みのまま放置したと誤って差し戻さない。
+    written_task_ids: list[str] = field(default_factory=list)
 
     def render(self, *, include_result: bool = True) -> str:
         """
@@ -698,6 +705,7 @@ class Agent:
                     "evaluation": e.evaluation,
                     "output_schema": e.output_schema,
                     "written_to_memory": e.written_to_memory,
+                    "written_task_ids": list(e.written_task_ids),
                 }
                 for e in self.tool_history
             ],
@@ -750,6 +758,8 @@ class Agent:
                 evaluation=e["evaluation"],
                 output_schema=e["output_schema"],
                 written_to_memory=e["written_to_memory"],
+                # この項目より前に保存した状態には無い（無ければ書いていない）。
+                written_task_ids=list(e.get("written_task_ids", [])),
             )
             for e in data["tool_history"]
         ]
@@ -1662,16 +1672,22 @@ class Agent:
         立てたタスク（同じtoolを別の引数でもう一度、など）まで放置と見なして
         差し戻してしまう。toolが1つしか無いエージェントは、結果を見て掘り直す
         ことができなくなる。失敗した実行は対象にしない（再試行が正しい）。
+
+        今回のtoolの結果が書いたタスクも対象にしない。記憶の更新より前に書かれる
+        ので、toolが「同じtoolをもう一度」と立てたタスクが、放置に見えてしまう。
         """
         succeeded = {e.name for e in executed if e.result.success}
         if not succeeded:
             return set()
 
+        written = {task_id for e in executed for task_id in e.written_task_ids}
         pending = (TaskStatus.NEXT, TaskStatus.NEXT_PARALLEL)
         return {
             task.id
             for task in self.private_memory.tasks
-            if task.status in pending and succeeded & set(task.target_names)
+            if task.status in pending
+            and succeeded & set(task.target_names)
+            and task.id not in written
         }
 
     def _stale_task_errors(self, executed_ids: set[str]) -> list[DiffError]:
@@ -2197,8 +2213,10 @@ class Agent:
             # 登録側の設定ではなく戻り値で決まるので、同じtoolが状況に応じて
             # 記憶へ書くか選べる。
             if result.memory and result.success:
-                entry.written_to_memory = self._write_tool_result_to_memory(
-                    tool_name=call.name, memory=result.memory
+                entry.written_to_memory, entry.written_task_ids = (
+                    self._write_tool_result_to_memory(
+                        tool_name=call.name, memory=result.memory
+                    )
                 )
 
             if target is not None and result.success:
@@ -2233,21 +2251,30 @@ class Agent:
         self.last_successful_calls = succeeded_now
         return entries
 
-    def _write_tool_result_to_memory(self, *, tool_name: str, memory: dict) -> bool:
+    def _write_tool_result_to_memory(
+        self, *, tool_name: str, memory: dict
+    ) -> tuple[bool, list[str]]:
         """
-        toolが返したmemoryを記憶へ直接書き込む。書き込めたらTrueを返す。
+        toolが返したmemoryを記憶へ直接書き込む。
 
-        受け取るのは {プロパティ名: [本文, ...]}。idはapply_diffのid_prefixで
-        採番させる（toolは既存の記憶を知らない）。存在しないプロパティ名は
-        通知だけ出して処理を続ける（toolの実装ミスでセッションは止めない）。
+        受け取るのは {プロパティ名: [項目, ...]}。項目は本文の文字列か、LLMの差分の
+        行と同じ形のオブジェクト（idを省けばapply_diffのid_prefixで採番する。toolは
+        既存の記憶を知らない）。存在しないプロパティ名は通知だけ出して処理を続ける
+        （toolの実装ミスでセッションは止めない）。
+
+        戻り値は (結果の中身を記録したか, 書けたtasksのid)。tasksは結果の中身では
+        なく次の指示なので、前者には数えない。
         """
         rows = [
-            {"field": field_name, "text": text}
-            for field_name, texts in memory.items()
-            for text in texts
+            # プロパティ名はキーの方で決まる。項目の中のfieldは使わない。
+            {**item, "field": field_name}
+            if isinstance(item, dict)
+            else {"field": field_name, "text": item}
+            for field_name, items in memory.items()
+            for item in items
         ]
         if not rows:
-            return False
+            return False, []
 
         result = apply_diff(rows, *self._writable_memories(), id_prefix=tool_name)
         errors = result.errors
@@ -2279,11 +2306,15 @@ class Agent:
                 + "\n".join(e.render() for e in unwritten)
             )
 
-        # 1件でも通っていれば記録済みとして扱う。分母がresult.rowsなのは、渡した
-        # 行数で判定すると（ignoredの行はrowsへ入らない）1行も適用されていないのに
-        # 記録済みになり、記憶にも履歴にも何も残らないため。
-        applied = len(result.rows) - len(errors)
-        return applied > 0
+        # 通った行は、result.rowsのうちerrorsに入らなかったもの。分母がresult.rows
+        # なのは、渡した行数で判定すると（ignoredの行はrowsへ入らない）1行も適用
+        # されていないのに記録済みになり、記憶にも履歴にも何も残らないため。
+        # errorsが持つ行は、result.rowsの同じ実体（apply_diffが採番した後の行）。
+        failed = {id(e.entry) for e in errors}
+        applied = [row for row in result.rows if id(row) not in failed]
+        task_ids = [str(row["id"]) for row in applied if row["field"] == "tasks"]
+        # 1件でも中身が通っていれば記録済みとして扱う。
+        return len(applied) > len(task_ids), task_ids
 
     # ---- 初期tool ----
     def _plan_initial_tools(self) -> list[_PlannedCall]:

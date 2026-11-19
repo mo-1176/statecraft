@@ -483,6 +483,154 @@ def test_toolのmemoryは要約を通さず記憶へ入る():
     assert agent.shared_memory.vars[0].id.startswith("issue_reservation-vars-")
 
 
+def test_toolが立てたタスクで次の呼び出しが決まる():
+    """業務フローのように、次の手順をtool側が決める使い方。"""
+    reserved: list[str] = []
+
+    def check_stock(item: str) -> dict:
+        return {
+            "value": "在庫あり（倉庫B）",
+            "memory": {
+                "tasks": [
+                    {
+                        "text": "在庫を確保するため",
+                        "status": "next",
+                        "target_names": ["reserve_item"],
+                    }
+                ]
+            },
+        }
+
+    def reserve_item(item: str) -> dict:
+        reserved.append(item)
+        return {"value": "確保しました"}
+
+    llm = FakeLLM(
+        [
+            diff_response([task_row("t-1", "在庫を確かめる", "next", ["check_stock"])]),
+            call_response("check_stock", item="EQ"),
+            diff_response([task_row("t-1", "在庫を確かめる", "done", ["check_stock"])]),
+            call_response("reserve_item", item="EQ"),
+            diff_response(
+                [task_row("check_stock-tasks-1", "在庫を確保するため", "done", ["reserve_item"])]
+            ),
+            text_response("確保しました。"),
+        ]
+    )
+    agent = build_agent(
+        llm,
+        tools=[
+            Tool(func=check_stock, summary="在庫を確かめる"),
+            Tool(func=reserve_item, summary="在庫を確保する"),
+        ],
+    )
+
+    agent.respond(message="x")
+
+    assert reserved == ["EQ"]
+    assert [t["name"] for t in (d.to_declaration() for d in llm.calls[3]["tools"])] == [
+        "reserve_item"
+    ]
+    # tasksは結果の中身ではないので、書いても値は隠れず、評価する生成に届く
+    assert "在庫あり（倉庫B）" in llm.calls[2]["prompt"]
+
+
+def test_toolが同じtoolをもう一度と立てたタスクは放置として差し戻さない():
+    """記憶の更新の前に書かれるので、何もしないと「実行済みなのにnextのまま」に見える。"""
+
+    def fetch_page(page: int) -> dict:
+        status = "next" if page == 1 else "done"
+        return {
+            "value": f"{page}ページ目",
+            "memory": {
+                "tasks": [
+                    {
+                        "id": "next-page",
+                        "text": "続きのページを読むため",
+                        "status": status,
+                        "target_names": ["fetch_page"],
+                    }
+                ]
+            },
+        }
+
+    diffs: list = []
+    interceptor = Interceptor()
+    interceptor.notice.memory_diff(diffs.append)
+    llm = FakeLLM(
+        [
+            diff_response([task_row("t-1", "読む", "next", ["fetch_page"])]),
+            call_response("fetch_page", page=1),
+            # LLMは自分のタスクだけを閉じる。toolが立てたnext-pageはnextのまま残る
+            diff_response([task_row("t-1", "読む", "done", ["fetch_page"])]),
+            call_response("fetch_page", page=2),
+            diff_response([]),
+            text_response("読み終えました。"),
+        ]
+    )
+    agent = build_agent(
+        llm, tools=[Tool(func=fetch_page, summary="ページを読む")], interceptor=interceptor
+    )
+
+    agent.respond(message="x")
+
+    # 差し戻しの作り直しが起きていない（起きると台本がずれて落ちるか、回数が増える）
+    assert len(llm.calls) == 6
+    assert all(not e.errors for e in diffs)
+
+
+def test_toolはidを指定して既存の項目を差し替えられる():
+    def correct(topic: str) -> dict:
+        return {"value": "ok", "memory": {"facts": [{"id": "f-1", "text": "正しい値"}]}}
+
+    llm = FakeLLM(
+        [
+            diff_response(
+                [
+                    {"field": "facts", "id": "f-1", "text": "古い値"},
+                    task_row("t-1", "直す", "next", ["correct"]),
+                ]
+            ),
+            call_response("correct", topic="x"),
+            diff_response([task_row("t-1", "直す", "done", ["correct"])]),
+            text_response("直しました。"),
+        ]
+    )
+    agent = build_agent(llm, tools=[Tool(func=correct, summary="直す")])
+
+    agent.respond(message="x")
+
+    assert [(e.id, e.text) for e in agent.shared_memory.facts] == [("f-1", "正しい値")]
+    # tasks以外を書けば、結果は記録済みとして中身を繰り返さない（今までどおり）
+    assert "※結果はmemoryへ記録済み" in llm.calls[2]["prompt"]
+
+
+def test_ReflexAgentではtoolがtasksを書いても入らず知らせる():
+    """tasksを持たないので書き込めない。toolの実装の誤りとしてerrorで知らせる。"""
+
+    def plan(topic: str) -> dict:
+        return {
+            "value": "ok",
+            "memory": {"tasks": [{"text": "次へ", "status": "next", "target_names": []}]},
+        }
+
+    errors: list = []
+    interceptor = Interceptor()
+    interceptor.notice.error(errors.append)
+    agent = ReflexAgent(
+        name="front",
+        summary="窓口",
+        llm=FakeLLM([call_response("plan", topic="x"), text_response("回答")]),
+        model="m",
+        tools=[Tool(func=plan, summary="計画する")],
+        interceptor=interceptor,
+    )
+
+    agent.respond(message="x")
+
+    assert any("書き込めませんでした" in e.message for e in errors)
+
+
 # ---- 委譲（execute） ----
 def test_委譲の結果はagent_answersへ記録される():
     llm = FakeLLM(

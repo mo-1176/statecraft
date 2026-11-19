@@ -65,7 +65,7 @@ def dump_result(result: ToolResult | None, where: str) -> dict | None:
         "error": result.error,
         "execution_time": result.execution_time,
         "blobs": encode(result.blobs, where),
-        "memory": result.memory,
+        "memory": encode(result.memory, where),
     }
 
 
@@ -77,7 +77,7 @@ def load_result(data: dict | None) -> ToolResult | None:
         error=data["error"],
         execution_time=data["execution_time"],
         blobs=decode(data["blobs"]),
-        memory=data["memory"],
+        memory=decode(data["memory"]),
     )
 
 
