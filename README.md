@@ -2117,12 +2117,11 @@ pytest -v                                 # 1件ずつ名前を出す
 
 **動作を確認済み**
 
-Geminiでの1往復、委譲、初期ツール、入力/出力スキーマ、実行前の拒否（機械的な条件とエージェント判定の両方）、記憶への直接書き込み、添付の受け渡し、同時実行、ツールの無効化、停滞の検出、phaseごとのモデル切替、記憶の差分イベント、生成の計測、生成前の判定（予算による中止とモデル切替）、生成失敗時の再試行判定（待って再試行／枠切れ時のモデル切替）、会話履歴の読み分け（利用者の訂正と受け入れ）、問いの置き場の分離（調べる questions_to_research / 尋ねる questions_to_ask）、期限のある情報の現在時刻との照合、設定ファイル（YAML / Markdown）からの組み立て
+Geminiでの1往復、委譲、初期ツール、入力/出力スキーマ、実行前の拒否（機械的な条件とエージェント判定の両方）、記憶への直接書き込み、添付の受け渡し、同時実行、ツールの無効化、停滞の検出、phaseごとのモデル切替、記憶の差分イベント、生成の計測、生成前の判定（予算による中止とモデル切替）、生成失敗時の再試行判定（待って再試行／枠切れ時のモデル切替）、会話履歴の読み分け（利用者の訂正と受け入れ）、問いの置き場の分離（調べる questions_to_research / 尋ねる questions_to_ask）、期限のある情報の現在時刻との照合、設定ファイル（YAML / Markdown）からの組み立て、中断と再開（Geminiで、委譲先のtoolで中断して状態をJSONで保存し、別のプロセスで読み込んで再開するまでと、before_executeでの承認。保存した継承する思考〔思考の署名〕を、再開後にAPIが受け付けることも確認。OpenAI / Claude では未確認）
 
 **未検証**
 
-OpenAI / Azure OpenAI / Claude のプロバイダ実装（Azure OpenAI は、本物の SDK からローカルの代役サーバーへ送り、接続先・認証・キャッシュの区切りの扱いまで確認済み）、思考の継承（Gemini と OpenAI〔gpt-6-luna〕では、サンプルの図書館を通しで動かし、委譲・tool・記憶の更新・ReflexAgent を含めて API が受け付けることまで確認済み。Azure OpenAI は未確認。回答が良くなるかは未検証）、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）、記憶の更新の監査（before_memory_diff。FakeLLMでのみ確認）、組み込みの監査役（enable_auditor。FakeLLMでのみ確認）、MCPサーバーのツール（McpTools。偽のサーバーでのみ確認。接続の部分は plugin-scout で mcp 2.3.0 の見本のサーバーに対して確認した時のもの）、最終回答だけに渡すナレッジ（answer_knowledge。FakeLLMでのみ確認）、中断と再開（suspend / save_state / load_state / resume。FakeLLMでのみ確認。Geminiの継承する思考の保存は、SDKの型でJSONを往復することまで確認）
-
+OpenAI / Azure OpenAI / Claude のプロバイダ実装（Azure OpenAI は、本物の SDK からローカルの代役サーバーへ送り、接続先・認証・キャッシュの区切りの扱いまで確認済み）、思考の継承（Gemini と OpenAI〔gpt-6-luna〕では、サンプルの図書館を通しで動かし、委譲・tool・記憶の更新・ReflexAgent を含めて API が受け付けることまで確認済み。Azure OpenAI は未確認。回答が良くなるかは未検証）、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）、記憶の更新の監査（before_memory_diff。FakeLLMでのみ確認）、組み込みの監査役（enable_auditor。FakeLLMでのみ確認）、MCPサーバーのツール（McpTools。偽のサーバーでのみ確認。接続の部分は plugin-scout で mcp 2.3.0 の見本のサーバーに対して確認した時のもの）、最終回答だけに渡すナレッジ（answer_knowledge。FakeLLMでのみ確認）
 ---
 
 ## ドキュメント
