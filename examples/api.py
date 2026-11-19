@@ -8,7 +8,8 @@ Web API。会話は session_id で見分け、会話履歴と引き継ぐ記憶�
       → {"session_id": "...", "message": "...", "awaiting_reply": false}
     POST /chat  {"session_id": "...", "message": "さっきの予約の受付番号は？"}   # 同じ会話の続き
 
-利用者に候補を選んでもらう所で依頼が止まると、応答の options に候補が入る。
+利用者に尋ねる所（候補を選ぶ、足りない情報を答える、予約を承認する）で依頼が止まると、
+応答の message が尋ねる文になり、options に候補が入る（自由入力で答えるものは空）。
 次の POST /chat の message が、その答えになる。
 
     POST /chat  {"message": "『銀河鉄道』を予約したい。会員番号はM-001"}

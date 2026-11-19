@@ -15,4 +15,5 @@
       api_key.py         APIキーの用意
 
 入口は examples/ 直下の cli.py（1問で終わる）/ chat.py（対話）/ api.py（Web API）。
+replay.py は、cli.py が止めて保存した所から何度でも試し直す。
 """

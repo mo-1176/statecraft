@@ -5,11 +5,13 @@
     python cli.py "貸出は何冊まで？"
     python cli.py "貸出は何冊まで？" --fresh    # 前回の記憶を引き継がない
 
-利用者に候補を選んでもらう所で依頼が止まったら、状態を sample_suspended.json に
-保存して終わる。答えを渡すと、保存した状態を読み込んで止まった所から続ける。
+利用者に尋ねる所（候補を選ぶ、足りない情報を答える、予約を承認する）で依頼が止まったら、
+状態を sample_suspended.json に保存して終わる。答えを渡すと、保存した状態を読み込んで
+止まった所から続ける。1つの依頼の中で、何度か止まることもある。
 
     python cli.py "『銀河鉄道』を予約したい。会員番号はM-001"    # 候補を出して止まる
     python cli.py --answer 2                                    # 2番目を選んで続ける
+    python cli.py --answer はい                                 # 予約の承認で止まったら答える
 
 2回目以降は、前回の記憶のうち ontology と vars を引き継ぐ（sample_carry_over.json）。
 何を実演しているか・どう読むかは docs/sampleの読み方.md を参照。
@@ -141,7 +143,7 @@ def wait_for_answer(session: LibrarySession) -> None:
     assert suspension is not None
 
     print("\n" + "=" * 64)
-    print("利用者に選んでもらう（依頼はここで止まっている）")
+    print("利用者に尋ねる（依頼はここで止まっている）")
     print("=" * 64)
     print(suspension.question)
     for number, option in enumerate(suspension.options, 1):
@@ -151,7 +153,10 @@ def wait_for_answer(session: LibrarySession) -> None:
     # 答えは別のリクエストで届く。
     SUSPENDED_FILE.write_text(json.dumps(session.dump(), ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n状態を保存しました: {SUSPENDED_FILE.name}")
-    print("続けるには: python cli.py --answer 番号（候補に無い返答は文で渡す）")
+    if suspension.options:
+        print("続けるには: python cli.py --answer 番号（候補に無い返答は文で渡す）")
+    else:
+        print('続けるには: python cli.py --answer "返答"')
 
     session.cost.report()
 

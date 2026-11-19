@@ -49,6 +49,23 @@
       keyword: {type: string, description: 書名か著者名に含まれる語（部分一致で探す）}
     required: [keyword]
 
+# 調べている途中のまま、利用者に尋ねるツール。ここでも依頼全体が止まる（suspend）。
+# 受付に聞き返してもらう形と違い、それまでに調べたことを捨てずに続けられる。
+- name: ask_member
+  summary: 利用者にしか分からないことを、利用者に尋ねる
+  usage: "依頼に無い情報のうち、利用者にしか分からず、それが無いと先へ進めないものを尋ねる。\
+    1回に尋ねることは1つにし、利用者が答えられる言葉で書く。\
+    書名の候補から選んでもらうのは identify_title で行う。"
+  evaluation: |-
+    結果は利用者の返答そのもの。値はそのまま使い、形を整えたり補ったりしない。
+    尋ねたことに答えていない返答は、利用者の意向としてそのまま読む。
+  execution_message: 利用者に確認しています...
+  parameters:
+    type: object
+    properties:
+      question: {type: string, description: 利用者に尋ねる文。利用者の画面にそのまま出る}
+    required: [question]
+
 - name: check_stock
   summary: 書名から所在と貸出状況を調べる
   execution_message: 『{title}』の所蔵状況を照会しています...

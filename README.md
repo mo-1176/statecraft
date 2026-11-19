@@ -55,9 +55,9 @@ LLMの能力を引き出し、軽量モデルでも自律的に多くのタス�
 | 実行前の判定（審査役のエージェントを含む） | `library/observers.py` の `Guard`、`library/guard/` |
 | 進捗・記憶の変化・トークンと概算コストの表示、生成失敗時の再試行 | `library/observers.py` |
 | ターンの区切りと、次のターンへの記憶の引き継ぎ | `library/session.py`、`library/carry_over.py` |
-| 依頼を途中で止めて利用者に候補を選んでもらい、保存した状態から再開する（ヒューマンインザループ） | `library/tools.py` の `identify_title`、`library/session.py` |
+| 依頼を途中で止めて人に尋ね、保存した状態から再開する（ヒューマンインザループ。候補を選ぶ / 足りない情報を尋ねる / 実行前の承認） | `library/tools.py` の `identify_title` と `ask_member`、`library/observers.py` の `Approval`、`library/session.py` |
 | APIキーの読み込み（環境変数 → `.env` → 入力欄） | `library/api_key.py` |
-| 入口（1問で終わる CLI / 対話 / Web API） | `cli.py`、`chat.py`、`api.py` |
+| 入口（1問で終わる CLI / 対話 / Web API / 止めた所から試し直す） | `cli.py`、`chat.py`、`api.py`、`replay.py` |
 
 設定ファイルとコードには、なぜそう書いたかのコメントが付いています。何がどう動いているかは [docs/sampleの読み方.md](docs/sampleの読み方.md) にあります。
 
@@ -103,7 +103,7 @@ pip install -e ".[gemini,claude]"   # 複数でもよい
 
 ### サンプルを動かす
 
-図書館の問い合わせ対応を題材に、3体のエージェントと6つのツールが動きます。受付（`front`）が依頼を整理して司書（`librarian`）へ渡し、司書が規程と蔵書を調べ、取り消せない操作の手前で審査役（`compliance`）が可否を返します。書名がはっきりしなければ、依頼を途中で止めて利用者に候補を選んでもらいます。
+図書館の問い合わせ対応を題材に、3体のエージェントと7つのツールが動きます。受付（`front`）が依頼を整理して司書（`librarian`）へ渡し、司書が規程と蔵書を調べ、取り消せない操作の手前で審査役（`compliance`）が可否を返します。途中で人の答えが要る所（候補を選ぶ、足りない情報を答える、予約を承認する）では、依頼を止めて利用者に尋ねます。
 
 設定には、書ける項目の見本として `sample_agent` と `sample_tool` も入っています。どのエージェントからも呼ばれないので動きませんが、Network には入るため、`cli.py` のトークンの内訳には `sample_agent: (0, 0)` と出ます。
 
@@ -137,7 +137,7 @@ GEMINI_API_KEY=ここに貼る
 
 #### 2. 実行する
 
-サンプルは `examples/` の中から実行します。入口は3つです。
+サンプルは `examples/` の中から実行します。入口は3つです（ほかに、止めた所から試し直す `replay.py` があります）。
 
 | 入口 | 使い方 |
 |---|---|
@@ -156,6 +156,7 @@ python chat.py
 
 ```bash
 python cli.py "深夜特急を予約したい。会員番号はM-001"
+python cli.py --answer はい                    # 予約の承認で止まるので答える
 python cli.py "さっきの予約の受付番号は？"
 ```
 
@@ -165,11 +166,12 @@ python cli.py "さっきの予約の受付番号は？"
 python cli.py "貸出は何冊まで？" --fresh
 ```
 
-利用者に候補を選んでもらう所で依頼が止まると、`cli.py` は状態を `sample_suspended.json` へ保存して終わります。答えを渡すと、保存した状態を読み込んで止まった所から続きます（`chat.py` は次の入力、`api.py` は次の `POST /chat` が答えになります）。
+利用者に尋ねる所で依頼が止まると、`cli.py` は状態を `sample_suspended.json` へ保存して終わります。答えを渡すと、保存した状態を読み込んで止まった所から続きます（`chat.py` は次の入力、`api.py` は次の `POST /chat` が答えになります）。`replay.py` を使うと、保存した所から何度でも試し直せます。
 
 ```bash
 python cli.py "『銀河鉄道』を予約したい。会員番号はM-001"   # 候補を出して止まる
 python cli.py --answer 2                                   # 2番目を選んで続ける
+python cli.py --answer はい                                # 予約の承認で止まったら答える
 ```
 
 Web API は FastAPI と uvicorn を足してから起動します。`http://127.0.0.1:8000/docs` から試せます。
@@ -210,6 +212,7 @@ my-app/
   cli.py            ← examples/cli.py（入口は使うものだけでよい）
   chat.py           ← examples/chat.py
   api.py            ← examples/api.py（fastapi と uvicorn が要る）
+  replay.py         ← examples/replay.py（止めた所から試し直す。要らなければ写さない）
   .env.example      ← リポジトリ直下の .env.example
 ```
 
@@ -1302,7 +1305,7 @@ result = net.resume(answers={result.pending[0].point: "EQ-B"})
 - 保存するのは実行して変わったもの（記憶、起動の途中の状態、継承する思考、起動の表）だけです。設定は含まないので、プロンプトを変えたNetworkへ戻して、途中から1体だけを試すこともできます。
 - toolの戻り値と `suspend()` に渡す値は、JSONにできる形にします。
 
-詳しくは [reference/network.md](docs/reference/network.md) の「中断と再開」を見てください。サンプルでは、書名の候補を利用者に選んでもらう所で止め、CLI・対話・Web API のそれぞれで保存から再開までを行っています（→ [sampleの読み方.md](docs/sampleの読み方.md#利用者に選んでもらう中断と再開)）。
+詳しくは [reference/network.md](docs/reference/network.md) の「中断と再開」を見てください。サンプルでは、候補を選んでもらう・足りない情報を尋ねる（tool の本体で止める）と、実行前の承認（`before_execute` で止める）の3つを、CLI・対話・Web API のそれぞれで保存から再開まで行っています。保存した所から何度でも試し直す `replay.py` もあります（→ [sampleの読み方.md](docs/sampleの読み方.md#人に尋ねる中断と再開)）。
 
 ### 渡すと共有記憶が入る
 

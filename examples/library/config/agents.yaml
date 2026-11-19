@@ -2,7 +2,7 @@
 #
 #   利用者 ──→ front（受付・ReflexAgent）──委譲──→ librarian（調査・Agent）
 #                                                         │
-#                                                       tool 5つ
+#                                                       tool 6つ
 #                               実行の手前で compliance（審査役）が可否を返す
 #
 # 審査役（compliance）は、ここではなく guard/config/agents.yaml にある。
@@ -68,7 +68,7 @@
     # ANSWERはstatusを返すだけで文章を作らないため、既定のままでよい。
     initial_memory: {model: gemini-3.7-flash}
     memory_update: {model: gemini-3.7-flash}
-  tools: [search_rules, identify_title, check_stock, issue_reservation, send_overdue_notice]
+  tools: [search_rules, identify_title, ask_member, check_stock, issue_reservation, send_overdue_notice]
   # 決まっている手順はLLMに選ばせない。並列で走る。
   # 引数は input_schema の同名プロパティから渡される（名前が一致しないとNetwork構築時に落ちる）。
   # 会員番号が渡らない相談では、fetch_member_status は実行されず

@@ -20,7 +20,8 @@ class Reply:
     message: str
     # 利用者からの返答を待っているか。画面では入力欄の出し方に使う
     awaiting_reply: bool
-    # 利用者に選んでもらう候補。依頼が途中で止まっている時だけ入る（→ Suspension）
+    # 利用者に選んでもらう候補。依頼が途中で止まっている時だけ入る（→ Suspension）。
+    # 止まっていても、自由入力で答えるものでは空
     options: list[str] = field(default_factory=list)
 
     @classmethod
@@ -50,7 +51,8 @@ class Suspension:
     state: dict
     # net.resume(answers={point: 答え}) のキー
     point: str
-    # 利用者へ見せるもの。identify_title が suspend() に渡した形
+    # 利用者へ見せるもの。このサンプルで suspend() に渡す形はどこも
+    # {"question": 尋ねる文, "options": 候補}。自由入力で答えるもの（ask_member）は options が無い
     question: str
     options: list[str]
     # このターンの発言（依頼、尋ねたこと、答え）。依頼が終わってから会話履歴へ足す
@@ -60,8 +62,8 @@ class Suspension:
         """
         番号で答えたら、その候補の文字列にする。候補に無い返答はそのまま渡す。
 
-        答えはそのまま tool の結果になる。番号のままだと、受け取った側には
-        「2」としか見えない。
+        答えはそのまま tool の結果か、承認の判定に渡る。番号のままだと、
+        受け取った側には「2」としか見えない。
         """
         if text.isdigit() and 1 <= int(text) <= len(self.options):
             return self.options[int(text) - 1]
@@ -75,8 +77,8 @@ class LibrarySession:
     Networkを使い回さないのは、1つのNetworkが1リクエスト分の入れ物だから。
     使い回すと、前のターンの facts や decisions まで次のターンに残る。
 
-    依頼が途中で止まったら（利用者に候補を選んでもらう時）、状態を保存して答えを待つ。
-    止まっている間の発言は ask ではなく answer に渡す。
+    依頼が途中で止まったら（候補を選んでもらう、足りない情報を尋ねる、予約の承認を取る）、
+    状態を保存して答えを待つ。止まっている間の発言は ask ではなく answer に渡す。
     """
 
     def __init__(self, carry_over: CarryOver | None = None, cost: CostMeter | None = None) -> None:
@@ -121,7 +123,7 @@ class LibrarySession:
             # 同時に複数の所で止まることもある（並列の呼び出し）。1つずつ聞く。
             # 答えなかった所は、再開した時に実行し直されて、また止まる。
             pending = result.pending[0]
-            question, options = pending.payload["question"], pending.payload["options"]
+            question, options = pending.payload["question"], pending.payload.get("options", [])
             self.suspension = Suspension(
                 state=net.save_state(),
                 point=pending.point,

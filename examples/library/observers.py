@@ -3,6 +3,7 @@ interceptor に登録するもの。notice は受け取るだけ、guard は止�
 recover は失敗した後にどうするかを決める。
 
     Guard             実行の手前で可否を決める（guard。審査役への問い合わせを含む）
+    Approval          Guard を通った操作の手前で、利用者の承認を取る（guard。依頼を止める）
     ArgumentWatcher   呼ばれた対象と引数を出す（notice）
     CostMeter         生成ごとのトークンと概算コストを積む（notice）
     その他             画面への表示、記憶の変化の表示（notice）、生成失敗時の再試行（recover）
@@ -23,6 +24,7 @@ from statecraft import (
     GenerationFailedEvent,
     Interceptor,
     RetryDecision,
+    suspend,
 )
 
 from . import tools
@@ -154,6 +156,38 @@ class Guard:
 
         print(f"    [審査/{'許可' if allowed else '拒否'}] {label}: {verdict.get('reason', '')}")
         return allowed
+
+
+class Approval:
+    """
+    取り消せない操作の手前で、利用者の承認を取る（guard.before_execute。Guard の後に登録する）。
+
+    suspend() で依頼全体を止める。再開すると判定が頭からやり直しになり、ここの
+    suspend() が利用者の答えを返す（toolの本体で止めた時と違い、答えは結果にならない）。
+
+    Guard の後に置くのは、通らない操作の承認を利用者に求めないため。再開すると
+    Guard ももう一度判定する（審査役も呼ばれ直す）。答えを待つ間に開館時間を
+    過ぎることもあるので、実行する時点で判定し直す方が正しい。
+    """
+
+    NEEDS_APPROVAL: ClassVar[set[str]] = {"issue_reservation"}
+
+    def __call__(self, event: BeforeExecuteEvent) -> ExecuteDecision:
+        if event.name not in self.NEEDS_APPROVAL:
+            return ExecuteDecision(ok=True)
+
+        title, member_id = event.kwargs.get("title"), event.kwargs.get("member_id")
+        answer = suspend(
+            {
+                "question": f"『{title}』を会員{member_id}の名義で予約します。よろしいですか？",
+                "options": ["はい", "いいえ"],
+            }
+        )
+        if answer == "はい":
+            return ExecuteDecision(ok=True)
+        # 理由を返す。返さないと、司書は止められた原因を探して呼び直す。
+        # 返答も添える（「別の本にして」のように、断った理由が書かれていることがある）。
+        return ExecuteDecision(ok=False, reason=f"利用者が予約を承認しませんでした（返答: {answer}）。")
 
 
 class ArgumentWatcher:
@@ -424,6 +458,8 @@ def build_interceptor(cost: CostMeter) -> Interceptor:
     # 止める判定は guard、見るだけのものは notice。観測を guard に置かないので、
     # 返し忘れで実行が止まることはなく、登録の順番を気にする必要もない。
     interceptor.guard.before_execute(Guard())
+    # guard は登録した順に判定し、全部が許可した時だけ実行される。機械の判定が先、人が後
+    interceptor.guard.before_execute(Approval())
 
     # 引数は、実行が始まった時と止められた時の両方で出す。
     # 拒否された実行の引数が出ないと「なぜ止まったのか」を追えない。

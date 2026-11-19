@@ -96,6 +96,19 @@ def identify_title(keyword: str) -> dict:
     return {"value": ""}  # ここには来ない。suspend() は止まったまま戻らない
 
 
+def ask_member(question: str) -> dict:
+    """
+    利用者にしか分からないこと（会員番号など）を、調べている途中のまま利用者に尋ねる。
+
+    受付に聞き返してもらうと、答えは次のターンの新しい依頼になり、司書は最初から
+    調べ直す。ここで止めれば、それまでに調べたことを持ったまま、答えだけを受け取って続ける。
+    利用者の答えが、そのままこのtoolの結果になる。
+    """
+    # 候補を出さない（自由入力）ので options は無い
+    suspend({"question": question})
+    return {"value": ""}  # ここには来ない。suspend() は止まったまま戻らない
+
+
 def check_stock(title: str) -> dict:
     """指定した書名の所在と貸出状況を調べる"""
     found = STOCK.get(title)
