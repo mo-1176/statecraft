@@ -78,6 +78,23 @@ def test_memoryの値が配列でなければ失敗になる():
     assert "vars" in result.error
 
 
+def test_memoryの項目は記憶の項目と同じ形のオブジェクトでも返せる():
+    """idやtasksのstatusを書くため。中身の検査は書き込む側（apply_diff）に任せる。"""
+    task = {"text": "在庫を確保するため", "status": "next", "target_names": ["reserve"]}
+    result = parse_tool_return(
+        "t",
+        {"value": "ok", "memory": {"tasks": task, "facts": ["本文", {"id": "f-1", "text": "上書き"}]}},
+    )
+
+    assert result.success
+    assert result.memory == {
+        "tasks": [task],
+        "facts": ["本文", {"id": "f-1", "text": "上書き"}],
+    }
+    # 受け取った辞書をそのまま持たない（toolが定数を返しても、書き換えが伝わらない）
+    assert result.memory["tasks"][0] is not task
+
+
 # ---- ToolResult ----
 def test_successはerrorの有無から導出される():
     """boolを別に持つと success=True かつ error=失敗 という矛盾が作れてしまう。"""

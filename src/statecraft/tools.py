@@ -36,6 +36,9 @@ def parse_tool_return(tool_name: str, returned: Any) -> "ToolResult":
 
         {"value": str, "blobs": [...], "memory": {...}}   value以外は省略可
 
+    memoryの値は項目の配列で、項目は本文の文字列か、記憶の項目と同じ形の
+    オブジェクト（ToolResult.memoryを参照）。
+
     形は1つに固定する。登録側の設定で形が変わると（「記憶へ書くtoolは差分の
     配列を返す」のような分岐）、valueの意味そのものが入れ替わる。
     契約違反は失敗として返し、valueは推測で埋めない。
@@ -68,17 +71,21 @@ def parse_tool_return(tool_name: str, returned: Any) -> "ToolResult":
     memory = returned.get("memory") or {}
     if not isinstance(memory, dict):
         return ToolResult(error=f"{tool_name}のmemoryが辞書ではありません。")
-    # 値は本文の配列。文字列を1つ渡された場合も配列として扱う
+    # 値は項目の配列。1件だけ渡された場合も配列として扱う
     # （1件だけ書く時に [] を付け忘れるのはよくある）。
-    normalized: dict[str, list[str]] = {}
-    for field_name, texts in memory.items():
-        if isinstance(texts, str):
-            texts = [texts]
-        if not isinstance(texts, list):
+    normalized: dict[str, list[str | dict]] = {}
+    for field_name, items in memory.items():
+        if isinstance(items, (str, dict)):
+            items = [items]
+        if not isinstance(items, list):
             return ToolResult(
                 error=f"{tool_name}のmemory['{field_name}']が配列ではありません。"
             )
-        normalized[str(field_name)] = [str(t) for t in texts]
+        # オブジェクトの中身の検査（idの形、tasksのstatusなど）はここでしない。
+        # LLMの差分と同じ適用の経路（apply_diff）が、同じ規則で行う。
+        normalized[str(field_name)] = [
+            dict(item) if isinstance(item, dict) else str(item) for item in items
+        ]
 
     return ToolResult(value=returned["value"], blobs=list(blobs), memory=normalized)
 
@@ -105,13 +112,19 @@ class ToolResult:
     # 載らない（文字起こし先を持たないReflexAgentでは渡り続ける）。
     blobs: list[dict] = field(default_factory=list)
 
-    # LLMを介さず記憶へ直接書く内容。{プロパティ名: [本文, ...]}
+    # LLMを介さず記憶へ直接書く内容。{プロパティ名: [項目, ...]}
     #   {"vars": ["予約受付番号: RSV-63082"], "facts": ["予約を登録した"]}
     #
     # 一字一句正確に残したい値のための経路（要約を通さないので値が変わらない）。
-    # idは書かない。toolは既存の記憶を知らないため、システムが
-    # tool名-プロパティ名-連番 で採番する。書き込むのはAgent側。
-    memory: dict[str, list[str]] = field(default_factory=dict)
+    # 項目は本文の文字列か、LLMの差分の行と同じ形のオブジェクト。
+    #   文字列       … idはシステムが tool名-プロパティ名-連番 で採番する
+    #                  （toolは既存の記憶を知らないため）
+    #   オブジェクト … {"id": ..., "text": ...}。idを省けば採番、指定すれば同じidの
+    #                  項目を差し替える。tasksなら status / target_names も書ける
+    #   {"tasks": [{"text": "在庫を確保するため", "status": "next",
+    #               "target_names": ["reserve_item"]}]}
+    # 書き込むのはAgent側。
+    memory: dict[str, list[str | dict]] = field(default_factory=dict)
 
     @property
     def success(self) -> bool:
