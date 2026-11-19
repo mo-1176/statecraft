@@ -247,7 +247,8 @@ def test_引数が違えば重複ではない(search_tool):
 
     agent.respond(message="x")
 
-    assert search_tool.calls == ["貸出", "返却"]
+    # 2件は並列に呼ばれるので、関数に届く順番は決まらない。両方が呼ばれたことだけを見る
+    assert sorted(search_tool.calls) == ["貸出", "返却"]
 
 
 # ---- 名前の解決に失敗した場合 ----
