@@ -129,13 +129,14 @@ tool の本体か、`before_execute` のコールバックで `suspend(payload)`
 ```python
 from statecraft import Suspended, suspend
 
-def present_candidates(query: str) -> dict:
-    suspend({"candidates": search(query)})   # 利用者に選んでもらう
-    return {"value": ""}                     # ここへは来ない
+def identify_title(keyword: str) -> dict:
+    found = search_titles(keyword)
+    suspend({"question": "どれのことですか？", "options": found})   # 利用者に選んでもらう
+    return {"value": ""}                                           # ここへは来ない
 ```
 
 ```python
-result = net.respond(agent="front", message="EQを選びたい")
+result = net.respond(agent="front", message="『銀河鉄道』を予約したい")
 if isinstance(result, Suspended):
     [pending] = result.pending               # pending.payload を画面へ出す
     store.put(key, net.save_state())         # 保存先は利用側が決める（DB・Blob など）
@@ -143,7 +144,7 @@ if isinstance(result, Suspended):
 # 返事が来たら（別のプロセスでもよい）
 net = build_network()                        # 同じ名前のエージェントと tool で組む
 net.load_state(store.get(key))               # 戻すだけ。まだ動かない
-result = net.resume(answers={pending.point: "EQ-B"})
+result = net.resume(answers={pending.point: "銀河鉄道の父"})
 ```
 
 同じプロセスで続けるなら、`save_state()` / `load_state()` を挟まずに `resume()` を呼べます。
@@ -159,11 +160,13 @@ result = net.resume(answers={pending.point: "EQ-B"})
 
 ```python
 def confirm(e):
-    if e.name != "purchase":
+    if e.name != "issue_reservation":
         return ExecuteDecision(ok=True)
-    answer = suspend({"confirm": e.kwargs})   # 再開すると、ここが答えを返す
-    return ExecuteDecision(ok=answer == "yes", reason="利用者が取りやめました")
+    answer = suspend({"question": "予約してよいですか？", "options": ["はい", "いいえ"]})   # 再開すると、ここが答えを返す
+    return ExecuteDecision(ok=answer == "はい", reason="利用者が取りやめました")
 ```
+
+サンプル（`examples/`）では、候補を選んでもらう・足りない情報を尋ねる・実行前の承認の3つを、CLI・対話・Web API で動かしています（→ [sampleの読み方.md](../sampleの読み方.md#人に尋ねる中断と再開)）。
 
 ### 何が保存されるか
 

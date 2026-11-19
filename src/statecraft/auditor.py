@@ -2,7 +2,7 @@
 組み込みの監査役。Networkを作るときに enable_auditor を渡すと有効になる。
 
     network = Network(
-        agents=[front, scout],
+        agents=[front, librarian],
         enable_auditor={"llm": OpenAILLM(), "model": "gpt-6-luna"},
     )
 

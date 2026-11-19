@@ -96,7 +96,7 @@ class ApiKey:
             f.write(f"{prefix}{self.ENV_VAR}={value}\n")
 
         if is_new:
-            # 秘密を書いたファイルなので本人だけが読めるようにする。
+            # 秘密を書いたファイルなので、ファイルの持ち主だけが読めるようにする。
             # Windowsでは意味を持たないが、失敗しても実行は止めない。
             with contextlib.suppress(OSError):
                 os.chmod(path, 0o600)

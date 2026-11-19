@@ -396,7 +396,7 @@ tools.yaml と knowledges.yaml は、使わなければ置かなくて構いま�
   phase_overrides:
     initial_memory: {model: gemini-3.7-flash}
     memory_update: {model: gemini-3.7-flash}
-  tools: [search_rules, check_stock, issue_reservation, send_overdue_notice]
+  tools: [search_rules, identify_title, ask_member, check_stock, issue_reservation, send_overdue_notice]
   initial_tools: [search_rules, fetch_member_status]
   knowledge: [terms]
   input_schema:
@@ -493,6 +493,8 @@ LIBRARY_TOOLS = LocalTools(
     {
         "search_rules": tools.search_rules,
         "fetch_member_status": tools.fetch_member_status,
+        "identify_title": tools.identify_title,
+        "ask_member": tools.ask_member,
         "check_stock": tools.check_stock,
         "issue_reservation": tools.issue_reservation,
         "send_overdue_notice": tools.send_overdue_notice,
@@ -698,9 +700,9 @@ def issue_ticket(title: str, member_id: str) -> dict:
 
 ```python
 "memory": {
-    "facts": [{"id": "在庫-EQ", "text": "EQは倉庫Bに3点"}],          # idを指定すると、同じidの項目を差し替える
-    "tasks": [{"text": "在庫を確保するため", "status": "next",
-               "target_names": ["reserve_item"]}],                 # 次の手順をtoolが決める
+    "facts": [{"id": "stock-深夜特急", "text": "『深夜特急』は貸出中"}],   # idを指定すると、同じidの項目を差し替える
+    "tasks": [{"text": "貸出中の資料を予約するため", "status": "next",
+               "target_names": ["issue_reservation"]}],            # 次の手順をtoolが決める
 }
 ```
 
@@ -878,7 +880,7 @@ Agentを置いた場合も、その Agent からは他の初期ステップの�
 
 #### Agent も置けます
 
-ツールの代わりにエージェントを置くこともできますが、あまり推奨しません。。。
+ツールの代わりにエージェントを置くこともできますが、あまり勧めません（下の「毎回かかる費用」を参照）。
 もちろん、ツールとエージェントを混ぜてもかまいません。
 
 設定ファイルの `initial_tools` に書けるのは tools.yaml のツールだけなので、エージェントを置く場合はコードで組みます（→ [設定ファイルを使わずに組む](#設定ファイルを使わずに組む)）。
@@ -1286,17 +1288,18 @@ toolの本体か `before_execute` のコールバックで `suspend(payload)` �
 ```python
 from statecraft import Suspended, suspend
 
-def present_candidates(query: str) -> dict:
-    suspend({"candidates": search(query)})   # ここで依頼全体が止まる
+def identify_title(keyword: str) -> dict:
+    found = search_titles(keyword)
+    suspend({"question": "どれのことですか？", "options": found})   # ここで依頼全体が止まる
     return {"value": ""}
 
-result = net.respond(agent="front", message="EQを選びたい")
+result = net.respond(agent="front", message="『銀河鉄道』を予約したい")
 if isinstance(result, Suspended):
     store.put(key, net.save_state())         # 保存先は利用側が決める
 
 net = build_network()                        # 別のプロセスでもよい。同じ名前で組む
 net.load_state(store.get(key))               # 戻すだけで、動かさない
-result = net.resume(answers={result.pending[0].point: "EQ-B"})
+result = net.resume(answers={result.pending[0].point: "銀河鉄道の父"})
 ```
 
 **再生ではなく、文字通りの中断と再開です。** 中断までに終わった呼び出しは実行し直さず、委譲先の中で止まっても、誰が誰の結果を待っていたかごと続きから進みます。エージェントは互いを関数として呼ばず、Networkが起動の表で親子を持っているためです（→ [ADR 0004](docs/adr/0004-runs-as-table.md)）。
@@ -1434,7 +1437,7 @@ Network に入れて動かすと、どのイベントにも `network`（`Network
 
 ```python
 def on_generated(e: GeneratedEvent) -> None:
-    for step in e.network.agents["scout"].steps:
+    for step in e.network.agents["librarian"].steps:
         print(step.step_no, {phase.value: round(s, 1) for phase, s in step.seconds.items()})
         # 1 {'initial_memory': 3.2, 'function_call': 1.1}
         # 2 {'memory_update': 4.0, 'function_call': 0.9}
@@ -1602,7 +1605,7 @@ def build_compliance() -> Agent:
 | 実在するか | ツール本体で確認する。形式チェックは形を真似た値を通す |
 | 権限・所有者 | ツール本体で確認する。LLMの判断に委ねない |
 | 実行できる時間帯・回数 | `before_execute` の中で外部の状態を見る |
-| 取り返しがつかない操作 | 人の承認を挟む。`before_execute` の中で待つか、ツールの中で止める |
+| 取り返しがつかない操作 | 人の承認を挟む（`before_execute` の中で `suspend()`。→ [中断と再開](#中断と再開--suspend--save_state--load_state--resume)） |
 
 LLMの審査が効くのは、**機械的な条件では書けないもの**だけです。上の表で塞げるものを塞いだ後、残りに重ねる層として使ってください。
 
@@ -2147,7 +2150,9 @@ Geminiでの1往復、委譲、初期ツール、入力/出力スキーマ、実
 
 **未検証**
 
-OpenAI / Azure OpenAI / Claude のプロバイダ実装（Azure OpenAI は、本物の SDK からローカルの代役サーバーへ送り、接続先・認証・キャッシュの区切りの扱いまで確認済み）、思考の継承（Gemini と OpenAI〔gpt-6-luna〕では、サンプルの図書館を通しで動かし、委譲・tool・記憶の更新・ReflexAgent を含めて API が受け付けることまで確認済み。Azure OpenAI は未確認。回答が良くなるかは未検証）、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）、記憶の更新の監査（before_memory_diff。FakeLLMでのみ確認）、組み込みの監査役（enable_auditor。FakeLLMでのみ確認）、MCPサーバーのツール（McpTools。偽のサーバーでのみ確認。接続の部分は plugin-scout で mcp 2.3.0 の見本のサーバーに対して確認した時のもの）、最終回答だけに渡すナレッジ（answer_knowledge。FakeLLMでのみ確認）---
+OpenAI / Azure OpenAI / Claude のプロバイダ実装（Azure OpenAI は、本物の SDK からローカルの代役サーバーへ送り、接続先・認証・キャッシュの区切りの扱いまで確認済み）、思考の継承（Gemini と OpenAI〔gpt-6-luna〕では、サンプルの図書館を通しで動かし、委譲・tool・記憶の更新・ReflexAgent を含めて API が受け付けることまで確認済み。Azure OpenAI は未確認。回答が良くなるかは未検証）、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）、記憶の更新の監査（before_memory_diff。FakeLLMでのみ確認）、組み込みの監査役（enable_auditor。FakeLLMでのみ確認）、MCPサーバーのツール（McpTools。偽のサーバーでのみ確認。接続の部分は、mcp 2.3.0 の見本のサーバーに対して確認済み）、最終回答だけに渡すナレッジ（answer_knowledge。FakeLLMでのみ確認）
+
+---
 
 ## ドキュメント
 

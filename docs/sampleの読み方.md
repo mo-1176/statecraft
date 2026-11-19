@@ -928,10 +928,7 @@ front は librarian に投げて終わりなので、tool を巧みに使う必�
 | `librarian`（`Agent`） | **される。** `ANSWER` で `response_schema` として渡る |
 | `front`（`ReflexAgent`） | されない。指示文として `system_instruction` に載るだけ |
 
-`front` の側は守られないことがありえますということを示せればと思って設定しました。
-基本的に受付役は会話を行うことが役目なのでoutput_schemaは推奨しません。
-
-A2A(Agent to Agent)では恩恵があるかもしれませんが。
+`front` に付けているのは、強制されない側では形が守られないことがある、と示すためです。受付役の仕事は会話なので、受付役に `output_schema` を付けることは勧めません。エージェントどうしでやり取りする場合（A2A）は、役に立つことがあります。
 
 `chat.py` と `api.py` は、`front` の回答を `Reply.parse` で `message` と `awaiting_reply` に分けます。形が守られなかった場合は、本文をそのまま `message` として扱います。
 
