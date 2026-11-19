@@ -1,12 +1,12 @@
 # サンプル（図書館）の読み方
 
-図書館の問い合わせに答えるサンプルです。3体のエージェントと5つのツールで、利用者の質問から予約の登録までを行います。
+図書館の問い合わせに答えるサンプルです。3体のエージェントと6つのツールで、利用者の質問から予約の登録までを行います。書名がはっきりしなければ、依頼を途中で止めて利用者に候補を選んでもらい、答えが届いたら続きから進めます（ヒューマンインザループ）。
 
 エージェントとツールの定義は、設定のディレクトリ（`examples/library/` の YAML と Markdown）に書いてあります。コードに残っているのは、ツールの実装、実行を止める判定、画面への表示、記憶の引き継ぎだけです。入口は3つあります。
 
 | 入口 | 使い方 |
 |---|---|
-| `cli.py` | 1つの質問に答えて終わる。記憶の中身とコストの内訳まで出す |
+| `cli.py` | 1つの質問に答えて終わる。記憶の中身とコストの内訳まで出す。依頼が止まったら状態をファイルへ保存して終わり、`--answer` で続ける |
 | `chat.py` | 対話モード。会話履歴と記憶を次のターンへ引き継ぐ |
 | `api.py` | Web API。会話を `session_id` で見分ける |
 
@@ -39,6 +39,7 @@
 - [画面に出る行の種類](#画面に出る行の種類)
 - [コストの見方](#コストの見方)
 - [引き継ぎ](#引き継ぎ)
+- [利用者に選んでもらう（中断と再開）](#利用者に選んでもらう中断と再開)
 - [試せる質問](#試せる質問)
 - [なぜそうしたか](#なぜそうしたか)
 - [自分のアプリに写す](#自分のアプリに写す)
@@ -83,6 +84,13 @@ python cli.py "さっきの予約の受付番号は？"
 
 毎回まっさらな状態で試すなら `--fresh` を付けます。読み込みも保存も行いません。引き継ぎを完全に消すなら `sample_carry_over.json` を削除します。
 
+依頼の途中で利用者に候補を選んでもらう所では、`cli.py` は状態を `sample_suspended.json` へ保存して終わります。答えを渡すと、別のプロセスでも止まった所から続きます（→ [利用者に選んでもらう](#利用者に選んでもらう中断と再開)）。
+
+```bash
+python cli.py "『銀河鉄道』を予約したい。会員番号はM-001"   # 候補を出して止まる
+python cli.py --answer 2                                   # 2番目を選んで続ける
+```
+
 ---
 
 ## ファイルの置き場所
@@ -93,7 +101,7 @@ examples/
   library/
     config/
       agents.yaml                 front と librarian。末尾に全項目の見本（sample_agent）
-      tools.yaml                  5つのツール。末尾に全項目の見本（sample_tool）
+      tools.yaml                  6つのツール。末尾に全項目の見本（sample_tool）
       knowledges.yaml             用語辞書の登録
     prompts/
       agents/front/system_instruction.md
@@ -109,7 +117,7 @@ examples/
     network.py                    組み立て（tools.yaml の名前とツールの実装の対応。LocalTools）
     observers.py                  interceptor に登録するもの（審査、表示、計測、再試行）
     carry_over.py                 次のターンへ引き継ぐ記憶
-    session.py                    1つの会話（ターンごとにNetworkを作る）
+    session.py                    1つの会話（ターンごとにNetworkを作る。止まった依頼の保存と再開）
     api_key.py                    APIキーの用意
 ```
 
@@ -149,6 +157,9 @@ examples/
 
     fetch_member_status     ★初期tool（toolsへ登録しない）
     会員区分を引く           会員番号が空なら実行されない
+
+    identify_title          ★候補が複数なら、依頼全体を止めて利用者に選んでもらう
+    書名を確定する
 
       ┌──────────────────────────────────────────┐
       │ compliance                 ReflexAgent   │
@@ -635,22 +646,133 @@ setattr(net.shared_memory, name, [MemoryEntry(id=r["id"], text=r["text"]) for r 
 def ask(self, message: str) -> Reply:
     net = build_network(build_interceptor(self.cost))
     self.carry_over.apply(net)
-    response = net.respond(agent="front", message=message, history=self.history)
-    ...
-    self.carry_over = CarryOver.capture(net)
+    result = net.respond(agent="front", message=message, history=self.history)
+    return self._settle(net, result, ...)   # 終わっていれば CarryOver.capture(net) で持ち越す
 ```
 
 Network を使い回さないのは、1つの Network が1リクエスト分の入れ物だからです。使い回すと、前のターンの `facts` や `decisions` まで次のターンに残ります。
 
-| 入口 | 会話履歴と引き継ぎを持つ場所 |
-|---|---|
-| `cli.py` | 1問で終わるので会話履歴は無い。引き継ぎは `sample_carry_over.json` |
-| `chat.py` | 会話の間はプロセスのメモリ。終えるときに `sample_carry_over.json` へ保存 |
-| `api.py` | `session_id` ごとにサーバーのメモリ（`SessionStore`） |
+| 入口 | 会話履歴と引き継ぎを持つ場所 | 止まった依頼を持つ場所 |
+|---|---|---|
+| `cli.py` | 1問で終わるので会話履歴は無い。引き継ぎは `sample_carry_over.json` | `sample_suspended.json`（次の起動の `--answer` が読む） |
+| `chat.py` | 会話の間はプロセスのメモリ。終えるときに `sample_carry_over.json` へ保存 | プロセスのメモリ |
+| `api.py` | `session_id` ごとにサーバーのメモリ（`SessionStore`） | 同じ `SessionStore` |
 
-`api.py` の `SessionStore` は簡易版です。再起動で消え、サーバーを複数台に増やすと台ごとに別の会話になります。実運用では Redis や DB に置きます（保存するのは `history` と `carry_over` だけで足ります）。
+`api.py` の `SessionStore` は簡易版です。再起動で消え、サーバーを複数台に増やすと台ごとに別の会話になります。実運用では Redis や DB に置きます（`LibrarySession.dump()` を保存し、`load()` で戻します。会話履歴・引き継ぐ記憶・止まった依頼の状態が入り、Network は入りません）。
 
 会話履歴に残すのは、利用者に見せた本文（`front` の回答の `message`）だけです。
+
+---
+
+## 利用者に選んでもらう（中断と再開）
+
+書名がはっきりしない依頼では、`librarian` が `identify_title` で蔵書を探します。候補が複数あれば、どれのことかを利用者に選んでもらいます。LLM に推測させると、利用者の求めていない方で話が進むためです。
+
+```bash
+python cli.py "『銀河鉄道』を予約したい。会員番号はM-001"
+```
+
+```
+  [引数] identify_title(keyword=銀河鉄道)
+  ▷ 「銀河鉄道」に当たる蔵書を探しています...
+
+================================================================
+利用者に選んでもらう（依頼はここで止まっている）
+================================================================
+「銀河鉄道」に当たる本が2冊あります。どれのことですか？
+  1. 銀河鉄道の夜
+  2. 銀河鉄道の父
+
+状態を保存しました: sample_suspended.json
+続けるには: python cli.py --answer 番号（候補に無い返答は文で渡す）
+```
+
+**プロセスはここで終わります。** 答えを待ちません。サーバーで動かす場合も、答えは別のリクエストで届くので、同じ形にしています。
+
+```bash
+python cli.py --answer 2
+```
+
+```
+続き: 「銀河鉄道」に当たる本が2冊あります。どれのことですか？
+答え: 銀河鉄道の父
+  [memory_diff] librarian / memory_update / 1回目 / 適用
+      vars[…] 銀河鉄道の父
+      …
+  [引数] check_stock(title=銀河鉄道の父)
+```
+
+### 止めるのは tool の本体
+
+```python
+# library/tools.py の identify_title
+suspend(
+    {
+        "question": f"「{keyword}」に当たる本が{len(found)}冊あります。どれのことですか？",
+        "options": found,
+    }
+)
+```
+
+`suspend()` を呼ぶと、tool だけでなく依頼全体が止まります。止まった時点では、`front` が `librarian` の回答を待ち、`librarian` が `identify_title` の結果を待っています。**この「誰が誰を待っているか」ごと保存されます。**
+
+再開すると、利用者の答えがそのまま `identify_title` の結果として `librarian` へ届きます。関数は呼び直されません。止まるまでに終わったもの（規程の検索、会員区分の取得、依頼の審査）も、もう一度は走りません。
+
+```
+── 1回目の起動 ──
+front      function_call    librarian へ委譲（⑤の審査を通る）
+  └ search_rules と fetch_member_status（初期tool）
+librarian  initial_memory   書名を確定するタスクを立てる
+librarian  function_call    identify_title("銀河鉄道") → 候補が2冊 → 止まる
+                            状態を保存して、プロセスを終える
+── 2回目の起動（--answer 2） ──
+                            新しい Network に状態を戻し、答えを渡して再開
+librarian  memory_update    結果（利用者が選んだ『銀河鉄道の父』）を評価する
+librarian  function_call    check_stock → issue_reservation
+librarian  answer           status を返す
+front      function_call    記憶を読んで利用者へ答える
+```
+
+`suspend()` に渡す値は、利用者に見せるものです。状態ごと保存されるので、JSON にできる形にします。候補を書名だけにしているのは、選ばれた候補がそのまま結果になり、`check_stock` へ渡るためです。結果の読み方（選ばれた書名が返る、候補に無い返答は利用者の意向として読む）は、`tools.yaml` の `evaluation` に書いてあります。
+
+### 番号は候補の文字列に直して渡す
+
+`--answer 2` の「2」は、`Suspension.resolve` が「銀河鉄道の父」に直してから渡します。番号のまま渡すと、`librarian` には「2」という結果しか見えません。候補に無い返答（「やっぱりやめる」など）は、そのまま渡ります。
+
+### 続きは新しい Network で
+
+```python
+# library/session.py の LibrarySession.answer
+net = build_network(build_interceptor(self.cost))
+net.load_state(suspension.state)   # 戻すだけで、動かさない
+result = net.resume(answers={suspension.point: choice})
+```
+
+止まった時の Network を取っておけば、`resume()` だけで続けられます。それでも作り直すのは、答えが届くのが別のリクエストだからです。サーバーなら、別のプロセス（別の台）に届くこともあります。3つの入口とも、同じ形にそろえています。
+
+保存した状態に、設定は入りません。止まっている間に `config/` や `prompts/` を直すと、再開後は直した設定で動きます。
+
+### 入口ごとの答え方
+
+| 入口 | 止まった時 | 答え方 |
+|---|---|---|
+| `cli.py` | 候補を出し、`sample_suspended.json` へ保存して終わる | `python cli.py --answer 2`（候補に無い返答は文で渡す） |
+| `chat.py` | 候補を出し、次の入力を待つ | 次の入力（番号か返答の文） |
+| `api.py` | 応答の `options` に候補が入る（`awaiting_reply` は `true`） | 同じ `session_id` で、次の `POST /chat` の `message` に入れる |
+
+`chat.py` と `api.py` は、止まっている間の発言を `answer()` へ、それ以外を `ask()` へ渡します。利用者の側から見ると、受付に聞き返された時と同じで、次に話せば続きます。
+
+```python
+reply = session.answer(message) if session.suspension else session.ask(message)
+```
+
+### 同時に2か所で止まったら
+
+同じ生成で `identify_title` が2回呼ばれると、2か所で同時に止まります。サンプルは1つ目だけを聞いて再開します。答えなかった所は再開した時に実行し直され、また止まるので、1つずつ聞くことになります。
+
+### 会話履歴へ入れるのは、終わってから
+
+止まっている間、このターンの発言（依頼、尋ねたこと、選んだ答え）は会話履歴へ入れず、`Suspension.turn` に置きます。依頼が終わった時に、まとめて足します。
 
 ---
 
@@ -666,6 +788,7 @@ Network を使い回さないのは、1つの Network が1リクエスト分の�
 | 深夜特急を予約したい。会員番号はM-999 | 形式は正しいが実在しない会員 |
 | 広辞苑を予約したい。会員番号はM-001 | 禁帯出（館内閲覧のみ） |
 | 銀河鉄道の夜を予約したい。会員番号はM-001 | 在架のもの |
+| 『銀河鉄道』を予約したい。会員番号はM-001 | 候補を選んでもらう（中断と再開）。`cli.py` は `--answer 番号` で続ける |
 | M-001さんに督促メールを送って | ツール名で止まる（①） |
 | 深夜特急の返却予定日を教えて | 蔵書の照会だけで済む依頼 |
 | 貸出の理由を教えて | 規程に書かれていないことを聞く |
@@ -752,6 +875,8 @@ knowledgeは常にプロンプトの中に流し込まれるので、細かい�
 
 `session.py` / `carry_over.py` と3つの入口は、受付のエージェントの名前（`front`）と、引き継ぐ項目を合わせれば、そのまま使えます。審査役を使わないなら `guard/` と `Guard` は消して構いません。
 
+利用者に選んでもらうツールを足すときは、`suspend()` に渡す形（`question` と `options`）を `identify_title` に合わせます。`LibrarySession` がその形を読んで、利用者へ見せます。
+
 設定を書き間違えると、組み立ての時点で、何がどこで違うかをまとめてエラーにします。
 
 ---
@@ -764,9 +889,9 @@ knowledgeは常にプロンプトの中に流し込まれるので、細かい�
 | 2 | `library/config/agents.yaml` | フィールドの使い分け、委譲の引数を構造で決める（`input_schema`）、回答を状態だけにする（`output_schema`） |
 | 3 | `library/config/tools.yaml` | 初期toolを `tools` へ登録するかしないかの判断、`execution_message` |
 | 4 | `library/prompts/` と `library/knowledge/` | 人格定義、結果の読み方（`evaluation`）、共通ナレッジ |
-| 5 | `library/tools.py` | ツールが返す辞書の形 |
+| 5 | `library/tools.py` | ツールが返す辞書の形と、依頼を止める所（`identify_title`） |
 | 6 | `library/network.py` | 設定からの組み立てと、審査役の配置 |
 | 7 | `library/guard/` と `observers.py` の `Guard` | 実行を止める5つの場所 |
 | 8 | `observers.py` の `build_interceptor()` | 何を観測しているか |
-| 9 | `library/session.py` と `carry_over.py` | ターンの区切り方と引き継ぎ |
+| 9 | `library/session.py` と `carry_over.py` | ターンの区切り方と引き継ぎ、止まった依頼の保存と再開 |
 | 10 | `cli.py` / `chat.py` / `api.py` | 呼び出し方 |

@@ -29,6 +29,7 @@ build/
 
 # Local state & logs
 **/sample_carry_over.json
+**/sample_suspended.json
 *.log
 
 # OS generated files

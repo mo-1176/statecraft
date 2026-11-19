@@ -4,6 +4,9 @@
     python chat.py
     python chat.py --fresh    # 前回の記憶を引き継がずに始める
 
+利用者に候補を選んでもらう所で依頼が止まったら、候補を出して次の入力を待つ。
+次の入力（番号か返答の文）がその答えになり、止まった所から続く。
+
 exit で終わる（Ctrl+C / Ctrl+D でも終わる）。終えた時点の記憶を sample_carry_over.json へ
 保存し、次に起動したときに引き継ぐ（cli.py と同じファイル）。
 """
@@ -43,13 +46,17 @@ def main() -> None:
             break
 
         try:
-            reply = session.ask(message)
+            # 依頼が途中で止まっていれば、この発言はその答え
+            reply = session.answer(message) if session.suspension else session.ask(message)
         except Exception as e:  # noqa: BLE001
-            # 1ターンの失敗で会話を終わらせない。履歴と記憶は失敗する前のまま残る。
+            # 1ターンの失敗で会話を終わらせない。履歴と記憶は失敗する前のまま残る
+            # （止まっていた依頼も残るので、もう一度答えられる）。
             print(f"\n失敗しました: {type(e).__name__}: {e}")
             continue
 
         print(f"\n受付> {reply.message}")
+        for number, option in enumerate(reply.options, 1):
+            print(f"  {number}. {option}")
 
     session.cost.report()
 

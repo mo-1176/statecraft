@@ -7,6 +7,8 @@ LLMに見せる説明（summary / usage / evaluation）と引数のスキーマ�
 
 import time
 
+from statecraft import suspend
+
 RULES = """
 【貸出】
 一般利用者は1人あたり同時に5冊まで、貸出期間は14日間。
@@ -32,10 +34,12 @@ MEMBERS = {
 }
 
 STOCK: dict[str, dict[str, str | None]] = {
-    "深夜特急": {"所在": "3階 旅行記", "状態": "貸出中", "返却予定": "2026-09-10"},
-    "銀河鉄道の夜": {"所在": "2階 日本文学", "状態": "在架", "返却予定": None},
+    "深夜特急": {"著者": "沢木耕太郎", "所在": "3階 旅行記", "状態": "貸出中", "返却予定": "2026-09-10"},
+    "銀河鉄道の夜": {"著者": "宮沢賢治", "所在": "2階 日本文学", "状態": "在架", "返却予定": None},
+    # 「銀河鉄道」で探すと上と2冊になる。利用者に選んでもらう（identify_title）確認に使う
+    "銀河鉄道の父": {"著者": "門井慶喜", "所在": "2階 日本文学", "状態": "貸出中", "返却予定": "2026-12-10"},
     # 禁帯出資料。予約もできないため、審査で止まることの確認に使う
-    "広辞苑": {"所在": "1階 参考図書", "状態": "館内閲覧のみ", "返却予定": None},
+    "広辞苑": {"著者": "新村出 編", "所在": "1階 参考図書", "状態": "館内閲覧のみ", "返却予定": None},
 }
 
 
@@ -61,6 +65,35 @@ def fetch_member_status(member_id: str) -> dict:
     # memoryへは入れない。区分は「一般」「学生」のどちらかで、
     # 受付番号のように一字一句を保たないと無意味になる値ではないため。
     return {"value": f"会員番号 {member_id} の区分: {category}"}
+
+
+def identify_title(keyword: str) -> dict:
+    """
+    書名の一部や著者名から蔵書を探し、書名を1つに確定する。
+
+    候補が複数あれば、どれのことかを利用者に選んでもらう。LLMに推測させると、
+    利用者の求めていない方で話が進む。suspend() を呼ぶと依頼全体がここで止まり、
+    利用者の答えがそのまま、このtoolの結果になる（再開しても、この関数は呼び直されない）。
+    """
+    found = [
+        title
+        for title, info in STOCK.items()
+        if keyword in title or keyword in (info["著者"] or "")
+    ]
+    if not found:
+        return {"value": f"「{keyword}」に当たる蔵書は見つかりませんでした。"}
+    if len(found) == 1:
+        return {"value": f"書名は『{found[0]}』です（著者: {STOCK[found[0]]['著者']}）。"}
+
+    # 渡す値は、入口が利用者へ見せるもの。状態ごと保存されるので、JSONにできる形にする。
+    # 候補は書名だけにする。選ばれた候補がそのまま結果になり、check_stock へ渡るため。
+    suspend(
+        {
+            "question": f"「{keyword}」に当たる本が{len(found)}冊あります。どれのことですか？",
+            "options": found,
+        }
+    )
+    return {"value": ""}  # ここには来ない。suspend() は止まったまま戻らない
 
 
 def check_stock(title: str) -> dict:
