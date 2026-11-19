@@ -585,6 +585,19 @@ class BaseLLM(ABC):
             return "unavailable"
         return "other"
 
+    def dump_reply(self, reply: Any) -> Any:
+        """
+        継承する思考（LLMResponse.reply）を、中断した状態へ保存できる形にする。
+
+        既定はそのまま返す。OpenAILLMのreplyは最初からdictの配列なので、これで足りる。
+        SDKのオブジェクトをreplyに入れるプロバイダは、load_replyと対で上書きする。
+        """
+        return reply
+
+    def load_reply(self, data: Any) -> Any:
+        """dump_replyの逆。保存した形から、generate()へ送り返せるreplyへ戻す。"""
+        return data
+
     @abstractmethod
     def generate(
         self,
@@ -663,6 +676,15 @@ class GeminiLLM(BaseLLM):
                 vertexai=True, project=self._project_id, location=self._location
             )
         return genai.Client(api_key=self._api_key)
+
+    def dump_reply(self, reply: Any) -> Any:
+        """
+        replyはSDKのContent。思考の署名（bytes）はmode="json"でbase64の文字列になる。
+        """
+        return reply.model_dump(mode="json", exclude_none=True)
+
+    def load_reply(self, data: Any) -> Any:
+        return types.Content.model_validate(data)
 
     def _build_thinking_config(self, thought_level: ThoughtLevel | None):
         """

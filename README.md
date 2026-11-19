@@ -26,6 +26,7 @@ LLMの能力を引き出し、軽量モデルでも自律的に多くのタス�
   - [プロンプトキャッシュ](#プロンプトキャッシュ)
 - [Network](#network) — 共有記憶と配線の単位
   - [Agentを使い回す](#agentを使い回す--reset)
+  - [中断と再開](#中断と再開--suspend--save_state--load_state--resume)
   - [よくある構成](#よくある構成)
 - [Interceptor](#interceptor) — 観測と、実行前の判定
 - [設定ファイルを使わずに組む](#設定ファイルを使わずに組む) — Python のコードだけで組み立てる
@@ -1202,6 +1203,8 @@ net = NetworkBuilder.from_dir(ROOT, interceptor, tools=[LIBRARY_TOOLS]).build() 
 net = Network(agents=[front, librarian], interceptor=ic)   # コードで組む場合
 
 net.respond(agent="front", message="...")  # 利用者からの依頼。トークン数は委譲先と監査役を含む全体
+net.resume(answers={point: "..."})  # 中断した依頼を続きから（→ 中断と再開）
+net.save_state() / net.load_state(state)  # 中断した依頼をJSONにできるdictで取り出す／戻す
 net.get("front")  # net["front"] でも同じ
 net.total_tokens()  # (入力, 出力)
 net.token_usage()  # {"front": (入力, 出力), ...}
@@ -1249,6 +1252,34 @@ net.shared_memory.ontology = carried   # 前のターンから引き継ぐもの
 サンプルは作り直す側です。`session.py` がターンごとに `build_network()` を呼び、持ち越すのは会話履歴と `CarryOver` だけにしています。設定も毎回読み直されるので、プロンプトを直すと次のターンから効きます。
 
 Agent単体で使っている場合は `agent.reset()` があります（そのAgent1体分だけを戻します。共有記憶は触りません）。
+
+### 中断と再開 — suspend / save_state / load_state / resume
+
+toolの本体か `before_execute` のコールバックで `suspend(payload)` を呼ぶと、依頼全体がそこで止まり、`respond()` は `Suspended` を返します。利用者に候補を選んでもらう、承認を取る、といったヒューマンインザループに使います。
+
+```python
+from statecraft import Suspended, suspend
+
+def present_candidates(query: str) -> dict:
+    suspend({"candidates": search(query)})   # ここで依頼全体が止まる
+    return {"value": ""}
+
+result = net.respond(agent="front", message="EQを選びたい")
+if isinstance(result, Suspended):
+    store.put(key, net.save_state())         # 保存先は利用側が決める
+
+net = build_network()                        # 別のプロセスでもよい。同じ名前で組む
+net.load_state(store.get(key))               # 戻すだけで、動かさない
+result = net.resume(answers={result.pending[0].point: "EQ-B"})
+```
+
+**再生ではなく、文字通りの中断と再開です。** 中断までに終わった呼び出しは実行し直さず、委譲先の中で止まっても、誰が誰の結果を待っていたかごと続きから進みます。エージェントは互いを関数として呼ばず、Networkが起動の表で親子を持っているためです（→ [ADR 0004](docs/adr/0004-runs-as-table.md)）。
+
+- toolの本体で止まった場合は、渡した答えがそのtoolの結果になります。`before_execute` で止まった場合は、判定し直して、そこの `suspend()` が答えを返します（承認向き）。
+- 保存するのは実行して変わったもの（記憶、起動の途中の状態、継承する思考、起動の表）だけです。設定は含まないので、プロンプトを変えたNetworkへ戻して、途中から1体だけを試すこともできます。
+- toolの戻り値と `suspend()` に渡す値は、JSONにできる形にします。
+
+詳しくは [reference/network.md](docs/reference/network.md) の「中断と再開」を見てください。
 
 ### 渡すと共有記憶が入る
 
@@ -2090,7 +2121,7 @@ Geminiでの1往復、委譲、初期ツール、入力/出力スキーマ、実
 
 **未検証**
 
-OpenAI / Azure OpenAI / Claude のプロバイダ実装（Azure OpenAI は、本物の SDK からローカルの代役サーバーへ送り、接続先・認証・キャッシュの区切りの扱いまで確認済み）、思考の継承（Gemini と OpenAI〔gpt-6-luna〕では、サンプルの図書館を通しで動かし、委譲・tool・記憶の更新・ReflexAgent を含めて API が受け付けることまで確認済み。Azure OpenAI は未確認。回答が良くなるかは未検証）、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）、記憶の更新の監査（before_memory_diff。FakeLLMでのみ確認）、組み込みの監査役（enable_auditor。FakeLLMでのみ確認）、MCPサーバーのツール（McpTools。偽のサーバーでのみ確認。接続の部分は plugin-scout で mcp 2.3.0 の見本のサーバーに対して確認した時のもの）、最終回答だけに渡すナレッジ（answer_knowledge。FakeLLMでのみ確認）
+OpenAI / Azure OpenAI / Claude のプロバイダ実装（Azure OpenAI は、本物の SDK からローカルの代役サーバーへ送り、接続先・認証・キャッシュの区切りの扱いまで確認済み）、思考の継承（Gemini と OpenAI〔gpt-6-luna〕では、サンプルの図書館を通しで動かし、委譲・tool・記憶の更新・ReflexAgent を含めて API が受け付けることまで確認済み。Azure OpenAI は未確認。回答が良くなるかは未検証）、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）、記憶の更新の監査（before_memory_diff。FakeLLMでのみ確認）、組み込みの監査役（enable_auditor。FakeLLMでのみ確認）、MCPサーバーのツール（McpTools。偽のサーバーでのみ確認。接続の部分は plugin-scout で mcp 2.3.0 の見本のサーバーに対して確認した時のもの）、最終回答だけに渡すナレッジ（answer_knowledge。FakeLLMでのみ確認）、中断と再開（suspend / save_state / load_state / resume。FakeLLMでのみ確認。Geminiの継承する思考の保存は、SDKの型でJSONを往復することまで確認）
 
 ---
 

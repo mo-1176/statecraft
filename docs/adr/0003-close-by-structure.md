@@ -61,6 +61,6 @@
 ## 関連
 
 - `src/statecraft/memory.py` の `build_diff_schema`、`apply_diff`、`_upsert`
-- `src/statecraft/agent.py` の `_select_invokables`、`_execute_calls`、`_stale_task_errors`、`_update_memory`
+- `src/statecraft/agent.py` の `_select_invokables`、`_plan_calls`、`_stale_task_errors`、`_update_memory`
 - README の「機械的に塞げるものは、必ず機械的に塞いでください」の表
 - [concepts/failure-handling.md](../concepts/failure-handling.md)

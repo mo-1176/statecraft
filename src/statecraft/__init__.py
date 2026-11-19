@@ -68,6 +68,8 @@ from .mcp import McpTools
 from .memory import MemoryEntry, PrivateMemory, SharedMemory, TaskEntry, TaskStatus
 from .network import Network
 from .prompts import Phase
+from .runtime import Pending, Suspended
+from .suspension import suspend
 from .tool_sources import LocalTools, ToolSource
 from .tools import SchemaTool, Tool, ToolResult
 
@@ -118,6 +120,7 @@ __all__ = [
     "NetworkConfig",
     "NetworkState",
     "OpenAILLM",
+    "Pending",
     "Phase",
     "PrivateMemory",
     "ReflexAgent",
@@ -128,6 +131,7 @@ __all__ = [
     "SchemaTool",
     "SharedMemory",
     "StepTime",
+    "Suspended",
     "TaskEntry",
     "TaskStatus",
     "ThoughtLevel",
@@ -136,6 +140,7 @@ __all__ = [
     "ToolResult",
     "ToolSource",
     "__version__",
+    "suspend",
 ]
 
 

@@ -38,6 +38,7 @@ ADR（Architecture Decision Record）は、設計で決めたことを1件1フ�
 | [0001](0001-memory-centered-prompt.md) | 記憶を中心に、毎回プロンプトを組み立て直す | 採用（下書き） |
 | [0002](0002-own-tool-loop.md) | ループを自前で持ち、ツールの説明を載せる時を分ける | 採用（下書き） |
 | [0003](0003-close-by-structure.md) | 禁止を積まず、構造で閉じる | 採用（下書き） |
+| [0004](0004-runs-as-table.md) | 起動の親子を、コールスタックではなく表で持つ | 採用 |
 
 ## ADR の候補
 

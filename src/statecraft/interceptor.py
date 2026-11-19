@@ -42,6 +42,7 @@ from .events import (
     RespondEndEvent,
     RespondStartEvent,
 )
+from .suspension import Suspend
 
 logger = logging.getLogger(__name__)
 
@@ -442,6 +443,12 @@ class Interceptor:
                     logger.exception(
                         "通知コールバックが例外を送出しました: event=%s", event
                     )
+                except Suspend:
+                    # 通知は実行のあらゆる所から流れるので、ここで止めると
+                    # 再開できる場所（toolの呼び出し）の外で止まる。
+                    logger.error(
+                        "通知コールバックからは中断（suspend）できません: event=%s", event
+                    )
 
     def _decide_retry(
         self, event: str, payload: GenerationFailedEvent
@@ -537,12 +544,18 @@ class Interceptor:
         失敗が通る）。拒否の理由は、返された判定からそのまま持ち帰る。
 
         判定だけのロックを取るので、人の承認を待つあいだも通知は流れ続ける。
+
+        コールバックが中断（suspend）した場合は、判定の中で止まった印を付けて
+        そのまま外へ出す。再開時はこの判定からやり直し、同じ所のsuspend()が答えを返す。
         """
         with self._check_lock:
             self._stamp(payload)
             for callback in self._listeners.get(event, []):
                 try:
                     verdict = callback(payload)
+                except Suspend as s:
+                    s.at = "before_execute"
+                    raise
                 except Exception:
                     logger.exception(
                         "判定コールバックが例外を送出しました: event=%s", event

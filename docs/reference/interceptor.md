@@ -110,6 +110,7 @@ guard と recover は、**決まった型で返します。** `True` や文字�
 | やりたいこと | 使うもの |
 |---|---|
 | 危ない実行を止める | `guard.before_execute` |
+| 実行の前に人の承認を取る | `guard.before_execute` の中で `suspend()` を呼ぶ。依頼全体が止まり、`resume()` で渡した答えをその `suspend()` が返す（→ [network.md](network.md#中断と再開--suspend--save_state--load_state--resume)） |
 | 予算の上限を効かせる、軽いモデルへ落とす | `guard.before_generate` |
 | 一時的な過負荷（503）で待って再試行する、枠切れ（429）で別のモデルへ逃がす | `recover.generation_failed`（`event.kind` が `"unavailable"` / `"rate_limit"` / `"other"` で見分ける） |
 | 記憶の更新の向き（やりすぎ・早すぎる打ち切り・脱線）を監査する | `guard.before_memory_diff`（組み込みの監査役で足りるなら、Network の `enable_auditor`。→ [network.md](network.md#監査役を付ける--enable_auditor)） |
@@ -130,7 +131,7 @@ LLM に審査させる方法だけに頼るのは危険です。審査役も LLM
 | 実在するか | ツール本体で確かめる。形式のチェックは、形を真似た値を通す |
 | 権限・所有者 | ツール本体で確かめる。LLM の判断に委ねない |
 | 実行できる時間帯・回数 | `before_execute` の中で外部の状態を見る |
-| 取り返しがつかない操作 | 人の承認を挟む |
+| 取り返しがつかない操作 | 人の承認を挟む（`before_execute` の中で `suspend()`） |
 
 LLM の審査が効くのは、機械的な条件では書けないものだけです。上の表で塞げるものを塞いだ後、残りに重ねる層として使ってください。審査役・監査役は、監視される Network に入れません（→ [concepts/network-placement.md](../concepts/network-placement.md#network-の外に置くもの)）。
 
