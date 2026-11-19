@@ -1,6 +1,7 @@
 import copy
 import threading
 import time
+from typing import Any
 
 from .agent import Agent, AgentResponse, ReflexAgent
 from .auditor import AUDITOR_NAME, Auditor, AuditorSettings
@@ -8,6 +9,8 @@ from .events import AgentState, GeneratedEvent, NetworkState, StepTime
 from .interceptor import Interceptor
 from .memory import MemoryEntry, SharedMemory
 from .prompts import Phase
+from .runtime import Pending, Runtime, Suspended
+from .state import STATE_VERSION, dump_memory, restore_memory
 
 
 class Network:
@@ -29,8 +32,25 @@ class Network:
       5. 配線の誤りを構築時に落とす（存在しない委譲先、循環、初期toolの引数不整合）
       6. enable_auditorを渡せば、監査役を全Agentの記憶の更新へ繋ぐ（auditor.py）
       7. どのイベントにも、その時点のネットワークの状態（NetworkState）を付ける
+      8. 依頼を起動の表（runtime.py）で進め、中断したら保存・復元・再開の入口を持つ
 
     llmは配らない。接続先はAgentごとに違うのが前提のため。
+
+    【中断と再開】
+    toolの本体かbefore_executeのコールバックがsuspend()を呼ぶと、respond()は
+    Suspendedを返す。同じプロセスならそのままresume()で続けられる。プロセスを
+    またぐなら、状態を取り出して保存し、同じ設定で組んだNetworkへ戻す。
+
+        result = net.respond(agent="front", message="...")
+        if isinstance(result, Suspended):
+            store.put(key, net.save_state())          # 保存先は利用側が決める
+
+        net = build_network()                          # 別のプロセスでもよい
+        net.load_state(store.get(key))                 # 戻すだけで、動かさない
+        result = net.resume(answers={result.pending[0].point: "候補B"})
+
+    保存するのは実行して変わったもの（記憶・起動の途中の状態・起動の表）だけで、
+    設定は含めない。読み込む側のNetworkは、エージェントとtoolの名前を揃えて組む。
     """
 
     def __init__(
@@ -62,6 +82,13 @@ class Network:
         # net.respond()を始めた時刻。状態のelapsedはここから数える。
         self._started: float | None = None
         self.interceptor._attach_state(self._state)
+
+        # 進めている依頼の起動の表。依頼が終われば捨て、中断している間は残る。
+        self._runtime: Runtime | None = None
+        # 依頼を始めた時点のトークン累計（中断をまたいでも、依頼全体の消費を返すため）
+        self._tokens_at_start: tuple[int, int] = (0, 0)
+        # 中断した時点の経過秒数。再開したらここから数え直す。
+        self._elapsed = 0.0
 
         self._wire()
         self._resolve_sub_agents()
@@ -297,6 +324,9 @@ class Network:
         with self._usage_lock:
             self._usage = {}
         self._started = None
+        self._runtime = None
+        self._tokens_at_start = (0, 0)
+        self._elapsed = 0.0
 
         # 新しい共有記憶と、_source_toolsから複製し直したtoolを配る
         # （設定としてのdisabledだけが残る）。
@@ -309,7 +339,7 @@ class Network:
         message: str,
         history: list[dict] | None = None,
         blobs: list[dict] | None = None,
-    ) -> AgentResponse:
+    ) -> AgentResponse | Suspended:
         """
         利用者からの依頼を、名前で指したエージェント（窓口）へ渡す。
 
@@ -321,17 +351,138 @@ class Network:
 
         全体の増えた分で数えるので、同じNetworkで同時に2つの依頼を走らせると
         混ざる（共有の記憶も混ざるので、そもそも同時には使わない）。
+
+        途中でsuspend()が呼ばれたら、そこで止まってSuspendedを返す
+        （中断している地点の一覧を持つ）。続きはresume()で進める。
         """
         self._started = time.perf_counter()
-        before_in, before_out = self.total_tokens()
-        response = self.get(agent).respond(message=message, history=history, blobs=blobs)
+        self._tokens_at_start = self.total_tokens()
+        self._runtime = Runtime()
+        self._runtime.begin_respond(
+            self.get(agent),
+            message=message,
+            history=list(history or []),
+            blobs=list(blobs or []),
+        )
+        return self._drive()
+
+    def resume(self, answers: dict[str, Any] | None = None) -> AgentResponse | Suspended:
+        """
+        中断した依頼を続きから進める。戻り値はrespond()と同じ（また止まることもある）。
+
+            answers={pending.point: 答え}
+
+        答えの扱いは、どこで止まったか（Pending.at）で変わる。
+
+          tool           … 答えがそのtoolの結果になる（実行し直さない）。
+                           ToolResultを渡せば、失敗や記憶への書き込みも渡せる
+          before_execute … 同じ呼び出しを判定し直し、そこのsuspend()が答えを返す
+
+        答えなかった地点は、実行し直す（同じ所でまた止まることもある）。
+        依頼全体のトークン数は、中断する前の分も含めて返す。
+        """
+        if self._runtime is None:
+            raise RuntimeError(
+                "再開する依頼がありません。resume()は、respond() / resume() が"
+                "Suspendedを返した後か、load_state()の後に呼びます。"
+            )
+        self._runtime.answer(answers or {})
+        self._started = time.perf_counter() - self._elapsed
+        return self._drive()
+
+    def _drive(self) -> AgentResponse | Suspended:
+        """起動の表を進め、終われば依頼全体の消費を添えて返す。"""
+        assert self._runtime is not None
+        try:
+            outcome = self._runtime.drive()
+        except BaseException:
+            # 途中で例外が出た依頼は再開できない（表と各Agentの状態が揃っていない）。
+            self._runtime = None
+            raise
+        if isinstance(outcome, Suspended):
+            self._elapsed = time.perf_counter() - (self._started or time.perf_counter())
+            return outcome
+
+        self._runtime = None
         after_in, after_out = self.total_tokens()
+        before_in, before_out = self._tokens_at_start
         return AgentResponse(
-            text=response.text,
-            steps=response.steps,
+            text=outcome.text,
+            steps=outcome.steps,
             input_tokens=after_in - before_in,
             output_tokens=after_out - before_out,
         )
+
+    @property
+    def pending(self) -> list[Pending]:
+        """
+        中断している地点。load_state()で戻した後に、利用者へもう一度見せる時に使う。
+        中断していなければ空。
+        """
+        return self._runtime.pending() if self._runtime else []
+
+    # ---- 中断した依頼の保存と復元 ----
+    def save_state(self) -> dict:
+        """
+        中断している依頼の状態を、JSONにできる形で取り出す。保存先は利用側が決める。
+
+        入るのは実行して変わったものだけ（共有の記憶、各Agentの記憶と起動の途中の
+        状態、継承する思考、起動の表、消費の集計）。toolの戻り値とsuspend()に渡した
+        値も入るので、JSONにできない値が入っているとTypeErrorになる。
+        """
+        if self._runtime is None:
+            raise RuntimeError(
+                "中断している依頼がありません。save_state()は、respond() / resume() が"
+                "Suspendedを返した後に呼びます。"
+            )
+        with self._usage_lock:
+            usage = {name: _dump_usage(used) for name, used in self._usage.items()}
+        return {
+            "version": STATE_VERSION,
+            "shared_memory": dump_memory(self.shared_memory),
+            "agents": {name: agent._dump_state() for name, agent in self.agents.items()},
+            "runtime": self._runtime.dump(),
+            "usage": usage,
+            "auditor": None
+            if self._auditor is None
+            else [self._auditor.total_input_tokens, self._auditor.total_output_tokens],
+            "tokens_at_start": list(self._tokens_at_start),
+            "elapsed": self._elapsed,
+        }
+
+    def load_state(self, state: dict) -> None:
+        """
+        save_state()で取り出した状態へ戻す。戻すだけで、動かさない（resume()で動く）。
+
+        このNetworkの今の状態は捨てる（reset()してから書き戻す）。エージェントと
+        toolは名前で結び直すので、同じ名前で組んだNetworkへ読み込む。人格定義や
+        プロンプトを変えて組み直したNetworkへ戻すこともできる（変えた後の設定で
+        続きが動く）。読み込みに失敗した場合は、reset()した状態で残る。
+        """
+        if state.get("version") != STATE_VERSION:
+            raise ValueError(
+                f"保存した状態の版（{state.get('version')}）が、このstatecraftの版"
+                f"（{STATE_VERSION}）と違うため読み込めません。"
+            )
+        if unknown := set(state["agents"]) - set(self.agents):
+            raise ValueError(
+                f"保存した状態にあるエージェントが、このNetworkにありません: {sorted(unknown)}"
+            )
+
+        self.reset()
+        restore_memory(self.shared_memory, state["shared_memory"])
+        for name, data in state["agents"].items():
+            self.agents[name]._load_state(data)
+        with self._usage_lock:
+            self._usage = {name: _load_usage(used) for name, used in state["usage"].items()}
+        if self._auditor is not None and state["auditor"] is not None:
+            (
+                self._auditor.total_input_tokens,
+                self._auditor.total_output_tokens,
+            ) = state["auditor"]
+        self._tokens_at_start = (state["tokens_at_start"][0], state["tokens_at_start"][1])
+        self._elapsed = state["elapsed"]
+        self._runtime = Runtime.load(state["runtime"], self.agents)
 
     # ---- イベントに付ける状態 ----
     def _state(self, event: object) -> NetworkState:
@@ -425,3 +576,41 @@ class Network:
                 self._auditor.total_output_tokens,
             )
         return usage
+
+
+# ---- イベントに付ける状態の積み上げを、保存できる形にする ----
+# 記憶（AgentState.memory）は保存しない。イベントを配る時に、その時点の記憶から作り直す。
+def _dump_usage(used: AgentState) -> dict:
+    return {
+        "input_tokens": used.input_tokens,
+        "output_tokens": used.output_tokens,
+        "cached_tokens": used.cached_tokens,
+        "cache_write_tokens": used.cache_write_tokens,
+        "seconds": used.seconds,
+        "steps": [
+            {
+                "run_id": s.run_id,
+                "step_no": s.step_no,
+                "seconds": {phase.value: sec for phase, sec in s.seconds.items()},
+            }
+            for s in used.steps
+        ],
+    }
+
+
+def _load_usage(data: dict) -> AgentState:
+    return AgentState(
+        input_tokens=data["input_tokens"],
+        output_tokens=data["output_tokens"],
+        cached_tokens=data["cached_tokens"],
+        cache_write_tokens=data["cache_write_tokens"],
+        seconds=data["seconds"],
+        steps=[
+            StepTime(
+                run_id=s["run_id"],
+                step_no=s["step_no"],
+                seconds={Phase(p): sec for p, sec in s["seconds"].items()},
+            )
+            for s in data["steps"]
+        ],
+    )

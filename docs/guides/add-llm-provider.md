@@ -79,6 +79,7 @@ API のエラーは、握りつぶさずに投げます。再試行するか、�
 
 - **対応しない場合:** `exchanges` が `None` 以外で来たら `NotImplementedError` を投げます。黙って無視すると、継承したつもりで1問1答になり、誰も気付けないためです。この提供元で動かすエージェントは、`carry_thoughts: false` にします。
 - **対応する場合:** 過去の生成（`Exchange`）を、思考の署名ごと会話として送り返します。応答の `reply` に提供元の出力そのものを入れ、エージェントに預けさせます。`GeminiLLM` と `OpenAILLM` の実装を見てください。
+  - `reply` に SDK のオブジェクトを入れるなら、`dump_reply()` / `load_reply()` も上書きします。中断した依頼を保存する時（`Network.save_state()`）に、預けた `reply` を JSON にできる形へ変える／戻すためです。既定はそのまま返すので、`OpenAILLM` のように最初から dict の配列を入れるなら不要です。`GeminiLLM` は `Content` を `model_dump(mode="json")` / `model_validate()` で往復させています。
 
 ## 5. 設定から使えるように登録する
 

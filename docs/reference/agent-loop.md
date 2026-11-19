@@ -11,7 +11,9 @@
 | `respond(message=, history=, blobs=)` | 利用側（人間からの入口） | 原文と会話履歴を共有の記憶の `conversation` に記録する。依頼は `conversation` から読む |
 | `execute(kwargs=, interceptor=)` | 他のエージェント（委譲） | `before_execute` を通る。最初の委譲なら、依頼を `requests` に記録する。終わったら回答を `agent_answers` に記録し、`ToolResult` で返す |
 
-`execute()` は `Tool.execute()` と同じ形なので、呼ぶ側から見ると、委譲先が tool でもエージェントでも同じに扱えます（`Invokable`）。同じ実体への `execute()` は、ロックで1件ずつに直列化されます。
+`execute()` は `Tool.execute()` と同じ形なので、呼ぶ側から見ると、委譲先が tool でもエージェントでも同じに扱えます（`Invokable`）。
+
+ただし Network の中では、エージェントが委譲先の `execute()` を関数として呼ぶことはありません。ループは tool / agent を呼ぶ所で**呼び出しの計画を返して手を離し**、実行は起動の表（`src/statecraft/runtime.py`）が受け持ちます。委譲先はその表に子の起動として足され、親は「バッチの何番目の結果を待っているか」というデータになります。同じエージェントの起動は、表の上で1件ずつ進みます（2件目は1件目が終わるまで待つ）。こうしてあるので、依頼を途中で中断して保存し、後で再開できます（→ [network.md](network.md) の「中断と再開」、[ADR 0004](../adr/0004-runs-as-table.md)）。`execute()` / `respond()` を直接呼ぶのは、エージェントを単体で動かす時です。
 
 ### 起動ごとに捨てるもの・残すもの
 
@@ -121,7 +123,7 @@ flowchart TD
 
 ## Agent と ReflexAgent の違い
 
-ループの本体（`_run_react`）は共通で、違いは途中の差し込み口（hook）の中身だけです。
+ループの本体（`_loop` / `_continue_after_batch`）は共通で、違いは途中の差し込み口（hook）の中身だけです。
 
 | | `Agent` | `ReflexAgent` |
 |---|---|---|

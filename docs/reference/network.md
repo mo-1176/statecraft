@@ -21,6 +21,7 @@ Network が持つのは、エージェント単体では決められない**配�
 4. Tool を複製する（あるエージェントの無効化が、他のエージェントや次のリクエストへ波及しないように）
 5. 配線の誤りを、構築した時点で落とす
 6. `enable_auditor` を渡せば、組み込みの監査役を全エージェントの記憶の更新へ繋ぐ
+7. 依頼を起動の表（`runtime.py`）で進め、中断した依頼の保存・復元・再開の入口を持つ（下の「中断と再開」）
 
 LLM の接続は配りません。接続先はエージェントごとに違うのが前提です。
 
@@ -110,11 +111,80 @@ net.respond(agent="front", message=...)
 
 | | 中身 |
 |---|---|
-| `net.respond(agent="name", message=..., history=..., blobs=...)` | 利用者からの依頼を、名前で指したエージェントへ渡す。返るトークン数は、委譲先と監査役を含むこの依頼の全体（`agent.respond()` は、そのエージェント自身の分だけ。単体で動かす時やテスト向け） |
+| `net.respond(agent="name", message=..., history=..., blobs=...)` | 利用者からの依頼を、名前で指したエージェントへ渡す。返るトークン数は、委譲先と監査役を含むこの依頼の全体（`agent.respond()` は、そのエージェント自身の分だけ。単体で動かす時やテスト向け）。途中で中断したら `Suspended` が返る |
+| `net.resume(answers={point: 答え})` | 中断した依頼を続きから進める。戻り値は `respond()` と同じ |
+| `net.save_state()` / `net.load_state(state)` | 中断した依頼の状態を、JSON にできる dict で取り出す／戻す（戻すだけで動かさない） |
+| `net.pending` | 中断している地点（`Pending`）の一覧。中断していなければ空 |
 | `net["name"]` / `net.get("name")` | エージェントを名前で取る。無ければ `KeyError` |
 | `net.shared_memory` | 共有の記憶の実体 |
 | `net.total_tokens()` | Network 全体の `(入力, 出力)` |
 | `net.token_usage()` | エージェントごとの `{"name": (入力, 出力)}`。監査役を付けていれば `auditor` も入る |
+
+---
+
+## 中断と再開 — suspend / save_state / load_state / resume
+
+tool の本体か、`before_execute` のコールバックで `suspend(payload)` を呼ぶと、依頼全体がそこで止まり、`respond()` は `Suspended` を返します。利用者の返事を待つ（ヒューマンインザループ）、承認を取る、途中の状態から特定のエージェントだけを試す、といった用途です。
+
+```python
+from statecraft import Suspended, suspend
+
+def present_candidates(query: str) -> dict:
+    suspend({"candidates": search(query)})   # 利用者に選んでもらう
+    return {"value": ""}                     # ここへは来ない
+```
+
+```python
+result = net.respond(agent="front", message="EQを選びたい")
+if isinstance(result, Suspended):
+    [pending] = result.pending               # pending.payload を画面へ出す
+    store.put(key, net.save_state())         # 保存先は利用側が決める（DB・Blob など）
+
+# 返事が来たら（別のプロセスでもよい）
+net = build_network()                        # 同じ名前のエージェントと tool で組む
+net.load_state(store.get(key))               # 戻すだけ。まだ動かない
+result = net.resume(answers={pending.point: "EQ-B"})
+```
+
+同じプロセスで続けるなら、`save_state()` / `load_state()` を挟まずに `resume()` を呼べます。
+
+### 答えの扱いは、どこで止まったかで変わる
+
+| `Pending.at` | 止まった所 | `resume()` で答えを渡すと | 答えなかったら |
+|---|---|---|---|
+| `"tool"` | tool の本体 | 答えがそのまま tool の結果になる。tool は実行し直さない（`ToolResult` を渡せば、失敗や `memory` も渡せる） | tool を実行し直す |
+| `"before_execute"` | `before_execute` のコールバック | 同じ呼び出しを判定し直し、そこで呼んだ `suspend()` が答えを返す | 判定し直す |
+
+承認なら `before_execute` で止めます。
+
+```python
+def confirm(e):
+    if e.name != "purchase":
+        return ExecuteDecision(ok=True)
+    answer = suspend({"confirm": e.kwargs})   # 再開すると、ここが答えを返す
+    return ExecuteDecision(ok=answer == "yes", reason="利用者が取りやめました")
+```
+
+### 何が保存されるか
+
+保存するのは、実行して変わったものだけです。設定（人格定義・プロンプト・tool・LLM の接続）は含めません。
+
+- 共有の記憶、各エージェントの個別の記憶
+- 各エージェントの起動の途中の状態（実行履歴、周回数、停滞の数え、無効化、抱えた添付）
+- 継承する思考（`carry_thoughts`。プロバイダの出力は `dump_reply()` で保存できる形にする）
+- 起動の表（どの起動が、どのバッチの何番目の結果を待っているか。中断までに終わった呼び出しの結果）
+- トークンの累計と、イベントに付ける集計
+
+読み込む側の Network は、**エージェントと tool の名前を揃えて**組みます。人格定義やプロンプトは変えてかまいません（変えた後の設定で続きが動きます）。途中の状態から1体だけを試すのに使えます。
+
+### 決まりごと
+
+- 中断できるのは、tool の本体と `before_execute` のコールバックだけです。生成や記憶の更新の途中（`before_generate` など）で呼ぶとエラーになります。通知（`notice`）のコールバックで呼んでも止まりません（ログに出るだけ）。
+- 並列に走っていた他の呼び出しは、終わるのを待ってから止まります。終わった呼び出しは、再開しても実行し直しません。
+- 2か所以上で同時に止まったら、`pending` に全部入ります。答えなかった地点は実行し直すので、また止まることがあります。
+- tool の戻り値と `suspend()` に渡す値は、JSON にできる形にします（`bytes` は自動で base64 にします）。できない値が入っていると、`save_state()` が `TypeError` になります。
+- エージェントを単体で動かした時（`agent.respond()` / `agent.execute()`）は中断できません。保存して再開する入口が Network にしか無いためです。
+- 仕組みと、なぜこの形にしたかは [ADR 0004](../adr/0004-runs-as-table.md) にあります。
 
 ---
 

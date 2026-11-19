@@ -5,6 +5,7 @@ google-genaiの型（ただのデータ）で応答を組み、送ったリク�
 CIはSDKを入れないので、google-genaiが無い環境では飛ばす。
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -124,3 +125,14 @@ def test_結果の数が合わなければ送らない(make_llm):
         generate(llm, exchanges=[Exchange(prompt="[function_call]", reply=reply)])
 
     assert models.requests == []
+
+
+# ---- 中断した状態への保存 ----
+def test_中断の保存で思考の署名ごと往復する():
+    """署名はbytes。JSONを通しても、送り返せる元のContentへ戻ること。"""
+    llm = GeminiLLM(api_key="test")
+    reply = types.Content(role="model", parts=[search_call(b"\x00\xffsig")])
+
+    saved = json.loads(json.dumps(llm.dump_reply(reply)))
+
+    assert llm.load_reply(saved) == reply

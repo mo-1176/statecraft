@@ -44,6 +44,6 @@ API の往復に任せると、次のことが起きる。
 
 ## 関連
 
-- `src/statecraft/agent.py` の `_select_invokables`、`_run_react`、`ToolHistoryEntry.render` / `outcome`
+- `src/statecraft/agent.py` の `_select_invokables`、`_loop`、`ToolHistoryEntry.render` / `outcome`
 - `src/statecraft/tools.py` の `to_declaration`、`to_catalog_line`
 - [reference/tool.md](../reference/tool.md)、[concepts/knowledge.md](../concepts/knowledge.md)

@@ -7,12 +7,19 @@ ReflexAgentはAgentを継承し、記憶に関わるhookを空にするだけ。
 【1回の応答で何が起きるか】
     respond() または execute()
       → _begin_run()      前回の実行の痕跡を捨てる
-      → _before_loop()    初期ツールを実行し、最初の記憶を作る（Agentのみ）
+      → 初期ツールを実行し、最初の記憶を作る（_after_initial_tools。Agentのみ）
       → ループ開始
           _select_invokables()  次に呼ぶ対象を決める
           ・対象がある → 生成してツールを呼ぶ → 結果を記憶へ（_after_tools）
           ・対象がない → ループを抜けて回答へ
       → _final_answer()   回答を生成する
+
+【ツールの呼び出しで、いったん手を離す】
+    ループは、ツールや他のエージェントを自分で呼ばない。呼び出しの計画（バッチ）を
+    返して手を離し、結果が揃ったら _continue_after_batch() から続きを進める。
+    実行するのは起動の表（runtime.py）で、委譲先のエージェントもそこで子の起動として
+    進む。親子をコールスタックではなく表のデータで持つので、途中で中断して状態を
+    保存し、後で再開できる。
 
 【外から呼ばれる入口は2つ】
     respond()  人間からの入口。会話履歴や添付を受け取る
@@ -25,11 +32,9 @@ import json
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, ClassVar, Optional
-from uuid import uuid4
 
 from .events import (
     BeforeExecuteEvent,
@@ -79,8 +84,27 @@ from .prompts import (
     join_sections,
     section,
 )
+from .runtime import Runtime, Stage, Suspended, _Batch, _Finished, _PlannedCall
+from .state import (
+    decode,
+    dump_diff_error,
+    dump_memory,
+    dump_result,
+    encode,
+    load_diff_error,
+    load_result,
+    restore_memory,
+)
+from .suspension import Suspend
 from .tools import Tool, ToolResult
 from .utils import format_message, with_timing
+
+# 単体で動かしたAgent（Networkに入れずにrespond / execute）が中断した時の文言。
+# 中断した状態を保存して戻す入口（save_state / load_state / resume）はNetworkにある。
+_SUSPEND_OUTSIDE_NETWORK = (
+    "中断（suspend）は、Networkに入れて動かした時だけ使えます。"
+    "Agentを単体で動かすと、中断した状態を保存して再開する入口がありません。"
+)
 
 
 def _extract_rows(text: str) -> list | None:
@@ -312,25 +336,6 @@ class ToolHistoryEntry:
         return "\n".join(lines)
 
 
-@dataclass
-class _PlannedCall:
-    """
-    実行の1件分。「実行するか」を決めた後、「実行して反映する」側へ渡す器。
-
-    decidedが入っているものは実行しない。結果を先に決めてあり、②を飛ばして
-    ③でそのまま履歴とイベントへ乗る（実行しなかった事実も観測できる）。
-    """
-
-    call: FunctionCall
-    # 呼び出す相手。解決できなかった場合と、実行しないと決めた場合はNone。
-    target: Invokable | None = None
-    # 実行せずに確定させた結果。重複拒否・名前の解決失敗・引数不足。
-    decided: ToolResult | None = None
-    # 重複として拒否したもの。結果を既に持っている扱いなので、次のステップでも
-    # 「直前に成功した」側へ引き継ぐ（落とすと拒否と実行が交互に繰り返される）。
-    duplicate: bool = False
-
-
 def _is_blank(value: Any) -> bool:
     """
     必須の引数が実質的に空か。
@@ -516,14 +521,13 @@ class Agent:
     # ループの前に走るINITIAL_MEMORYもstep 1として扱うため1で始める。
     _step_no: int = 1
 
-    # この起動（respond / execute 1回）を指すID。_begin_run()で発行する。
-    # publicなのは、ExecutedEvent.callee_run_idを呼び出した側がここから読むため。
+    # この起動（respond / execute 1回）を指すID。起動の表（runtime.py）が発行し、
+    # _begin_run()で受け取る。中断した地点（Pending.point）にも使われる。
     current_run_id: str = ""
 
-    # 同じ実体へ同時に入るのを防ぐ錠。execute()だけが取る（respond()の同時
-    # 呼び出しは利用側が作るもので、守るとshared_memoryが混ざったまま動く）。
-    # 1つの親からの同時呼び出しは_execute_callsがid(target)で防ぐので、
-    # こちらは親をまたいだ場合に効く。RLockは万一の再入でハングしないため。
+    # 単体で動かしたexecute()が、同じ実体へ同時に入るのを防ぐ錠。Networkの中では
+    # 起動の表が同じエージェントの起動を1件ずつにするので、こちらは単体で複数の
+    # スレッドから呼ばれた場合に効く。RLockは万一の再入でハングしないため。
     _lock: Any = field(default_factory=threading.RLock, compare=False)
     # toolが返した添付の蓄積。文字起こしする先を持たないReflexAgentが
     # 以降も見せ続けるために使う（記憶を持つAgentは1回渡して終わり）。
@@ -659,8 +663,162 @@ class Agent:
         self._awaiting_outcomes = None
         self._run_generations = 0
 
+    # ---- 中断した状態の保存と復元（Network.save_state / load_state） ----
+    def _dump_state(self) -> dict:
+        """
+        記憶と、起動の途中の状態。JSONにできる形で返す。
+
+        設定（人格定義・tool・llm）は含めない。同じ設定で組み直したNetworkへ
+        読み込む前提で、入れるのは実行して変わったものだけ。
+        """
+        run = self.current_input
+        return {
+            "private_memory": dump_memory(self.private_memory),
+            "tokens": [
+                self.total_input_tokens,
+                self.total_output_tokens,
+                self.total_cached_tokens,
+            ],
+            "current_input": None
+            if run is None
+            else {
+                "message": run.message,
+                "kwargs": encode(run.kwargs, f"{self.name}への依頼の引数"),
+                "history": encode(run.history, f"{self.name}への依頼の会話履歴"),
+                "blobs": encode(run.blobs, f"{self.name}への依頼の添付"),
+                "from_user": run.from_user,
+            },
+            "current_run_id": self.current_run_id,
+            "step_no": self._step_no,
+            "tool_history": [
+                {
+                    "name": e.name,
+                    "kwargs": encode(e.kwargs, f"{self.name}の実行履歴の引数"),
+                    "result": dump_result(e.result, f"{self.name}の実行履歴の '{e.name}'"),
+                    "evaluation": e.evaluation,
+                    "output_schema": e.output_schema,
+                    "written_to_memory": e.written_to_memory,
+                }
+                for e in self.tool_history
+            ],
+            "last_successful_calls": sorted(self.last_successful_calls),
+            "unresolved_targets": [list(t) for t in self._unresolved_targets],
+            "runtime_disabled": sorted(self._runtime_disabled),
+            "last_fingerprint": None
+            if self._last_fingerprint is None
+            else [list(t) for t in self._last_fingerprint],
+            "stalled_count": self._stalled_count,
+            "unapplied_rows": [
+                dump_diff_error(e, f"{self.name}の反映されなかった行")
+                for e in self._unapplied_rows
+            ],
+            "carried_blobs": encode(self._carried_blobs, f"{self.name}が抱えている添付"),
+            "exchanges": [self._dump_exchange(llm, ex) for llm, ex in self._exchanges],
+            "awaiting_outcomes": None
+            if self._awaiting_outcomes is None
+            else self._dump_exchange(*self._awaiting_outcomes),
+            "run_generations": self._run_generations,
+        }
+
+    def _load_state(self, data: dict) -> None:
+        """_dump_state()の逆。reset()した直後の実体へ書き戻す。"""
+        restore_memory(self.private_memory, data["private_memory"])
+        (
+            self.total_input_tokens,
+            self.total_output_tokens,
+            self.total_cached_tokens,
+        ) = data["tokens"]
+        raw = data["current_input"]
+        self.current_input = (
+            None
+            if raw is None
+            else RunInput(
+                message=raw["message"],
+                kwargs=decode(raw["kwargs"]),
+                history=decode(raw["history"]),
+                blobs=decode(raw["blobs"]),
+                from_user=raw["from_user"],
+            )
+        )
+        self.current_run_id = data["current_run_id"]
+        self._step_no = data["step_no"]
+        self.tool_history = [
+            ToolHistoryEntry(
+                name=e["name"],
+                kwargs=decode(e["kwargs"]),
+                result=load_result(e["result"]) or ToolResult(),
+                evaluation=e["evaluation"],
+                output_schema=e["output_schema"],
+                written_to_memory=e["written_to_memory"],
+            )
+            for e in data["tool_history"]
+        ]
+        self.last_successful_calls = set(data["last_successful_calls"])
+        self._unresolved_targets = [tuple(t) for t in data["unresolved_targets"]]
+        # 無効化は名前と、toolの実体のdisabledの両方で持つ（_apply_disable_rowsと同じ）。
+        for name in data["runtime_disabled"]:
+            target = self._resolve_invokable(name)
+            if target is not None and not isinstance(target, Agent):
+                target.disabled = True
+            self._runtime_disabled.add(name)
+        fingerprint = data["last_fingerprint"]
+        self._last_fingerprint = (
+            None if fingerprint is None else frozenset(tuple(t) for t in fingerprint)
+        )
+        self._stalled_count = data["stalled_count"]
+        self._unapplied_rows = [load_diff_error(e) for e in data["unapplied_rows"]]
+        self._carried_blobs = decode(data["carried_blobs"])
+        self._exchanges = [
+            pair for e in data["exchanges"] if (pair := self._load_exchange(e))
+        ]
+        awaiting = data["awaiting_outcomes"]
+        self._awaiting_outcomes = None if awaiting is None else self._load_exchange(awaiting)
+        self._run_generations = data["run_generations"]
+
+    def _llm_key(self, llm: BaseLLM) -> str:
+        """
+        継承する思考を作った接続を、保存できる名前で指す。実体は保存できないので、
+        Agentのどこに設定された接続か（llm / phase_overridesのどのphase）で持つ。
+        """
+        if llm is self.llm:
+            return "llm"
+        for phase, override in self.phase_overrides.items():
+            if override.llm is llm:
+                return f"phase:{phase.name}"
+        return ""
+
+    def _dump_exchange(self, llm: BaseLLM, exchange: Exchange) -> dict:
+        return {
+            "llm": self._llm_key(llm),
+            "prompt": exchange.prompt,
+            # 中身を解釈できるのは作ったプロバイダだけなので、変換も任せる。
+            "reply": encode(llm.dump_reply(exchange.reply), f"{self.name}の継承する思考"),
+            "outcomes": [[o.text, o.is_error] for o in exchange.outcomes],
+        }
+
+    def _load_exchange(self, data: dict) -> tuple[BaseLLM, Exchange] | None:
+        """
+        保存した思考を、今の設定の接続へ結び直す。その接続が設定から消えていれば
+        捨てる（送り返す先が無い）。
+        """
+        key = data["llm"]
+        llm: BaseLLM | None = None
+        if key == "llm":
+            llm = self.llm
+        elif phase := Phase.__members__.get(key.removeprefix("phase:")):
+            override = self.phase_overrides.get(phase)
+            llm = override.llm if override else None
+        if llm is None:
+            return None
+        exchange = Exchange(
+            prompt=data["prompt"],
+            reply=llm.load_reply(decode(data["reply"])),
+            outcomes=[CallOutcome(text=t, is_error=e) for t, e in data["outcomes"]],
+        )
+        return llm, exchange
+
     # ---- 起動の入り口 ----
-    def _begin_run(self, run_input: RunInput) -> None:
+    def _begin_run(self, run_input: RunInput, run_id: str) -> None:
         """
         起動ごとに、前回の実行の痕跡を捨てる（同一セッション内で同じAgentが
         複数回呼ばれることがある）。
@@ -668,6 +826,9 @@ class Agent:
         tasksを捨てるのは必須。status=nextのまま残ると_select_invokablesが
         拾い、前回の依頼のためのtool実行が起きる。goalsとshared_memoryは残す。
         継承する思考（carry_thoughts）も残す。
+
+        run_idは起動の表が発行したもの。親が子の起動を表で指すのにも使うので、
+        ここで作らずに受け取る。
         """
         self.current_input = run_input
         self.tool_history = []
@@ -684,10 +845,7 @@ class Agent:
         # 前回の周回数を持ち越さない。INITIAL_MEMORYはループへ入る前に
         # 走るため、ここで1に戻しておく必要がある。
         self._step_no = 1
-        # 起動の単位は_begin_run()の呼び出しと一致するのでここで発行する。
-        # 用途は1セッション内のイベントの突き合わせだけなので、人が読める
-        # 長さまで切っている（外部へ出す識別子ではない）。
-        self.current_run_id = uuid4().hex[:12]
+        self.current_run_id = run_id
         # 前回の依頼で取得した添付を持ち越さない。
         self._carried_blobs = []
         # 前の起動が実行の手前で終わった場合、結果の無い呼び出し要求が残る。
@@ -709,34 +867,59 @@ class Agent:
         そこから読む（窓口へ【依頼内容】やmessagesとして別に渡すと二重になる）。
         委譲先にとっての要求の解釈の基準はrequests（委譲された時点で構造化された
         依頼）のままで、conversationは解釈を補う材料として読ませる。
+
+        単体で動かす時の入口。Networkに入れた場合はNetwork.respond()から
+        起動の表が進めるので、ここは通らない。単体では中断できない
+        （保存して再開する入口がNetworkにしか無い）。
         """
-        turns = list(history or [])
+        runtime = Runtime()
+        runtime.begin_respond(
+            self, message=message, history=list(history or []), blobs=list(blobs or [])
+        )
+        outcome = runtime.drive()
+        if isinstance(outcome, Suspended):
+            # 型の不正ではなく使い方の誤り（単体では再開できない）。
+            raise RuntimeError(_SUSPEND_OUTSIDE_NETWORK)  # noqa: TRY004
+        return outcome
+
+    def _start_respond(
+        self, run_id: str, *, message: str, history: list[dict], blobs: list[dict]
+    ) -> _Batch | _Finished:
+        """起動の表が、respondの起動を始める時に呼ぶ。"""
+        turns = list(history)
         self._begin_run(
             RunInput(
                 message=message,
                 kwargs={"message": message},
                 history=turns,
-                blobs=list(blobs or []),
+                blobs=list(blobs),
                 from_user=True,
-            )
+            ),
+            run_id,
         )
         self._record_conversation(message, turns)
-        # トークンは累計を保持したまま、今回分だけを差分で返す。
-        # 累計はNetwork.total_tokens()がセッション全体の集計に使う。
-        before_in, before_out = self.total_input_tokens, self.total_output_tokens
         self.interceptor.notify.respond_start(
             RespondStartEvent(
                 agent=self.name, message=f"{self.name}が応答を開始しました。"
             )
         )
+        return self._enter_loop()
 
-        text, steps = self._run_react()
+    def _finish_respond(
+        self, text: str, steps: int, tokens_before: tuple[int, int]
+    ) -> AgentResponse:
+        """
+        起動の表が、respondの起動の回答が出た時に呼ぶ。
 
+        トークンは累計を保持したまま、今回分だけを差分で返す。
+        累計はNetwork.total_tokens()がセッション全体の集計に使う。
+        """
         self.interceptor.notify.respond_end(
             RespondEndEvent(
                 agent=self.name, message=f"{self.name}が応答を完了しました。"
             )
         )
+        before_in, before_out = tokens_before
         return AgentResponse(
             text=text,
             steps=steps,
@@ -822,6 +1005,35 @@ class Agent:
 
         チャット履歴はmessagesとしては受け取らない。原文と経緯は、窓口の
         respond()が記録したshared_memory.conversationを読む。
+
+        単体で動かす時の入口（監査役など）。Networkの中の委譲はここを通らず、
+        起動の表が_open_execute() → _start_execute() の順に進める。
+        """
+        try:
+            blocked = self._open_execute(kwargs, interceptor)
+        except Suspend:
+            return ToolResult(error=_SUSPEND_OUTSIDE_NETWORK)
+        if blocked is not None:
+            return blocked
+
+        # ここから先は自分の状態を書き換えながら進むため1件ずつに直列化する。
+        # 門より後で取るのは、before_executeが人の承認を待つ構成でも
+        # 他の呼び出し元を待たせないため。
+        with self._lock:
+            runtime = Runtime()
+            runtime.begin_execute(self, kwargs)
+            outcome = runtime.drive()
+        if isinstance(outcome, Suspended):
+            return self._fail_execute(RuntimeError(_SUSPEND_OUTSIDE_NETWORK))
+        return outcome
+
+    def _open_execute(
+        self, kwargs: dict, interceptor: Interceptor | None
+    ) -> ToolResult | None:
+        """
+        委譲を受けてよいかの判定。断るならその結果を、受けるならNoneを返す。
+
+        before_executeのコールバックが中断（suspend）した場合は、そのまま外へ出る。
         """
         if self.disabled:
             # Tool.executeと同じく、呼ばれなかった理由を観測側へ伝える。
@@ -852,7 +1064,10 @@ class Agent:
                     )
                 )
                 return ToolResult(error=verdict.reason or "委譲がブロックされました。")
+        return None
 
+    def _start_execute(self, run_id: str, kwargs: dict) -> _Batch | _Finished:
+        """起動の表が、委譲された起動を始める時に呼ぶ（判定は通った後）。"""
         # 依頼本文。input_schemaが既定（messageのみ）ならその中身を、
         # 構造化スキーマならJSONのまま見せる。
         if set(kwargs) == {"message"}:
@@ -862,88 +1077,118 @@ class Agent:
             # Invokableの「例外を外へ出さない」契約が破れる。
             message = json.dumps(kwargs, ensure_ascii=False, indent=2, default=str)
 
-        # ここから先は自分の状態を書き換えながら進むため1件ずつに直列化する。
-        # 門より後で取るのは、before_executeが人の承認を待つ構成でも
-        # 他の親を待たせないため。
-        with self._lock:
-            self._begin_run(RunInput(message=message, kwargs=dict(kwargs)))
+        self._begin_run(RunInput(message=message, kwargs=dict(kwargs)), run_id)
 
-            # 最初に呼ばれたエージェントの依頼だけがセッション全体の方向を定義する
-            # （以降の委譲では上書きしない）。入るのは構造化された引数だけ。
-            if self.shared_memory.requests is None:
-                self.shared_memory.requests = MemoryEntry(id="request_1", text=message)
+        # 最初に呼ばれたエージェントの依頼だけがセッション全体の方向を定義する
+        # （以降の委譲では上書きしない）。入るのは構造化された引数だけ。
+        if self.shared_memory.requests is None:
+            self.shared_memory.requests = MemoryEntry(id="request_1", text=message)
 
-            # toolと同じイベントで通知する。文言の組み立ては失敗しうるため、
-            # 通知の失敗で委譲を止めないよう保護する（Tool.executeと同じ）。
-            try:
-                describe = self.describe_execution or self._default_describe_execution
-                self.interceptor.notify.execute_start(
-                    ExecuteStartEvent(
-                        name=self.name, kwargs=kwargs, message=describe(kwargs)
-                    )
-                )
-            except Exception as e:  # noqa: BLE001
-                self._notify_error(
-                    f"{self.name}の実行中メッセージの生成に失敗しました: {e}"
-                )
-
-            try:
-                text, _ = self._run_react()
-            except Exception as e:  # noqa: BLE001
-                # Invokableの契約として例外を外へ出さない。
-                # ただし握りつぶすと原因が追えなくなるため、観測者へは通知する。
-                self._notify_error(f"{self.name}の実行が失敗しました: {e}")
-                self.interceptor.notify.execute_end(
-                    ExecuteEndEvent(
-                        name=self.name,
-                        success=False,
-                        message=f"{self.name}の委譲がエラーで終了しました。",
-                    )
-                )
-                return ToolResult(
-                    error=f"{self.name}の実行中にエラーが発生しました: {e}"
-                )
-
-            # agent_answersはシステム所有。LLMの差分では書けないため直接記録する。
-            self.shared_memory.agent_answers.append(
-                MemoryEntry(
-                    id=f"{self.name}-answer-{len(self.shared_memory.agent_answers) + 1}",
-                    text=text,
-                )
+        # toolと同じイベントで通知する。文言の組み立ては失敗しうるため、
+        # 通知の失敗で委譲を止めないよう保護する（Tool.executeと同じ）。
+        try:
+            describe = self.describe_execution or self._default_describe_execution
+            self.interceptor.notify.execute_start(
+                ExecuteStartEvent(name=self.name, kwargs=kwargs, message=describe(kwargs))
             )
-            self.interceptor.notify.execute_end(
-                ExecuteEndEvent(
-                    name=self.name,
-                    success=True,
-                    message=f"{self.name}の委譲が完了しました。",
-                )
-            )
+        except Exception as e:  # noqa: BLE001
+            self._notify_error(f"{self.name}の実行中メッセージの生成に失敗しました: {e}")
 
-            return ToolResult(value=text)
+        return self._enter_loop()
+
+    def _finish_execute(self, text: str) -> ToolResult:
+        """起動の表が、委譲された起動の回答が出た時に呼ぶ。"""
+        # agent_answersはシステム所有。LLMの差分では書けないため直接記録する。
+        self.shared_memory.agent_answers.append(
+            MemoryEntry(
+                id=f"{self.name}-answer-{len(self.shared_memory.agent_answers) + 1}",
+                text=text,
+            )
+        )
+        self.interceptor.notify.execute_end(
+            ExecuteEndEvent(
+                name=self.name, success=True, message=f"{self.name}の委譲が完了しました。"
+            )
+        )
+        return ToolResult(value=text)
+
+    def _fail_execute(self, error: Exception) -> ToolResult:
+        """
+        委譲された起動が例外で終わった時。Invokableの契約として例外を外へ出さない。
+        ただし握りつぶすと原因が追えなくなるため、観測者へは通知する。
+        """
+        self._notify_error(f"{self.name}の実行が失敗しました: {error}")
+        self.interceptor.notify.execute_end(
+            ExecuteEndEvent(
+                name=self.name,
+                success=False,
+                message=f"{self.name}の委譲がエラーで終了しました。",
+            )
+        )
+        return ToolResult(error=f"{self.name}の実行中にエラーが発生しました: {error}")
 
     # ---- ReActループ ----
-    def _run_react(self) -> tuple[str, int]:
+    # ループは「実行 → 評価 → 次を決める」の繰り返し。AgentとReflexAgentの違いは
+    # hookの中身だけなので、ここに分岐は無い。
+    #
+    # tool / agent を呼ぶ所でだけ、計画（_Batch）を返して手を離す。結果が揃うと
+    # 起動の表が _continue_after_batch() を呼び、そこから続ける。
+    #
+    # 抜ける条件は5つ。どの終わり方でも必ず回答を返す（_Finished）。
+    #
+    #     ・実行すべき対象が無くなった      → ANSWER
+    #     ・同じ実行を繰り返して進まない    → STALLED_ANSWER
+    #     ・max_stepsに達した               → CUTOFF_ANSWER
+    #     ・ReflexAgentがテキストで答えた   → その場で返す
+    #     ・呼び出しを強制したのにテキストが返った → ANSWER（やり直し）
+    def _enter_loop(self) -> _Batch | _Finished:
+        """ループに入る。初期toolがあれば、先にその実行を頼む。"""
+        plan = self._plan_initial_tools()
+        if plan:
+            return _Batch(stage="initial", plan=plan)
+        return self._after_initial([])
+
+    def _after_initial(self, entries: list[ToolHistoryEntry]) -> _Batch | _Finished:
+        # 記憶を持つAgentなら、初期ツールの結果も材料にして最初の記憶を作る。
+        # ReflexAgentでは添付を抱えるだけ。
+        self._after_initial_tools(entries)
+        return self._loop(1)
+
+    def _continue_after_batch(
+        self,
+        stage: Stage,
+        plan: list[_PlannedCall],
+        results: dict[int, ToolResult | None],
+        children: dict[int, str],
+    ) -> _Batch | _Finished:
         """
-        ReActループの本体。「実行 → 評価 → 次を決める」を繰り返す。
-        AgentとReflexAgentの違いはhookの中身だけなので、ここに分岐は無い。
+        起動の表が、バッチの結果が揃った時に呼ぶ。結果を反映して、続きを進める。
 
-        抜ける条件は5つ。どの終わり方でも必ず回答を返す。
-
-            ・実行すべき対象が無くなった      → ANSWER
-            ・同じ実行を繰り返して進まない    → STALLED_ANSWER
-            ・max_stepsに達した               → CUTOFF_ANSWER
-            ・ReflexAgentがテキストで答えた   → その場で返す
-            ・呼び出しを強制したのにテキストが返った → ANSWER（やり直し）
-
-        戻り値: (最終回答のテキスト, 実際に回ったステップ数)
+        children: 委譲先の起動のrun_id（枠の番号ごと）。executedイベントに載せる。
         """
-        # 記憶を持つAgentなら、ここで初期ツールを実行して最初の記憶を作る。
-        # ReflexAgentでは何も起きない。
-        self._before_loop()
+        entries = self._reflect(plan, results, children)
+        if stage == "initial":
+            return self._after_initial(entries)
 
-        for step in range(1, self.max_steps + 1):
+        # 結果を評価する生成より前に、呼び出し要求と結果を対にして残す。
+        self._close_exchange(entries)
+
+        # 結果を評価して記憶へ書く。同時に「進んでいるか」も判定する。
+        # 進んでいないと判断されたらTrueが返り、打ち切る。
+        if self._process_step(entries):
+            return _Finished(
+                self._final_answer(
+                    Phase.STALLED_ANSWER, notice=self._pending_task_notice()
+                ),
+                self._step_no,
+            )
+        return self._loop(self._step_no + 1)
+
+    def _loop(self, first_step: int) -> _Batch | _Finished:
+        """first_step周目から、次に手を離すところ（呼び出しか回答）まで回す。"""
+        for step in range(first_step, self.max_steps + 1):
             # この周のイベントに載る番号。_generate / _update_memory /
-            # _execute_calls が self._step_no から読む。
+            # _reflect が self._step_no から読む。
             self._step_no = step
 
             # 記憶を持つAgentはtasksの対象だけを提示して呼び出しを強制し、
@@ -962,17 +1207,21 @@ class Agent:
                 ]
                 self.tool_history.extend(entries)
                 if self._process_step(entries):
-                    return self._final_answer(
-                        Phase.STALLED_ANSWER, notice=self._pending_task_notice()
-                    ), step
+                    return _Finished(
+                        self._final_answer(
+                            Phase.STALLED_ANSWER, notice=self._pending_task_notice()
+                        ),
+                        step,
+                    )
                 continue
 
             # 実行すべきものが無い ＝ 追加実行なしで答えられる状態。
             # toolsを渡さないのではなく、そもそも呼び出しフェーズへ入らない。
             if not targets:
-                return self._final_answer(
-                    Phase.ANSWER, notice=self._pending_task_notice()
-                ), step
+                return _Finished(
+                    self._final_answer(Phase.ANSWER, notice=self._pending_task_notice()),
+                    step,
+                )
 
             # 呼び出しフェーズ。ここでLLMに決めさせるのは「引数」だけで、
             # 何を呼ぶかは既にtargetsで絞られている。
@@ -991,32 +1240,26 @@ class Agent:
                     # ReflexAgentはテキストで答えてきた時点で終了する
                     # （「調べる必要はなかった」という判断の表明）。output_schemaが
                     # あっても形式はsystem_instructionで伝えてあるので作り直さない。
-                    return response.text, step
+                    return _Finished(response.text, step)
 
                 # 呼び出しを強制した（"any"）のに答えが返ってきた場合。この
                 # テキストには回答フェーズの指示も出力形式の強制も効いていないため、
                 # 改めて回答フェーズで答えさせる。
-                return self._final_answer(
-                    Phase.ANSWER, notice=self._pending_task_notice()
-                ), step
+                return _Finished(
+                    self._final_answer(Phase.ANSWER, notice=self._pending_task_notice()),
+                    step,
+                )
 
             # --- 実際に呼ぶ ---
-            # 無効化の確認、重複の拒否、実行前判定はこの中で行われる。
-            entries = self._execute_calls(response.function_calls)
-            # 結果を評価する生成より前に、呼び出し要求と結果を対にして残す。
-            self._close_exchange(entries)
-
-            # 結果を評価して記憶へ書く。同時に「進んでいるか」も判定する。
-            # 進んでいないと判断されたらTrueが返り、打ち切る。
-            if self._process_step(entries):
-                return self._final_answer(
-                    Phase.STALLED_ANSWER, notice=self._pending_task_notice()
-                ), step
+            # 重複の拒否と名前の解決はここで決め、実行（無効化の確認・実行前判定を
+            # 含む）は起動の表に任せる。結果は_continue_after_batchで受け取る。
+            return _Batch(stage="loop", plan=self._plan_calls(response.function_calls))
 
         # max_stepsを使い切った。ここまでに分かったことで回答する。
-        return self._final_answer(
-            Phase.CUTOFF_ANSWER, notice=self._pending_task_notice()
-        ), self.max_steps
+        return _Finished(
+            self._final_answer(Phase.CUTOFF_ANSWER, notice=self._pending_task_notice()),
+            self.max_steps,
+        )
 
     @staticmethod
     def _step_fingerprint(entries: list[ToolHistoryEntry]) -> frozenset:
@@ -1153,14 +1396,14 @@ class Agent:
         """
         return [b for e in entries for b in e.result.blobs]
 
-    def _before_loop(self) -> None:
+    def _after_initial_tools(self, entries: list[ToolHistoryEntry]) -> None:
         """
-        ループ開始前。初期toolを実行し、その結果も材料にして初期memoryを作る。
+        ループ開始前。初期toolの結果も材料にして初期memoryを作る
+        （初期toolが無ければentriesは空）。
 
         結果と添付は履歴経由ではなく明示的に渡す（_show_tool_results=Falseで
         履歴からは隠れるが、このステップはその中身を材料にする）。
         """
-        entries = self._execute_initial_tools()
         tool_results = "\n".join(e.render(include_result=True) for e in entries)
         self._update_memory(
             phase=Phase.INITIAL_MEMORY,
@@ -1392,7 +1635,7 @@ class Agent:
         """
         呼び出し要求を返した生成に、呼び出し順の結果を対にして残す。
 
-        _execute_callsは要求1件につき1件の記録を、要求の順に返す。
+        _reflectは要求1件につき1件の記録を、要求の順に返す。
         """
         if self._awaiting_outcomes is None:
             return
@@ -1825,9 +2068,9 @@ class Agent:
         args = json.dumps(call.args, sort_keys=True, ensure_ascii=False, default=str)
         return f"{call.name}({args})"
 
-    def _execute_calls(self, calls: list[FunctionCall]) -> list[ToolHistoryEntry]:
+    def _plan_calls(self, calls: list[FunctionCall]) -> list[_PlannedCall]:
         """
-        LLMが要求した呼び出しを、実行する／しないに振り分けて_run_planへ渡す。
+        LLMが要求した呼び出しを、実行する／しないに振り分ける。
 
         重複拒否と名前の解決はここでしか起きない。逐次で回すのは、並列にすると
         同じ引数の呼び出しが両方走ってしまうため。
@@ -1870,85 +2113,72 @@ class Agent:
                 )
                 continue
 
-            plan.append(_PlannedCall(call=call, target=target))
+            plan.append(self._planned(call, target))
 
-        return self._run_plan(plan)
+        return plan
 
-    def _run_plan(self, plan: list["_PlannedCall"]) -> list[ToolHistoryEntry]:
+    @staticmethod
+    def _planned(call: FunctionCall, target: Invokable) -> _PlannedCall:
+        """実行する1件。相手がエージェントなら、起動の表で子の起動として進める。"""
+        return _PlannedCall(call=call, target=target, delegate=isinstance(target, Agent))
+
+    def _rebuild_planned(
+        self,
+        *,
+        stage: Stage,
+        call: FunctionCall,
+        decided: ToolResult | None,
+        duplicate: bool,
+    ) -> _PlannedCall:
         """
-        振り分け済みの呼び出しを実行し、記憶と履歴へ反映して返す。
+        保存した状態から、バッチの1件を組み直す（runtime.Runtime.loadが呼ぶ）。
 
-        LLMが要求した分（_execute_calls）と、システムが機械的に走らせる分
-        （_execute_initial_tools）の両方がここを通る。結果の扱い——記憶への
+        相手は名前で引き直す。初期toolはtools / sub_agentsに登録されていないことが
+        あるので、初期のバッチならinitial_toolsから探す。
+        """
+        if decided is not None:
+            return _PlannedCall(call=call, decided=decided, duplicate=duplicate)
+        if stage == "initial":
+            target = next((t for t in self.initial_tools if t.name == call.name), None)
+        else:
+            target = self._resolve_invokable(call.name)
+        if target is None:
+            raise ValueError(
+                f"保存した状態の{self.name}の呼び出し '{call.name}' が、"
+                f"このエージェントのtool / agentに見つかりません。"
+            )
+        return self._planned(call, target)
+
+    def _reflect(
+        self,
+        plan: list[_PlannedCall],
+        results: dict[int, ToolResult | None],
+        children: dict[int, str],
+    ) -> list[ToolHistoryEntry]:
+        """
+        実行の終わったバッチを、記憶と履歴へ反映して返す。
+
+        LLMが要求した分（_plan_calls）と、システムが機械的に走らせる分
+        （_plan_initial_tools）の両方がここを通る。結果の扱い——記憶への
         書き込み、履歴、イベント——を1箇所に持つため、どちらの経路でも
-        観測される形が同じになる。
+        観測される形が同じになる。実行（並列）は起動の表が済ませている。
 
-          ② 実行 … 2件以上なら並列。外部の待ち時間が重なる
-          ③ 反映 … 記憶への書き込みと履歴への追加。同時に行うと片方が消える
+        children: 委譲先の起動のrun_id（枠の番号ごと）。
         """
         succeeded_now = {
             self._call_signature(item.call) for item in plan if item.duplicate
         }
 
-        # --- ② 実行（単位ごとに並列） -------------------------------------
-        # 単位の中は順番に実行される。toolは1件ごとに別の単位、agentは同じ実体
-        # への呼び出しを1単位へまとめる（同時に走らせると記憶が混ざる）。
-        units: list[list[tuple[int, _PlannedCall]]] = []
-        agent_units: dict[int, list[tuple[int, _PlannedCall]]] = {}
-
-        for index, item in enumerate(plan):
-            if item.decided is not None or item.target is None:
-                continue
-            if isinstance(item.target, Agent):
-                unit = agent_units.get(id(item.target))
-                if unit is None:
-                    unit = agent_units[id(item.target)] = []
-                    units.append(unit)
-                unit.append((index, item))
-            else:
-                units.append([(index, item)])
-
-        results: dict[int, ToolResult] = {}
-
-        def run_unit(unit: list[tuple[int, _PlannedCall]]) -> dict[int, ToolResult]:
-            return {
-                index: item.target.execute(
-                    kwargs=item.call.args, interceptor=self.interceptor
-                )
-                for index, item in unit
-                if item.target is not None
-            }
-
-        if len(units) > 1:
-            # スレッド数は単位の数と同じ（提示するのはtasksが指定した対象だけなので
-            # 件数はそちらで抑えられている）。interceptorのコールバックはInterceptor
-            # 側で直列化済みだが、tool本体は同時に呼ばれる。外部の状態を書き換える
-            # toolを並列で呼ばせる場合は利用側で保護する。
-            with ThreadPoolExecutor(max_workers=len(units)) as pool:
-                futures = {pool.submit(run_unit, unit): unit for unit in units}
-                for future in as_completed(futures):
-                    try:
-                        results.update(future.result())
-                    except Exception as e:  # noqa: BLE001
-                        # Invokableは例外を投げない契約だが、スレッドの側で
-                        # 何かが起きた場合にここで落とすと1件の失敗が全体を止める。
-                        self._notify_error(f"並列実行が例外で終了しました: {e}")
-                        for index, _ in futures[future]:
-                            results.setdefault(
-                                index,
-                                ToolResult(error=f"実行中にエラーが発生しました: {e}"),
-                            )
-        else:
-            for unit in units:
-                results.update(run_unit(unit))
-
-        # --- ③ 反映（呼び出し順のまま逐次） -------------------------------
-        # 並列でも②の完了順ではなくplanの順で回す。プロンプトへ載る順序が
-        # 実行のタイミングで変わると、同じ依頼でも読み方が変わってしまう。
+        # 呼び出し順のまま逐次で反映する。並列でも完了順ではなくplanの順で回す。
+        # プロンプトへ載る順序が実行のタイミングで変わると、同じ依頼でも
+        # 読み方が変わってしまう。記憶への書き込みと履歴への追加を同時に行うと
+        # 片方が消えるので、ここは並列にしない。
         entries = []
         for index, item in enumerate(plan):
             call, target = item.call, item.target
-            result = item.decided if item.decided is not None else results[index]
+            result = results[index]
+            # 結果の無い枠は、表を回す側の誤り。
+            assert result is not None
 
             entry = ToolHistoryEntry(
                 name=call.name,
@@ -1991,9 +2221,8 @@ class Agent:
                     elapsed=result.execution_time,
                     written_to_memory=entry.written_to_memory,
                     caller_run_id=self.current_run_id,
-                    # 実行が終わった後に読む（Agentならこの呼び出しで発行されたIDが
-                    # 入る）。toolは属性を持たないので既定値の空文字で吸収する。
-                    callee_run_id=getattr(target, "current_run_id", ""),
+                    # 委譲ならその呼び出しで始まった起動のID。toolは起動を持たない。
+                    callee_run_id=children.get(index, ""),
                 )
             )
 
@@ -2057,20 +2286,14 @@ class Agent:
         return applied > 0
 
     # ---- 初期tool ----
-    def _execute_initial_tools(self) -> list[ToolHistoryEntry]:
-        """
-        ループ開始前に、システムが機械的にtoolを実行する（確定している手順を
-        判断させない分、1ステップ分の推論と失敗可能性が消える）。
-
-        反映の経路は_execute_callsと同じ（_run_plan）。記憶への書き込み、履歴、
-        イベントが1箇所なので、システムが走らせた分も同じ形で観測できる。
-        """
-        if not self.initial_tools or not self.current_input:
-            return []
-        return self._run_plan(self._plan_initial_tools())
-
     def _plan_initial_tools(self) -> list[_PlannedCall]:
         """
+        ループ開始前に、システムが機械的に実行するtoolの計画（確定している手順を
+        判断させない分、1ステップ分の推論と失敗可能性が消える）。
+
+        反映の経路はLLMが要求した呼び出しと同じ（_reflect）。記憶への書き込み、
+        履歴、イベントが1箇所なので、システムが走らせた分も同じ形で観測できる。
+
         初期toolへ渡す引数を決め、揃っていないものは実行しないと決める。
 
         引数は受け取った構造化引数から、呼ばれる側が受け取れるものだけを抜き出す。
@@ -2081,7 +2304,9 @@ class Agent:
         しか保証しないため、値が""のまま渡って空の条件で検索してしまう
         （呼ばれた側は空文字を正当な指定と区別できない）。
         """
-        kwargs = self.current_input.kwargs if self.current_input else {}
+        if not self.initial_tools or not self.current_input:
+            return []
+        kwargs = self.current_input.kwargs
         plan: list[_PlannedCall] = []
 
         for target in self.initial_tools:
@@ -2106,7 +2331,7 @@ class Agent:
                 plan.append(_PlannedCall(call=call, decided=ToolResult(error=reason)))
                 continue
 
-            plan.append(_PlannedCall(call=call, target=target))
+            plan.append(self._planned(call, target))
 
         return plan
 
@@ -2420,14 +2645,14 @@ class ReflexAgent(Agent):
         """
         return (self.shared_memory,)
 
-    def _before_loop(self) -> None:
+    def _after_initial_tools(self, entries: list[ToolHistoryEntry]) -> None:
         """
         初期toolは実行するが、初期memoryは作らない。
 
         返ってきた添付は_carried_blobsへ積む。このクラスには文字起こしする先が
         無く、渡す先の生成も無いので、ここで抱えなければ二度と参照できない。
         """
-        self._carried_blobs.extend(self._collect_blobs(self._execute_initial_tools()))
+        self._carried_blobs.extend(self._collect_blobs(entries))
 
     def _after_tools(
         self, entries: list[ToolHistoryEntry], *, notice: str = ""

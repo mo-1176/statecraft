@@ -164,7 +164,7 @@ class ExecutedEvent:
     """
     tool / agentの実行1回分。各項目の意味はREADMEを参照。
 
-    発火するのは呼び出した側（_run_plan）。
+    発火するのは呼び出した側（Agent._reflect）。
     Tool.execute / Agent.executeは呼び出し元も周回数も知らない。
     """
 
@@ -189,7 +189,8 @@ class ExecutedEvent:
 
     # 呼び出した側の起動ID（caller の current_run_id）。
     caller_run_id: str = ""
-    # 呼ばれた側の起動ID。calleeがagentの場合だけ入り、toolでは空文字。
+    # 呼ばれた側の起動ID。calleeがagentで、委譲が始まった場合だけ入る
+    # （toolと、before_executeで止められた委譲では空文字）。
     # callee（名前）だけでは同じエージェントが並列に呼ばれた時に区別できない。
     # callee側のGeneratedEvent.run_idと一致する。
     callee_run_id: str = ""
