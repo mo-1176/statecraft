@@ -8,6 +8,15 @@ Web API。会話は session_id で見分け、会話履歴と引き継ぐ記憶�
       → {"session_id": "...", "message": "...", "awaiting_reply": false}
     POST /chat  {"session_id": "...", "message": "さっきの予約の受付番号は？"}   # 同じ会話の続き
 
+利用者に尋ねる所（候補を選ぶ、足りない情報を答える、予約を承認する）で依頼が止まると、
+応答の message が尋ねる文になり、options に候補が入る（自由入力で答えるものは空）。
+次の POST /chat の message が、その答えになる。
+
+    POST /chat  {"message": "『銀河鉄道』を予約したい。会員番号はM-001"}
+      → {"session_id": "...", "message": "「銀河鉄道」に当たる本が2冊あります。どれのことですか？",
+         "awaiting_reply": true, "options": ["銀河鉄道の夜", "銀河鉄道の父"]}
+    POST /chat  {"session_id": "...", "message": "2"}    # 番号か返答の文。止まった所から続く
+
 http://127.0.0.1:8000/docs から試せる。エージェントの経過はサーバーの端末に出る。
 """
 
@@ -35,6 +44,8 @@ class ChatResponse(BaseModel):
     message: str
     # 利用者からの返答を待っているか（足りない情報を尋ねたときなど）
     awaiting_reply: bool
+    # 利用者に選んでもらう候補。依頼が途中で止まっている時だけ入る。画面ではボタンなどにする
+    options: list[str] = []
 
 
 @dataclass
@@ -49,7 +60,8 @@ class SessionStore:
     session_id → 会話。プロセスのメモリに置くだけの簡易版。
 
     再起動で消え、サーバーを複数台に増やすと台ごとに別の会話になる。実運用では
-    Redis や DB に置く（保存するのは LibrarySession の history と carry_over だけでよい）。
+    Redis や DB に置く（LibrarySession.dump() を保存し、load() で戻す。会話履歴と
+    引き継ぐ記憶、止まった依頼の状態が入る。Networkは入らない）。
     """
 
     def __init__(self) -> None:
@@ -99,10 +111,15 @@ def chat(request: ChatRequest) -> ChatResponse:
         conversation = found
 
     with conversation.lock:
-        reply = conversation.session.ask(request.message)
+        session = conversation.session
+        # 依頼が途中で止まっていれば、届いた発言はその答え。保存した状態から続ける
+        reply = session.answer(request.message) if session.suspension else session.ask(request.message)
 
     return ChatResponse(
-        session_id=session_id, message=reply.message, awaiting_reply=reply.awaiting_reply
+        session_id=session_id,
+        message=reply.message,
+        awaiting_reply=reply.awaiting_reply,
+        options=reply.options,
     )
 
 

@@ -1,14 +1,15 @@
 # サンプル（図書館）の読み方
 
-図書館の問い合わせに答えるサンプルです。3体のエージェントと5つのツールで、利用者の質問から予約の登録までを行います。
+図書館の問い合わせに答えるサンプルです。3体のエージェントと7つのツールで、利用者の質問から予約の登録までを行います。途中で人の答えが要る所（候補を選ぶ、足りない情報を答える、予約を承認する）では、依頼を止めて状態を保存し、答えが届いたら続きから進めます（ヒューマンインザループ）。
 
 エージェントとツールの定義は、設定のディレクトリ（`examples/library/` の YAML と Markdown）に書いてあります。コードに残っているのは、ツールの実装、実行を止める判定、画面への表示、記憶の引き継ぎだけです。入口は3つあります。
 
 | 入口 | 使い方 |
 |---|---|
-| `cli.py` | 1つの質問に答えて終わる。記憶の中身とコストの内訳まで出す |
+| `cli.py` | 1つの質問に答えて終わる。記憶の中身とコストの内訳まで出す。依頼が止まったら状態をファイルへ保存して終わり、`--answer` で続ける |
 | `chat.py` | 対話モード。会話履歴と記憶を次のターンへ引き継ぐ |
 | `api.py` | Web API。会話を `session_id` で見分ける |
+| `replay.py` | `cli.py` が止めて保存した所から、何度でも試し直す |
 
 このドキュメントは、**動かした画面に出てくるものを、上から順に読めるようにする**ためのものです。
 
@@ -39,6 +40,8 @@
 - [画面に出る行の種類](#画面に出る行の種類)
 - [コストの見方](#コストの見方)
 - [引き継ぎ](#引き継ぎ)
+- [人に尋ねる（中断と再開）](#人に尋ねる中断と再開)
+- [途中から試し直す](#途中から試し直す)
 - [試せる質問](#試せる質問)
 - [なぜそうしたか](#なぜそうしたか)
 - [自分のアプリに写す](#自分のアプリに写す)
@@ -78,10 +81,21 @@ APIキーは `.env` に置きます（`.env.example` をコピーして書き換
 
 ```bash
 python cli.py "深夜特急を予約したい。会員番号はM-001"
+python cli.py --answer はい                    # 予約の承認で止まるので答える
 python cli.py "さっきの予約の受付番号は？"
 ```
 
 毎回まっさらな状態で試すなら `--fresh` を付けます。読み込みも保存も行いません。引き継ぎを完全に消すなら `sample_carry_over.json` を削除します。
+
+依頼の途中で利用者に尋ねる所（候補を選ぶ、足りない情報を答える、予約を承認する）では、`cli.py` は状態を `sample_suspended.json` へ保存して終わります。答えを渡すと、別のプロセスでも止まった所から続きます（→ [人に尋ねる](#人に尋ねる中断と再開)）。
+
+```bash
+python cli.py "『銀河鉄道』を予約したい。会員番号はM-001"   # 候補を出して止まる
+python cli.py --answer 2                                   # 2番目を選んで続ける
+python cli.py --answer はい                                # 予約の承認で止まったら答える
+```
+
+止めた所から何度でも試し直すなら `replay.py` を使います（→ [途中から試し直す](#途中から試し直す)）。
 
 ---
 
@@ -90,10 +104,11 @@ python cli.py "さっきの予約の受付番号は？"
 ```
 examples/
   cli.py / chat.py / api.py       入口
+  replay.py                       止めて保存した所から試し直す
   library/
     config/
       agents.yaml                 front と librarian。末尾に全項目の見本（sample_agent）
-      tools.yaml                  5つのツール。末尾に全項目の見本（sample_tool）
+      tools.yaml                  7つのツール。末尾に全項目の見本（sample_tool）
       knowledges.yaml             用語辞書の登録
     prompts/
       agents/front/system_instruction.md
@@ -107,9 +122,9 @@ examples/
       prompts/agents/compliance/system_instruction.md
     tools.py                      ツールの実装（ダミーのデータ）と、見本の実装（sample_tool）
     network.py                    組み立て（tools.yaml の名前とツールの実装の対応。LocalTools）
-    observers.py                  interceptor に登録するもの（審査、表示、計測、再試行）
+    observers.py                  interceptor に登録するもの（審査、承認、表示、計測、再試行）
     carry_over.py                 次のターンへ引き継ぐ記憶
-    session.py                    1つの会話（ターンごとにNetworkを作る）
+    session.py                    1つの会話（ターンごとにNetworkを作る。止まった依頼の保存と再開）
     api_key.py                    APIキーの用意
 ```
 
@@ -146,9 +161,16 @@ examples/
     規程を検索     所在を照会    予約を登録         督促を送信
     ★初期tool                  ★memoryを返す      ①で常に拒否
                                ②③④で審査
+                               利用者の承認を待つ
 
     fetch_member_status     ★初期tool（toolsへ登録しない）
     会員区分を引く           会員番号が空なら実行されない
+
+    identify_title          ★候補が複数なら、依頼全体を止めて利用者に選んでもらう
+    書名を確定する
+
+    ask_member              ★依頼全体を止めて、利用者に自由入力で尋ねる
+    利用者に尋ねる
 
       ┌──────────────────────────────────────────┐
       │ compliance                 ReflexAgent   │
@@ -232,6 +254,8 @@ librarian  function_call    check_stock を呼ぶ
 librarian  memory_update    貸出中と分かった。予約できる状態と記録
 librarian  function_call    issue_reservation を呼ぶ
   └ compliance が操作を審査（許可）
+  └ 利用者の承認を待って止まる（cli.py は保存して終わる。--answer はい で続ける）
+  └ 判定をやり直して（審査も再び許可）、実行する
 librarian  memory_update    受付番号が出た。完了と記録
 librarian  answer           status=COMPLETE / blocking_reason=NONE を返す
 front      function_call    記憶を読んで利用者へ答える
@@ -369,6 +393,8 @@ return {
 | ⑤ | `NEEDS_REQUEST_AUDIT`（`librarian`） | 審査役の判定で | 返さない |
 
 **①が④より先にあるので、`send_overdue_notice` は審査役へ届きません。** `NEEDS_COMPLIANCE` に入っていますが、①で常に止まります。
+
+5つを通った `issue_reservation` は、最後に利用者の承認を待ちます。`Guard` の後に登録した `Approval` が依頼を止めて尋ねます（→ [実行前の承認](#実行前の承認--approval)）。
 
 ### 理由を返すか、返さないか
 
@@ -635,22 +661,224 @@ setattr(net.shared_memory, name, [MemoryEntry(id=r["id"], text=r["text"]) for r 
 def ask(self, message: str) -> Reply:
     net = build_network(build_interceptor(self.cost))
     self.carry_over.apply(net)
-    response = net.respond(agent="front", message=message, history=self.history)
-    ...
-    self.carry_over = CarryOver.capture(net)
+    result = net.respond(agent="front", message=message, history=self.history)
+    return self._settle(net, result, ...)   # 終わっていれば CarryOver.capture(net) で持ち越す
 ```
 
 Network を使い回さないのは、1つの Network が1リクエスト分の入れ物だからです。使い回すと、前のターンの `facts` や `decisions` まで次のターンに残ります。
 
-| 入口 | 会話履歴と引き継ぎを持つ場所 |
-|---|---|
-| `cli.py` | 1問で終わるので会話履歴は無い。引き継ぎは `sample_carry_over.json` |
-| `chat.py` | 会話の間はプロセスのメモリ。終えるときに `sample_carry_over.json` へ保存 |
-| `api.py` | `session_id` ごとにサーバーのメモリ（`SessionStore`） |
+| 入口 | 会話履歴と引き継ぎを持つ場所 | 止まった依頼を持つ場所 |
+|---|---|---|
+| `cli.py` | 1問で終わるので会話履歴は無い。引き継ぎは `sample_carry_over.json` | `sample_suspended.json`（次の起動の `--answer` が読む） |
+| `chat.py` | 会話の間はプロセスのメモリ。終えるときに `sample_carry_over.json` へ保存 | プロセスのメモリ |
+| `api.py` | `session_id` ごとにサーバーのメモリ（`SessionStore`） | 同じ `SessionStore` |
 
-`api.py` の `SessionStore` は簡易版です。再起動で消え、サーバーを複数台に増やすと台ごとに別の会話になります。実運用では Redis や DB に置きます（保存するのは `history` と `carry_over` だけで足ります）。
+`api.py` の `SessionStore` は簡易版です。再起動で消え、サーバーを複数台に増やすと台ごとに別の会話になります。実運用では Redis や DB に置きます（`LibrarySession.dump()` を保存し、`load()` で戻します。会話履歴・引き継ぐ記憶・止まった依頼の状態が入り、Network は入りません）。
 
 会話履歴に残すのは、利用者に見せた本文（`front` の回答の `message`）だけです。
+
+---
+
+## 人に尋ねる（中断と再開）
+
+依頼の途中で人の答えが要る所が、3つあります。どれも `suspend()` で依頼全体を止め、状態を保存して、答えが届いたら止まった所から続けます。
+
+| パターン | どこで止めるか | 答えの行き先 | サンプル |
+|---|---|---|---|
+| 候補を選んでもらう | tool の本体 | そのまま tool の結果になる | `tools.py` の `identify_title` |
+| 足りない情報を尋ねる | tool の本体 | そのまま tool の結果になる | `tools.py` の `ask_member` |
+| 実行前の承認 | `before_execute` のコールバック | `suspend()` の戻り値になり、可否の判定に使う | `observers.py` の `Approval` |
+
+1つの依頼の中で、何度か止まることもあります（候補を選んでから、予約の承認）。
+
+`suspend()` に渡す形は、3つとも `{"question": 尋ねる文, "options": 候補}` にそろえています（自由入力の `ask_member` は `options` を持ちません）。`LibrarySession` はこの形を読んで利用者へ見せるので、止まり方が違っても入口のコードは同じです。状態ごと保存されるので、JSON にできる値にします。
+
+### 候補を選んでもらう — identify_title
+
+書名がはっきりしない依頼では、`librarian` が `identify_title` で蔵書を探します。候補が複数あれば、どれのことかを利用者に選んでもらいます。LLM に推測させると、利用者の求めていない方で話が進むためです。
+
+```bash
+python cli.py "『銀河鉄道』を予約したい。会員番号はM-001"
+```
+
+```
+  [引数] identify_title(keyword=銀河鉄道)
+  ▷ 「銀河鉄道」に当たる蔵書を探しています...
+
+================================================================
+利用者に尋ねる（依頼はここで止まっている）
+================================================================
+「銀河鉄道」に当たる本が2冊あります。どれのことですか？
+  1. 銀河鉄道の夜
+  2. 銀河鉄道の父
+
+状態を保存しました: sample_suspended.json
+続けるには: python cli.py --answer 番号（候補に無い返答は文で渡す）
+```
+
+**プロセスはここで終わります。** 答えを待ちません。サーバーで動かす場合も、答えは別のリクエストで届くので、同じ形にしています。
+
+```bash
+python cli.py --answer 2
+```
+
+```
+続き: 「銀河鉄道」に当たる本が2冊あります。どれのことですか？
+答え: 銀河鉄道の父
+  [memory_diff] librarian / memory_update / 1回目 / 適用
+      vars[…] 銀河鉄道の父
+      …
+  [引数] check_stock(title=銀河鉄道の父)
+```
+
+止めているのは、tool の本体の1行です。
+
+```python
+# library/tools.py の identify_title
+suspend(
+    {
+        "question": f"「{keyword}」に当たる本が{len(found)}冊あります。どれのことですか？",
+        "options": found,
+    }
+)
+```
+
+`suspend()` を呼ぶと、tool だけでなく依頼全体が止まります。止まった時点では、`front` が `librarian` の回答を待ち、`librarian` が `identify_title` の結果を待っています。**この「誰が誰を待っているか」ごと保存されます。**
+
+再開すると、利用者の答えがそのまま `identify_title` の結果として `librarian` へ届きます。関数は呼び直されません。止まるまでに終わったもの（規程の検索、会員区分の取得、依頼の審査）も、もう一度は走りません。
+
+```
+── 1回目の起動 ──
+front      function_call    librarian へ委譲（⑤の審査を通る）
+  └ search_rules と fetch_member_status（初期tool）
+librarian  initial_memory   書名を確定するタスクを立てる
+librarian  function_call    identify_title("銀河鉄道") → 候補が2冊 → 止まる
+                            状態を保存して、プロセスを終える
+── 2回目の起動（--answer 2） ──
+                            新しい Network に状態を戻し、答えを渡して再開
+librarian  memory_update    結果（利用者が選んだ『銀河鉄道の父』）を評価する
+librarian  function_call    check_stock → issue_reservation
+  └ Guard を通った後、Approval が承認を尋ねて止まる。保存して終える
+── 3回目の起動（--answer はい） ──
+  └ 判定を頭からやり直し、Approval の suspend() が「はい」を返す。予約を実行する
+librarian  answer           status を返す
+front      function_call    記憶を読んで利用者へ答える
+```
+
+候補を書名だけにしているのは、選ばれた候補がそのまま結果になり、`check_stock` へ渡るためです。結果の読み方（選ばれた書名が返る、候補に無い返答は利用者の意向として読む）は、`tools.yaml` の `evaluation` に書いてあります。
+
+### 足りない情報を尋ねる — ask_member
+
+受付に聞き返してもらうと、利用者の答えは次のターンの新しい依頼になり、`librarian` は最初から調べ直します。`ask_member` で尋ねれば、それまでに調べたことを持ったまま、答えだけを受け取って続けられます。
+
+```bash
+python cli.py "深夜特急を予約したい。会員番号は12345"
+```
+
+```
+  [引数] ask_member(question=ご提示いただいた会員番号「12345」が登録簿に見つかりませんでした。…)
+
+================================================================
+利用者に尋ねる（依頼はここで止まっている）
+================================================================
+ご提示いただいた会員番号「12345」が登録簿に見つかりませんでした。お手数ですが、正しい会員番号をお知らせいただけますでしょうか。
+
+状態を保存しました: sample_suspended.json
+続けるには: python cli.py --answer "返答"
+```
+
+```bash
+python cli.py --answer M-001
+```
+
+尋ねる文は `librarian` が書き、利用者は自由入力で答えます。答えがそのまま `ask_member` の結果になる点は、`identify_title` と同じです。
+
+**使うかどうかは `librarian` が決めます。** 会員番号を記憶（`questions_to_ask`）に残して終え、受付が聞き返す形になることもあります。Gemini で試した範囲では、そちらの方が多く出ました。どちらも利用者に尋ねる手段で、違いは途中経過を持ったまま続けるかどうかです。
+
+### 実行前の承認 — Approval
+
+`issue_reservation` の直前に、利用者の承認を取ります。
+
+```python
+# library/observers.py の Approval
+answer = suspend(
+    {
+        "question": f"『{title}』を会員{member_id}の名義で予約します。よろしいですか？",
+        "options": ["はい", "いいえ"],
+    }
+)
+if answer == "はい":
+    return ExecuteDecision(ok=True)
+return ExecuteDecision(ok=False, reason=f"利用者が予約を承認しませんでした（返答: {answer}）。")
+```
+
+**tool の本体で止めた時と違い、答えは結果になりません。** 再開すると判定が頭からやり直しになり、そこの `suspend()` が答えを返します。「いいえ」なら理由を付けて拒否するので、`librarian` は予約しなかったことを記憶に残して終えます。
+
+```python
+# library/observers.py の build_interceptor
+interceptor.guard.before_execute(Guard())
+interceptor.guard.before_execute(Approval())   # 登録した順に判定する。機械の判定が先、人が後
+```
+
+`Guard` の後に置くのは、通らない操作の承認を利用者に求めないためです。そのぶん、再開すると `Guard` ももう一度判定します（審査役も呼ばれ直し、生成が1回増えます）。答えを待つ間に開館時間を過ぎることもあるので、実行する時点で判定し直す方が正しい、という扱いです。
+
+### 番号は候補の文字列に直して渡す
+
+`--answer 2` の「2」は、`Suspension.resolve` が「銀河鉄道の父」に直してから渡します。番号のまま渡すと、`librarian` には「2」という結果しか見えません。承認の「1」も「はい」に直ります。候補に無い返答（「やっぱりやめる」など）は、そのまま渡ります。
+
+### 続きは新しい Network で
+
+```python
+# library/session.py の LibrarySession.answer
+net = build_network(build_interceptor(self.cost))
+net.load_state(suspension.state)   # 戻すだけで、動かさない
+result = net.resume(answers={suspension.point: choice})
+```
+
+止まった時の Network を取っておけば、`resume()` だけで続けられます。それでも作り直すのは、答えが届くのが別のリクエストだからです。サーバーなら、別のプロセス（別の台）に届くこともあります。3つの入口とも、同じ形にそろえています。
+
+保存した状態に、設定は入りません。止まっている間に `config/` や `prompts/` を直すと、再開後は直した設定で動きます。
+
+### 入口ごとの答え方
+
+| 入口 | 止まった時 | 答え方 |
+|---|---|---|
+| `cli.py` | 尋ねる文と候補を出し、`sample_suspended.json` へ保存して終わる | `python cli.py --answer 2`（候補に無い返答や自由入力は文で渡す） |
+| `chat.py` | 尋ねる文と候補を出し、次の入力を待つ | 次の入力（番号か返答の文） |
+| `api.py` | 応答の `message` が尋ねる文、`options` が候補になる（`awaiting_reply` は `true`） | 同じ `session_id` で、次の `POST /chat` の `message` に入れる |
+
+`chat.py` と `api.py` は、止まっている間の発言を `answer()` へ、それ以外を `ask()` へ渡します。利用者の側から見ると、受付に聞き返された時と同じで、次に話せば続きます。
+
+```python
+reply = session.answer(message) if session.suspension else session.ask(message)
+```
+
+### 同時に2か所で止まったら
+
+同じ生成で止まる tool が2回呼ばれると、2か所で同時に止まります。サンプルは1つ目だけを聞いて再開します。答えなかった所は再開した時に実行し直され、また止まるので、1つずつ聞くことになります。
+
+### 会話履歴へ入れるのは、終わってから
+
+止まっている間、このターンの発言（依頼、尋ねたこと、答え）は会話履歴へ入れず、`Suspension.turn` に置きます。依頼が終わった時に、まとめて足します。
+
+---
+
+## 途中から試し直す
+
+保存した状態は、人に尋ねるためだけのものではありません。`replay.py` は、`cli.py` が止めた依頼（`sample_suspended.json`）を読み込み、答えを渡して最後まで進めます。**ファイルは消さず、書き換えもしない**ので、同じ所から何度でも流せます。
+
+```bash
+python cli.py "『銀河鉄道』を予約したい。会員番号はM-001"   # 止めて保存する
+python replay.py --answer 2 --answer はい                  # そこから最後まで（ファイルは残る）
+# prompts/agents/librarian/ を直す
+python replay.py --answer 2 --answer はい                  # 同じ所から、直した設定で
+```
+
+保存した状態に、設定は入っていません。再開した Network は、今の `config/` と `prompts/` で動きます。止まった所より後のエージェントの振る舞いを、規程の検索や依頼の審査を毎回流し直さずに確かめられます。
+
+- `--answer` は、止まった順に使います。足りなければ、止まったまま終わります（保存はしません）。
+- `cli.py --answer` は、依頼が終わるとファイルを消します。残しておきたい地点は、ファイルをコピーして `--state` で指します。
+- 保存できるのは、止まっている間だけです（止まっていない Network の `save_state()` は例外になります）。別の所を地点にしたいなら、そこで `suspend()` を呼びます（`before_execute` のコールバックに置けば、tool の手前で止められます）。
 
 ---
 
@@ -661,11 +889,12 @@ Network を使い回さないのは、1つの Network が1リクエスト分の�
 | 質問 | 何を試すもの |
 |---|---|
 | 学生証があれば何冊まで借りられる？ | 条件付きの結論（一般5冊／学生証10冊） |
-| 深夜特急を予約したい。会員番号はM-001 | 予約が通る経路 |
-| 深夜特急を予約したい。会員番号は12345 | 引数の形式（②） |
+| 深夜特急を予約したい。会員番号はM-001 | 予約が通る経路。登録の前に承認で止まる（`cli.py` は `--answer はい`） |
+| 深夜特急を予約したい。会員番号は12345 | 引数の形式（②）。司書がその場で正しい番号を尋ねることがある（`ask_member`） |
 | 深夜特急を予約したい。会員番号はM-999 | 形式は正しいが実在しない会員 |
 | 広辞苑を予約したい。会員番号はM-001 | 禁帯出（館内閲覧のみ） |
 | 銀河鉄道の夜を予約したい。会員番号はM-001 | 在架のもの |
+| 『銀河鉄道』を予約したい。会員番号はM-001 | 候補を選んでもらう（中断と再開）。`cli.py` は `--answer 番号` で続ける |
 | M-001さんに督促メールを送って | ツール名で止まる（①） |
 | 深夜特急の返却予定日を教えて | 蔵書の照会だけで済む依頼 |
 | 貸出の理由を教えて | 規程に書かれていないことを聞く |
@@ -678,6 +907,7 @@ Network を使い回さないのは、1つの Network が1リクエスト分の�
 
 ```bash
 python cli.py "深夜特急を予約したい。会員番号はM-001" --fresh
+python cli.py --answer はい      # 承認で止まるので答える。終わったら引き継ぎを保存する
 python cli.py "さっきの予約の受付番号は？"
 ```
 
@@ -698,10 +928,7 @@ front は librarian に投げて終わりなので、tool を巧みに使う必�
 | `librarian`（`Agent`） | **される。** `ANSWER` で `response_schema` として渡る |
 | `front`（`ReflexAgent`） | されない。指示文として `system_instruction` に載るだけ |
 
-`front` の側は守られないことがありえますということを示せればと思って設定しました。
-基本的に受付役は会話を行うことが役目なのでoutput_schemaは推奨しません。
-
-A2A(Agent to Agent)では恩恵があるかもしれませんが。
+`front` に付けているのは、強制されない側では形が守られないことがある、と示すためです。受付役の仕事は会話なので、受付役に `output_schema` を付けることは勧めません。エージェントどうしでやり取りする場合（A2A）は、役に立つことがあります。
 
 `chat.py` と `api.py` は、`front` の回答を `Reply.parse` で `message` と `awaiting_reply` に分けます。形が守られなかった場合は、本文をそのまま `message` として扱います。
 
@@ -752,6 +979,8 @@ knowledgeは常にプロンプトの中に流し込まれるので、細かい�
 
 `session.py` / `carry_over.py` と3つの入口は、受付のエージェントの名前（`front`）と、引き継ぐ項目を合わせれば、そのまま使えます。審査役を使わないなら `guard/` と `Guard` は消して構いません。
 
+人に尋ねる所を足すときは、`suspend()` に渡す形（`question` と、候補があれば `options`）を `identify_title` や `Approval` に合わせます。`LibrarySession` がその形を読んで、利用者へ見せます。
+
 設定を書き間違えると、組み立ての時点で、何がどこで違うかをまとめてエラーにします。
 
 ---
@@ -764,9 +993,9 @@ knowledgeは常にプロンプトの中に流し込まれるので、細かい�
 | 2 | `library/config/agents.yaml` | フィールドの使い分け、委譲の引数を構造で決める（`input_schema`）、回答を状態だけにする（`output_schema`） |
 | 3 | `library/config/tools.yaml` | 初期toolを `tools` へ登録するかしないかの判断、`execution_message` |
 | 4 | `library/prompts/` と `library/knowledge/` | 人格定義、結果の読み方（`evaluation`）、共通ナレッジ |
-| 5 | `library/tools.py` | ツールが返す辞書の形 |
+| 5 | `library/tools.py` | ツールが返す辞書の形と、依頼を止める所（`identify_title`） |
 | 6 | `library/network.py` | 設定からの組み立てと、審査役の配置 |
-| 7 | `library/guard/` と `observers.py` の `Guard` | 実行を止める5つの場所 |
+| 7 | `library/guard/` と `observers.py` の `Guard` / `Approval` | 実行を止める5つの場所と、実行前の承認 |
 | 8 | `observers.py` の `build_interceptor()` | 何を観測しているか |
-| 9 | `library/session.py` と `carry_over.py` | ターンの区切り方と引き継ぎ |
-| 10 | `cli.py` / `chat.py` / `api.py` | 呼び出し方 |
+| 9 | `library/session.py` と `carry_over.py` | ターンの区切り方と引き継ぎ、止まった依頼の保存と再開 |
+| 10 | `cli.py` / `chat.py` / `api.py` / `replay.py` | 呼び出し方と、止まった依頼の続け方 |

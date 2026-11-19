@@ -2647,7 +2647,7 @@ class Agent:
         過去の回答に触れずに聞き直された時の扱いは、ここではなくconversationの説明
         （memory.py）に置く。委譲先も会話を読み、前の回答で挙げた候補を「名指しされた
         製品」として調べるため（GPT-6 Solで実測。ここに置いた版では委譲先に見えず、
-        scoutが固定した）。
+        委譲先がその候補に固定した）。
         """
         if not self.current_input or not self.current_input.from_user:
             return ""

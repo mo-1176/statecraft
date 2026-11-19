@@ -20,6 +20,8 @@ LIBRARY_TOOLS = LocalTools(
     {
         "search_rules": tools.search_rules,
         "fetch_member_status": tools.fetch_member_status,
+        "identify_title": tools.identify_title,
+        "ask_member": tools.ask_member,
         "check_stock": tools.check_stock,
         "issue_reservation": tools.issue_reservation,
         "send_overdue_notice": tools.send_overdue_notice,

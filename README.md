@@ -55,8 +55,9 @@ LLMの能力を引き出し、軽量モデルでも自律的に多くのタス�
 | 実行前の判定（審査役のエージェントを含む） | `library/observers.py` の `Guard`、`library/guard/` |
 | 進捗・記憶の変化・トークンと概算コストの表示、生成失敗時の再試行 | `library/observers.py` |
 | ターンの区切りと、次のターンへの記憶の引き継ぎ | `library/session.py`、`library/carry_over.py` |
+| 依頼を途中で止めて人に尋ね、保存した状態から再開する（ヒューマンインザループ。候補を選ぶ / 足りない情報を尋ねる / 実行前の承認） | `library/tools.py` の `identify_title` と `ask_member`、`library/observers.py` の `Approval`、`library/session.py` |
 | APIキーの読み込み（環境変数 → `.env` → 入力欄） | `library/api_key.py` |
-| 入口（1問で終わる CLI / 対話 / Web API） | `cli.py`、`chat.py`、`api.py` |
+| 入口（1問で終わる CLI / 対話 / Web API / 止めた所から試し直す） | `cli.py`、`chat.py`、`api.py`、`replay.py` |
 
 設定ファイルとコードには、なぜそう書いたかのコメントが付いています。何がどう動いているかは [docs/sampleの読み方.md](docs/sampleの読み方.md) にあります。
 
@@ -102,7 +103,7 @@ pip install -e ".[gemini,claude]"   # 複数でもよい
 
 ### サンプルを動かす
 
-図書館の問い合わせ対応を題材に、3体のエージェントと5つのツールが動きます。受付（`front`）が依頼を整理して司書（`librarian`）へ渡し、司書が規程と蔵書を調べ、取り消せない操作の手前で審査役（`compliance`）が可否を返します。
+図書館の問い合わせ対応を題材に、3体のエージェントと7つのツールが動きます。受付（`front`）が依頼を整理して司書（`librarian`）へ渡し、司書が規程と蔵書を調べ、取り消せない操作の手前で審査役（`compliance`）が可否を返します。途中で人の答えが要る所（候補を選ぶ、足りない情報を答える、予約を承認する）では、依頼を止めて利用者に尋ねます。
 
 設定には、書ける項目の見本として `sample_agent` と `sample_tool` も入っています。どのエージェントからも呼ばれないので動きませんが、Network には入るため、`cli.py` のトークンの内訳には `sample_agent: (0, 0)` と出ます。
 
@@ -136,7 +137,7 @@ GEMINI_API_KEY=ここに貼る
 
 #### 2. 実行する
 
-サンプルは `examples/` の中から実行します。入口は3つです。
+サンプルは `examples/` の中から実行します。入口は3つです（ほかに、止めた所から試し直す `replay.py` があります）。
 
 | 入口 | 使い方 |
 |---|---|
@@ -155,6 +156,7 @@ python chat.py
 
 ```bash
 python cli.py "深夜特急を予約したい。会員番号はM-001"
+python cli.py --answer はい                    # 予約の承認で止まるので答える
 python cli.py "さっきの予約の受付番号は？"
 ```
 
@@ -162,6 +164,14 @@ python cli.py "さっきの予約の受付番号は？"
 
 ```bash
 python cli.py "貸出は何冊まで？" --fresh
+```
+
+利用者に尋ねる所で依頼が止まると、`cli.py` は状態を `sample_suspended.json` へ保存して終わります。答えを渡すと、保存した状態を読み込んで止まった所から続きます（`chat.py` は次の入力、`api.py` は次の `POST /chat` が答えになります）。`replay.py` を使うと、保存した所から何度でも試し直せます。
+
+```bash
+python cli.py "『銀河鉄道』を予約したい。会員番号はM-001"   # 候補を出して止まる
+python cli.py --answer 2                                   # 2番目を選んで続ける
+python cli.py --answer はい                                # 予約の承認で止まったら答える
 ```
 
 Web API は FastAPI と uvicorn を足してから起動します。`http://127.0.0.1:8000/docs` から試せます。
@@ -202,6 +212,7 @@ my-app/
   cli.py            ← examples/cli.py（入口は使うものだけでよい）
   chat.py           ← examples/chat.py
   api.py            ← examples/api.py（fastapi と uvicorn が要る）
+  replay.py         ← examples/replay.py（止めた所から試し直す。要らなければ写さない）
   .env.example      ← リポジトリ直下の .env.example
 ```
 
@@ -385,7 +396,7 @@ tools.yaml と knowledges.yaml は、使わなければ置かなくて構いま�
   phase_overrides:
     initial_memory: {model: gemini-3.7-flash}
     memory_update: {model: gemini-3.7-flash}
-  tools: [search_rules, check_stock, issue_reservation, send_overdue_notice]
+  tools: [search_rules, identify_title, ask_member, check_stock, issue_reservation, send_overdue_notice]
   initial_tools: [search_rules, fetch_member_status]
   knowledge: [terms]
   input_schema:
@@ -482,6 +493,8 @@ LIBRARY_TOOLS = LocalTools(
     {
         "search_rules": tools.search_rules,
         "fetch_member_status": tools.fetch_member_status,
+        "identify_title": tools.identify_title,
+        "ask_member": tools.ask_member,
         "check_stock": tools.check_stock,
         "issue_reservation": tools.issue_reservation,
         "send_overdue_notice": tools.send_overdue_notice,
@@ -687,9 +700,9 @@ def issue_ticket(title: str, member_id: str) -> dict:
 
 ```python
 "memory": {
-    "facts": [{"id": "在庫-EQ", "text": "EQは倉庫Bに3点"}],          # idを指定すると、同じidの項目を差し替える
-    "tasks": [{"text": "在庫を確保するため", "status": "next",
-               "target_names": ["reserve_item"]}],                 # 次の手順をtoolが決める
+    "facts": [{"id": "stock-深夜特急", "text": "『深夜特急』は貸出中"}],   # idを指定すると、同じidの項目を差し替える
+    "tasks": [{"text": "貸出中の資料を予約するため", "status": "next",
+               "target_names": ["issue_reservation"]}],            # 次の手順をtoolが決める
 }
 ```
 
@@ -867,7 +880,7 @@ Agentを置いた場合も、その Agent からは他の初期ステップの�
 
 #### Agent も置けます
 
-ツールの代わりにエージェントを置くこともできますが、あまり推奨しません。。。
+ツールの代わりにエージェントを置くこともできますが、あまり勧めません（下の「毎回かかる費用」を参照）。
 もちろん、ツールとエージェントを混ぜてもかまいません。
 
 設定ファイルの `initial_tools` に書けるのは tools.yaml のツールだけなので、エージェントを置く場合はコードで組みます（→ [設定ファイルを使わずに組む](#設定ファイルを使わずに組む)）。
@@ -1275,17 +1288,18 @@ toolの本体か `before_execute` のコールバックで `suspend(payload)` �
 ```python
 from statecraft import Suspended, suspend
 
-def present_candidates(query: str) -> dict:
-    suspend({"candidates": search(query)})   # ここで依頼全体が止まる
+def identify_title(keyword: str) -> dict:
+    found = search_titles(keyword)
+    suspend({"question": "どれのことですか？", "options": found})   # ここで依頼全体が止まる
     return {"value": ""}
 
-result = net.respond(agent="front", message="EQを選びたい")
+result = net.respond(agent="front", message="『銀河鉄道』を予約したい")
 if isinstance(result, Suspended):
     store.put(key, net.save_state())         # 保存先は利用側が決める
 
 net = build_network()                        # 別のプロセスでもよい。同じ名前で組む
 net.load_state(store.get(key))               # 戻すだけで、動かさない
-result = net.resume(answers={result.pending[0].point: "EQ-B"})
+result = net.resume(answers={result.pending[0].point: "銀河鉄道の父"})
 ```
 
 **再生ではなく、文字通りの中断と再開です。** 中断までに終わった呼び出しは実行し直さず、委譲先の中で止まっても、誰が誰の結果を待っていたかごと続きから進みます。エージェントは互いを関数として呼ばず、Networkが起動の表で親子を持っているためです（→ [ADR 0004](docs/adr/0004-runs-as-table.md)）。
@@ -1294,7 +1308,7 @@ result = net.resume(answers={result.pending[0].point: "EQ-B"})
 - 保存するのは実行して変わったもの（記憶、起動の途中の状態、継承する思考、起動の表）だけです。設定は含まないので、プロンプトを変えたNetworkへ戻して、途中から1体だけを試すこともできます。
 - toolの戻り値と `suspend()` に渡す値は、JSONにできる形にします。
 
-詳しくは [reference/network.md](docs/reference/network.md) の「中断と再開」を見てください。
+詳しくは [reference/network.md](docs/reference/network.md) の「中断と再開」を見てください。サンプルでは、候補を選んでもらう・足りない情報を尋ねる（tool の本体で止める）と、実行前の承認（`before_execute` で止める）の3つを、CLI・対話・Web API のそれぞれで保存から再開まで行っています。保存した所から何度でも試し直す `replay.py` もあります（→ [sampleの読み方.md](docs/sampleの読み方.md#人に尋ねる中断と再開)）。
 
 ### 渡すと共有記憶が入る
 
@@ -1423,7 +1437,7 @@ Network に入れて動かすと、どのイベントにも `network`（`Network
 
 ```python
 def on_generated(e: GeneratedEvent) -> None:
-    for step in e.network.agents["scout"].steps:
+    for step in e.network.agents["librarian"].steps:
         print(step.step_no, {phase.value: round(s, 1) for phase, s in step.seconds.items()})
         # 1 {'initial_memory': 3.2, 'function_call': 1.1}
         # 2 {'memory_update': 4.0, 'function_call': 0.9}
@@ -1591,7 +1605,7 @@ def build_compliance() -> Agent:
 | 実在するか | ツール本体で確認する。形式チェックは形を真似た値を通す |
 | 権限・所有者 | ツール本体で確認する。LLMの判断に委ねない |
 | 実行できる時間帯・回数 | `before_execute` の中で外部の状態を見る |
-| 取り返しがつかない操作 | 人の承認を挟む。`before_execute` の中で待つか、ツールの中で止める |
+| 取り返しがつかない操作 | 人の承認を挟む（`before_execute` の中で `suspend()`。→ [中断と再開](#中断と再開--suspend--save_state--load_state--resume)） |
 
 LLMの審査が効くのは、**機械的な条件では書けないもの**だけです。上の表で塞げるものを塞いだ後、残りに重ねる層として使ってください。
 
@@ -2136,7 +2150,9 @@ Geminiでの1往復、委譲、初期ツール、入力/出力スキーマ、実
 
 **未検証**
 
-OpenAI / Azure OpenAI / Claude のプロバイダ実装（Azure OpenAI は、本物の SDK からローカルの代役サーバーへ送り、接続先・認証・キャッシュの区切りの扱いまで確認済み）、思考の継承（Gemini と OpenAI〔gpt-6-luna〕では、サンプルの図書館を通しで動かし、委譲・tool・記憶の更新・ReflexAgent を含めて API が受け付けることまで確認済み。Azure OpenAI は未確認。回答が良くなるかは未検証）、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）、記憶の更新の監査（before_memory_diff。FakeLLMでのみ確認）、組み込みの監査役（enable_auditor。FakeLLMでのみ確認）、MCPサーバーのツール（McpTools。偽のサーバーでのみ確認。接続の部分は plugin-scout で mcp 2.3.0 の見本のサーバーに対して確認した時のもの）、最終回答だけに渡すナレッジ（answer_knowledge。FakeLLMでのみ確認）---
+OpenAI / Azure OpenAI / Claude のプロバイダ実装（Azure OpenAI は、本物の SDK からローカルの代役サーバーへ送り、接続先・認証・キャッシュの区切りの扱いまで確認済み）、思考の継承（Gemini と OpenAI〔gpt-6-luna〕では、サンプルの図書館を通しで動かし、委譲・tool・記憶の更新・ReflexAgent を含めて API が受け付けることまで確認済み。Azure OpenAI は未確認。回答が良くなるかは未検証）、記憶の引き継ぎ、結果を見て同じtoolで掘り直す動き（FakeLLMでのみ確認。Geminiでは、目的に届いたかの見極めが甘く掘り直しに至っていない）、記憶の更新の監査（before_memory_diff。FakeLLMでのみ確認）、組み込みの監査役（enable_auditor。FakeLLMでのみ確認）、MCPサーバーのツール（McpTools。偽のサーバーでのみ確認。接続の部分は、mcp 2.3.0 の見本のサーバーに対して確認済み）、最終回答だけに渡すナレッジ（answer_knowledge。FakeLLMでのみ確認）
+
+---
 
 ## ドキュメント
 

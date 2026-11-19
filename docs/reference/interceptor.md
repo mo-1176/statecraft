@@ -71,7 +71,7 @@ Network に入れて動かすと、どのイベントにも `network`（`Network
 
 ```python
 def on_generated(e: GeneratedEvent) -> None:
-    for step in e.network.agents["scout"].steps:
+    for step in e.network.agents["librarian"].steps:
         print(step.step_no, {phase.value: round(s, 1) for phase, s in step.seconds.items()})
         # 1 {'initial_memory': 3.2, 'function_call': 1.1}
         # 2 {'memory_update': 4.0, 'function_call': 0.9}
